@@ -3747,9 +3747,9 @@ const Gallery = (() => {
                     item.style.cssText = 'min-height:' + (h + 8) + 'px;display:flex;align-items:center;gap:6px;padding:4px 8px;';
                     item.title = tag.name;
                     const htmlBox = document.createElement('span');
-                    htmlBox.style.cssText = 'display:inline-block;width:' + w + 'px;height:' + h + 'px;overflow:hidden;vertical-align:middle;border:1px solid var(--border-color);border-radius:2px;flex-shrink:0;position:relative;';
+                    htmlBox.style.cssText = 'display:inline-flex;align-items:center;justify-content:center;width:' + w + 'px;height:' + h + 'px;overflow:hidden;vertical-align:middle;border:1px solid var(--border-color);border-radius:2px;flex-shrink:0;';
                     const inner = document.createElement('div');
-                    inner.style.cssText = 'position:absolute;top:0;left:0;transform-origin:0 0;';
+                    inner.style.cssText = 'display:inline-block;transform-origin:center center;';
                     htmlBox.appendChild(inner);
                     const scopeId = 'dd-tag-scope-' + tag.id;
                     htmlBox.setAttribute('data-tag-scope', scopeId);
@@ -3783,10 +3783,6 @@ const Gallery = (() => {
                         const nh = rect.height || h;
                         const scale = Math.min(w / nw, h / nh, 1);
                         inner.style.transform = `scale(${scale})`;
-                        const scaledW = nw * scale;
-                        const scaledH = nh * scale;
-                        inner.style.left = ((w - scaledW) / 2) + 'px';
-                        inner.style.top = ((h - scaledH) / 2) + 'px';
                     });
                     item.appendChild(htmlBox);
                 } else if (tag.tagType === 'avatar') {

@@ -2095,9 +2095,9 @@ const Sidebar = (() => {
             item.style.cssText = `display:inline-flex;align-items:center;gap:2px;margin-left:${depth * 20}px;flex-shrink:0;`;
             if (depth > 0) item.style.setProperty('--tag-depth', depth);
             const wrapper = document.createElement('div');
-            wrapper.style.cssText = `width:${w}px;height:${h}px;overflow:hidden;flex-shrink:0;pointer-events:none;`;
+            wrapper.style.cssText = `width:${w}px;height:${h}px;overflow:hidden;flex-shrink:0;pointer-events:none;display:flex;align-items:center;justify-content:center;`;
             const inner = document.createElement('div');
-            inner.style.cssText = 'position:absolute;top:0;left:0;transform-origin:0 0;';
+            inner.style.cssText = 'display:inline-block;transform-origin:center center;';
             // 用唯一 scope 包裹，防止 CSS 污染其他标签
             const scopeId = 'tag-scope-' + tag.id;
             wrapper.setAttribute('data-tag-scope', scopeId);
@@ -2132,11 +2132,6 @@ const Sidebar = (() => {
                 const nh = rect.height || h;
                 const scale = Math.min(w / nw, h / nh, 1); // 只缩小不放大
                 inner.style.transform = `scale(${scale})`;
-                // 居中：计算缩放后偏移
-                const scaledW = nw * scale;
-                const scaledH = nh * scale;
-                inner.style.left = ((w - scaledW) / 2) + 'px';
-                inner.style.top = ((h - scaledH) / 2) + 'px';
             });
             inner.querySelectorAll('script').forEach(s => {
                 try { eval(s.textContent); } catch(e) {}
@@ -3881,10 +3876,6 @@ const Sidebar = (() => {
                     const nh = rect.height || ch;
                     const scale = Math.min(cw / nw, ch / nh, 1);
                     inner.style.transform = `scale(${scale})`;
-                    const scaledW = nw * scale;
-                    const scaledH = nh * scale;
-                    inner.style.left = ((cw - scaledW) / 2) + 'px';
-                    inner.style.top = ((ch - scaledH) / 2) + 'px';
                 });
             };
             if (htmlTagWidthInput) {
@@ -4796,10 +4787,6 @@ const Sidebar = (() => {
                     const nh = rect.height || ch;
                     const scale = Math.min(cw / nw, ch / nh, 1);
                     inner.style.transform = `scale(${scale})`;
-                    const scaledW = nw * scale;
-                    const scaledH = nh * scale;
-                    inner.style.left = ((cw - scaledW) / 2) + 'px';
-                    inner.style.top = ((ch - scaledH) / 2) + 'px';
                 });
             };
             if (editWidthInput) {
@@ -4835,8 +4822,7 @@ const Sidebar = (() => {
         if (!inner) {
             inner = document.createElement('div');
             inner.className = 'html-preview-inner';
-            inner.style.cssText = 'position:absolute;top:0;left:0;transform-origin:0 0;';
-            container.style.position = 'relative';
+            inner.style.cssText = 'display:inline-block;transform-origin:center center;';
             container.innerHTML = '';
             container.appendChild(inner);
         }
@@ -4871,10 +4857,6 @@ const Sidebar = (() => {
             const nh = rect.height || ch;
             const scale = Math.min(cw / nw, ch / nh, 1);
             inner.style.transform = `scale(${scale})`;
-            const scaledW = nw * scale;
-            const scaledH = nh * scale;
-            inner.style.left = ((cw - scaledW) / 2) + 'px';
-            inner.style.top = ((ch - scaledH) / 2) + 'px';
         };
         // 先立即缩放一次，再等图片加载后重试
         requestAnimationFrame(() => {
