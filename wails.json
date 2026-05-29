@@ -1,0 +1,19 @@
+{
+  "name": "local-gallery",
+  "outputfilename": "LocalGallery",
+  "frontend:install": "",
+  "frontend:build": "",
+  "frontend:dev:watcher": "",
+  "frontend:dev:serverUrl": "",
+  "icon": "appicon.png",
+  "author": {
+    "name": "SamLiu1000",
+    "email": "sam.liu99@yahoo.com"
+  },
+  "info": {
+    "productName": "Local Gallery",
+    "productVersion": "1.0.0",
+    "copyright": "SamLiu1000",
+    "comments": "Image Management Tool"
+  }
+}

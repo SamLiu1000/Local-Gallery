@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <radialGradient id="sunCore" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#FFF5A0"/>
+      <stop offset="50%" stop-color="#FFD93D"/>
+      <stop offset="100%" stop-color="#FF9A00"/>
+    </radialGradient>
+    <radialGradient id="sunGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#FFE566" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#FF9A00" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="sunBlur">
+      <feGaussianBlur stdDeviation="2"/>
+    </filter>
+  </defs>
+  <!-- Glow halo -->
+  <circle cx="24" cy="24" r="22" fill="url(#sunGlow)" filter="url(#sunBlur)"/>
+  <!-- Rays -->
+  <g stroke="#FFB800" stroke-width="2.5" stroke-linecap="round">
+    <line x1="24" y1="4" x2="24" y2="9"/>
+    <line x1="24" y1="39" x2="24" y2="44"/>
+    <line x1="4" y1="24" x2="9" y2="24"/>
+    <line x1="39" y1="24" x2="44" y2="24"/>
+    <line x1="9.5" y1="9.5" x2="13" y2="13"/>
+    <line x1="35" y1="35" x2="38.5" y2="38.5"/>
+    <line x1="38.5" y1="9.5" x2="35" y2="13"/>
+    <line x1="13" y1="35" x2="9.5" y2="38.5"/>
+  </g>
+  <!-- Sun body -->
+  <circle cx="24" cy="24" r="11" fill="url(#sunCore)"/>
+  <!-- Inner shine -->
+  <ellipse cx="20" cy="19" rx="4" ry="2.5" fill="#fff" opacity="0.4" transform="rotate(-30 20 19)"/>
+</svg>

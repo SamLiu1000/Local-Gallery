@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="addGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#5EE87A"/>
+      <stop offset="100%" stop-color="#28A848"/>
+    </linearGradient>
+    <filter id="addShadow">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#0A4020" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+  <circle cx="24" cy="24" r="20" fill="url(#addGrad)" filter="url(#addShadow)"/>
+  <ellipse cx="18" cy="17" rx="7" ry="4" fill="#fff" opacity="0.2" transform="rotate(-30 18 17)"/>
+  <line x1="24" y1="13" x2="24" y2="35" stroke="#fff" stroke-width="5" stroke-linecap="round"/>
+  <line x1="13" y1="24" x2="35" y2="24" stroke="#fff" stroke-width="5" stroke-linecap="round"/>
+</svg>

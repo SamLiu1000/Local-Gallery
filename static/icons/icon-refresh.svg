@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="refreshGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4CC97A"/>
+      <stop offset="100%" stop-color="#28914F"/>
+    </linearGradient>
+    <filter id="refShadow">
+      <feDropShadow dx="0" dy="1.5" stdDeviation="1.5" flood-color="#1A5E34" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+  <g filter="url(#refShadow)">
+    <!-- 更闭合的圆弧（约300°） -->
+    <path 
+      d="M24 8 A16 16 0 1 1 10.14 16" 
+      fill="none" 
+      stroke="url(#refreshGrad)" 
+      stroke-width="5.5" 
+      stroke-linecap="round"/>
+    
+    <!-- Arrow head -->
+    <polygon points="24,4 18,12 30,12" fill="#4CC97A"/>
+  </g>
+  
+  <!-- Shine on arc -->
+  <path 
+    d="M24 8 A16 16 0 0 1 37.5 15" 
+    fill="none" 
+    stroke="#fff" 
+    stroke-width="1.5" 
+    stroke-linecap="round" 
+    opacity="0.35"/>
+</svg>

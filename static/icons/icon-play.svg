@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="playGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#E8A850"/>
+      <stop offset="100%" stop-color="#C87020"/>
+    </linearGradient>
+    <filter id="playShadow">
+      <feDropShadow dx="0" dy="1.5" stdDeviation="1.5" flood-color="#482010" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+  <circle cx="24" cy="24" r="20" fill="url(#playGrad)" filter="url(#playShadow)"/>
+  <ellipse cx="18" cy="17" rx="7" ry="4" fill="#fff" opacity="0.2" transform="rotate(-30 18 17)"/>
+  <!-- Play triangle -->
+  <polygon points="18,14 34,24 18,34" fill="#fff"/>
+</svg>

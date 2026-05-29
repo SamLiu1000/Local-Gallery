@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="body" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#E8EAF0"/>
+      <stop offset="100%" stop-color="#A8AEBF"/>
+    </linearGradient>
+    <linearGradient id="bodyEdge" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#C0C4D4"/>
+      <stop offset="50%" stop-color="#F0F2F8"/>
+      <stop offset="100%" stop-color="#B0B4C8"/>
+    </linearGradient>
+    <linearGradient id="pin" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#B8A060"/>
+      <stop offset="35%" stop-color="#E8D090"/>
+      <stop offset="65%" stop-color="#D4B870"/>
+      <stop offset="100%" stop-color="#A08040"/>
+    </linearGradient>
+    <linearGradient id="cord" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#383838"/>
+      <stop offset="50%" stop-color="#606060"/>
+      <stop offset="100%" stop-color="#383838"/>
+    </linearGradient>
+    <filter id="s">
+      <feDropShadow dx="0" dy="2" stdDeviation="1.5" flood-color="#1A1C28" flood-opacity="0.45"/>
+    </filter>
+    <filter id="ps">
+      <feDropShadow dx="0" dy="1" stdDeviation="1" flood-color="#1A1C28" flood-opacity="0.3"/>
+    </filter>
+  </defs>
+
+  <!-- 电线：从插头顶部正中引出，向上弯曲 -->
+  <path d="M24 10 C24 5, 20 3, 15 3 C10 3, 7 7, 7 11"
+        fill="none" stroke="#383838" stroke-width="4.5" stroke-linecap="round"/>
+  <path d="M24 10 C24 5, 20 3, 15 3 C10 3, 7 7, 7 11"
+        fill="none" stroke="#686868" stroke-width="2" stroke-linecap="round" opacity="0.7"/>
+  <path d="M24 10 C24 5, 20 3, 15 3 C10 3, 7 7, 7 11"
+        fill="none" stroke="#909090" stroke-width="0.8" stroke-linecap="round" opacity="0.5"/>
+
+  <!-- 插头主体：经典半圆+矩形组合（正视图） -->
+  <!-- 主体矩形部分 -->
+  <rect x="13" y="18" width="22" height="14" rx="2" fill="url(#body)" filter="url(#s)"/>
+  <!-- 主体顶部半圆 -->
+  <path d="M13 20 A11 11 0 0 1 35 20" fill="url(#bodyEdge)" filter="url(#s)"/>
+  <rect x="13" y="10" width="22" height="10" rx="0" fill="url(#bodyEdge)"/>
+  <!-- 顶部圆弧（半椭圆头） -->
+  <ellipse cx="24" cy="18" rx="11" ry="8" fill="url(#bodyEdge)" filter="url(#s)"/>
+  <!-- 顶面高光 -->
+  <ellipse cx="21" cy="15" rx="5" ry="3" fill="#fff" opacity="0.3" transform="rotate(-15 21 15)"/>
+  <!-- 主体正面（覆盖让分层清晰） -->
+  <rect x="13" y="18" width="22" height="14" rx="2" fill="url(#body)"/>
+  <!-- 底边收口 -->
+  <rect x="13" y="29" width="22" height="3" rx="1.5" fill="#9095A8"/>
+
+  <!-- 左插脚（铜黄金属片） -->
+  <rect x="18" y="32" width="4" height="13" rx="1" fill="url(#pin)" filter="url(#ps)"/>
+  <!-- 左脚高光 -->
+  <rect x="19.2" y="33" width="1.2" height="11" rx="0.5" fill="#fff" opacity="0.4"/>
+  <!-- 左脚尖 -->
+  <rect x="18" y="42" width="4" height="3" rx="1" fill="#907030"/>
+
+  <!-- 右插脚 -->
+  <rect x="26" y="32" width="4" height="13" rx="1" fill="url(#pin)" filter="url(#ps)"/>
+  <rect x="27.2" y="33" width="1.2" height="11" rx="0.5" fill="#fff" opacity="0.4"/>
+  <rect x="26" y="42" width="4" height="3" rx="1" fill="#907030"/>
+</svg>

@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="starEmpty" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#C8D0E0"/>
+      <stop offset="100%" stop-color="#8090B0"/>
+    </linearGradient>
+    <filter id="starEmptyShadow">
+      <feDropShadow dx="0" dy="1.5" stdDeviation="1.5" flood-color="#2A3050" flood-opacity="0.3"/>
+    </filter>
+  </defs>
+  <!-- Star outline with subtle fill -->
+  <polygon points="24,4 29,18 44,18 32,27 37,42 24,33 11,42 16,27 4,18 19,18" fill="#E8ECF4" stroke="url(#starEmpty)" stroke-width="2.5" filter="url(#starEmptyShadow)"/>
+  <!-- Subtle inner shadow suggestion -->
+  <polygon points="24,8 28,19 41,19 31,26 35,40 24,32 13,40 17,26 7,19 20,19" fill="none" stroke="#B0B8D0" stroke-width="0.8" opacity="0.5"/>
+</svg>

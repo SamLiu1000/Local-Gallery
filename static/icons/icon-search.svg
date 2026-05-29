@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="lensGrad" x1="20%" y1="10%" x2="80%" y2="90%">
+      <stop offset="0%" stop-color="#A8D4FF"/>
+      <stop offset="100%" stop-color="#5BA4E8"/>
+    </linearGradient>
+    <linearGradient id="handleGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7A6050"/>
+      <stop offset="100%" stop-color="#4A3828"/>
+    </linearGradient>
+    <filter id="searchShadow">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#1A3A5C" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+  <!-- Handle -->
+  <rect x="30" y="31" width="13" height="5.5" rx="2.75" fill="url(#handleGrad)" transform="rotate(45 36.5 33.75)" filter="url(#searchShadow)"/>
+  <!-- Lens rim -->
+  <circle cx="20" cy="20" r="14" fill="#3A5F8A" filter="url(#searchShadow)"/>
+  <!-- Lens glass -->
+  <circle cx="20" cy="20" r="11.5" fill="url(#lensGrad)"/>
+  <!-- Glass reflection -->
+  <ellipse cx="15" cy="15" rx="4.5" ry="2.5" fill="#fff" opacity="0.45" transform="rotate(-30 15 15)"/>
+  <ellipse cx="25" cy="24" rx="2" ry="1" fill="#fff" opacity="0.2"/>
+</svg>

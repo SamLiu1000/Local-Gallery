@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="loadRing" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#60A8F0"/>
+      <stop offset="100%" stop-color="#2060C0"/>
+    </linearGradient>
+    <filter id="loadShadow">
+      <feDropShadow dx="0" dy="1" stdDeviation="1.5" flood-color="#0A2860" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+  <!-- Ring track -->
+  <circle cx="24" cy="24" r="17" fill="none" stroke="#C0D8F0" stroke-width="5"/>
+  <!-- Active arc with gradient feel -->
+  <path d="M24 7 A17 17 0 1 1 7 24" fill="none" stroke="url(#loadRing)" stroke-width="5.5" stroke-linecap="round" filter="url(#loadShadow)"/>
+  <!-- Bright head dot -->
+  <circle cx="24" cy="7" r="4" fill="#80C0FF"/>
+  <circle cx="23" cy="6" r="1.5" fill="#fff" opacity="0.7"/>
+</svg>

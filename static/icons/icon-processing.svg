@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+  <!-- 惯性风线1 -->
+  <line x1="17" y1="11" x2="23" y2="11" stroke="#5DADE2" stroke-width="2.8" stroke-linecap="round" opacity="0.55"/>
+  <!-- 惯性风线2 -->
+  <line x1="17" y1="14.5" x2="22.5" y2="14.5" stroke="#5DADE2" stroke-width="2.2" stroke-linecap="round" opacity="0.38"/>
+  <!-- 惯性风线3 -->
+  <line x1="17" y1="18" x2="21.5" y2="18" stroke="#5DADE2" stroke-width="1.6" stroke-linecap="round" opacity="0.22"/>
+  <!-- 惯性风线4 -->
+  <line x1="17" y1="21.5" x2="20" y2="21.5" stroke="#5DADE2" stroke-width="1" stroke-linecap="round" opacity="0.1"/>
+  <!-- 速度箭头 -->
+  <polygon points="17,11 15.2,9.2 15.2,12.8" fill="#5DADE2" opacity="0.7"/>
+  <!-- 鼠标本体 -->
+  <path d="M9.5,5 L14.5,5 C16,5 17.2,6.2 17.2,7.8 L17.2,17.2 C17.2,18.8 16,20 14.5,20 L9.5,20 C8,20 6.8,18.8 6.8,17.2 L6.8,7.8 C6.8,6.2 8,5 9.5,5 Z" fill="#D5DBE0"/>
+  <!-- 鼠标高光 -->
+  <path d="M7.5,7.8 L7.5,17.2 C7.5,18.3 8.4,19.2 9.5,19.2 L9.8,19.2 L9.8,5 L9.5,5 C8.4,5 7.5,5.9 7.5,7 Z" fill="#E8ECEE" opacity="0.5"/>
+  <!-- 左键线 -->
+  <line x1="6.8" y1="12.5" x2="17.2" y2="12.5" stroke="#B0B8BD" stroke-width="0.5" opacity="0.35"/>
+  <!-- 滚轮 -->
+  <rect x="10.8" y="6.5" width="2.4" height="3" rx="1.2" fill="#8899A6"/>
+  <rect x="11.2" y="6.9" width="1.6" height="2.2" rx="0.8" fill="#A8B4BB" opacity="0.5"/>
+</svg>

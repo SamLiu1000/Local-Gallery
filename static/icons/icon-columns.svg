@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="colGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#8AB4F8"/>
+      <stop offset="100%" stop-color="#4A7CD6"/>
+    </linearGradient>
+    <filter id="colShadow">
+      <feDropShadow dx="0" dy="1.5" stdDeviation="1" flood-color="#1A3A7A" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+  <!-- Left column -->
+  <rect x="5" y="8" width="17" height="32" rx="3" fill="url(#colGrad)" filter="url(#colShadow)"/>
+  <!-- Left column content lines -->
+  <rect x="8" y="13" width="11" height="2.5" rx="1.2" fill="#fff" opacity="0.6"/>
+  <rect x="8" y="18" width="8" height="2.5" rx="1.2" fill="#fff" opacity="0.4"/>
+  <rect x="8" y="23" width="11" height="2.5" rx="1.2" fill="#fff" opacity="0.4"/>
+  <rect x="8" y="28" width="7" height="2.5" rx="1.2" fill="#fff" opacity="0.4"/>
+  <!-- Right column -->
+  <rect x="26" y="8" width="17" height="32" rx="3" fill="url(#colGrad)" filter="url(#colShadow)"/>
+  <rect x="29" y="13" width="11" height="2.5" rx="1.2" fill="#fff" opacity="0.6"/>
+  <rect x="29" y="18" width="7" height="2.5" rx="1.2" fill="#fff" opacity="0.4"/>
+  <rect x="29" y="23" width="11" height="2.5" rx="1.2" fill="#fff" opacity="0.4"/>
+  <rect x="29" y="28" width="9" height="2.5" rx="1.2" fill="#fff" opacity="0.4"/>
+  <!-- Shine -->
+  <rect x="5" y="8" width="17" height="8" rx="3" fill="#fff" opacity="0.15"/>
+  <rect x="26" y="8" width="17" height="8" rx="3" fill="#fff" opacity="0.15"/>
+</svg>

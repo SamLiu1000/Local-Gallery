@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="exportBox" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#90D870"/>
+      <stop offset="100%" stop-color="#489830"/>
+    </linearGradient>
+    <filter id="exportShadow">
+      <feDropShadow dx="0" dy="2" stdDeviation="1.5" flood-color="#0A3808" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+  <!-- Box bottom/tray -->
+  <path d="M6 30 L6 42 Q6 44 8 44 L40 44 Q42 44 42 42 L42 30 Z" fill="url(#exportBox)" filter="url(#exportShadow)"/>
+  <path d="M6 30 L6 36 Q24 40 42 36 L42 30 Z" fill="#fff" opacity="0.12"/>
+  <!-- Flaps open -->
+  <path d="M6 30 L14 22 L20 30 Z" fill="#68B850"/>
+  <path d="M42 30 L34 22 L28 30 Z" fill="#68B850"/>
+  <!-- Up arrow (exporting out of box) -->
+  <line x1="24" y1="28" x2="24" y2="8" stroke="#fff" stroke-width="4" stroke-linecap="round"/>
+  <polygon points="24,6 16,16 32,16" fill="#fff"/>
+</svg>

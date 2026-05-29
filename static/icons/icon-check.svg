@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="checkGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#60D888"/>
+      <stop offset="100%" stop-color="#20A050"/>
+    </linearGradient>
+    <filter id="checkShadow">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#084020" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+  <circle cx="24" cy="24" r="20" fill="url(#checkGrad)" filter="url(#checkShadow)"/>
+  <!-- Shine -->
+  <ellipse cx="18" cy="17" rx="8" ry="4.5" fill="#fff" opacity="0.22" transform="rotate(-25 18 17)"/>
+  <!-- Check mark -->
+  <polyline points="12,24 20,33 36,14" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

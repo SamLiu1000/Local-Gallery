@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="cursorBody" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#D0D8F0"/>
+    </linearGradient>
+    <linearGradient id="clickRipple" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#60A0F8"/>
+      <stop offset="100%" stop-color="#2060D0"/>
+    </linearGradient>
+    <filter id="clickShadow">
+      <feDropShadow dx="1" dy="2" stdDeviation="2" flood-color="#101838" flood-opacity="0.5"/>
+    </filter>
+  </defs>
+  <!-- Ripple rings -->
+  <circle cx="18" cy="30" r="16" fill="none" stroke="url(#clickRipple)" stroke-width="1.8" opacity="0.3"/>
+  <circle cx="18" cy="30" r="11" fill="none" stroke="url(#clickRipple)" stroke-width="2" opacity="0.5"/>
+  <circle cx="18" cy="30" r="6" fill="#A0C4F8" opacity="0.5"/>
+  <!-- Cursor arrow -->
+  <path d="M8 8 L8 34 L15 27 L20 38 L24 36 L19 25 L28 25 Z" fill="url(#cursorBody)" filter="url(#clickShadow)"/>
+  <path d="M8 8 L28 25 L19 25 L24 36 L20 38 L15 27 L8 34 Z" fill="none" stroke="#4860A0" stroke-width="1.5" stroke-linejoin="round"/>
+  <!-- Cursor shine -->
+  <path d="M9 9 L9 20 L16 13 Z" fill="#fff" opacity="0.5"/>
+</svg>

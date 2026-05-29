@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="pencilBody" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#F5E060"/>
+      <stop offset="100%" stop-color="#C8A800"/>
+    </linearGradient>
+    <linearGradient id="pencilTip" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#F0C090"/>
+      <stop offset="100%" stop-color="#C07838"/>
+    </linearGradient>
+    <filter id="pencilShadow">
+      <feDropShadow dx="0" dy="2" stdDeviation="1.5" flood-color="#5A4000" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+  <g filter="url(#pencilShadow)" transform="rotate(-45 24 24)">
+    <!-- Eraser end -->
+    <rect x="20" y="5" width="8" height="5" rx="1" fill="#F08080"/>
+    <rect x="20" y="9" width="8" height="2" fill="#C05050"/>
+    <!-- Pencil body -->
+    <rect x="20" y="11" width="8" height="24" fill="url(#pencilBody)"/>
+    <!-- Pencil stripe -->
+    <rect x="20" y="11" width="8" height="3" fill="#E8C800" opacity="0.5"/>
+    <!-- Wood section -->
+    <polygon points="20,35 28,35 26,41 22,41" fill="url(#pencilTip)"/>
+    <!-- Tip -->
+    <polygon points="22,41 26,41 24,47" fill="#2A2A2A"/>
+    <!-- Shine -->
+    <rect x="21" y="12" width="2.5" height="22" rx="1" fill="#fff" opacity="0.35"/>
+  </g>
+</svg>

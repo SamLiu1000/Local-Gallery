@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <!-- Tag body: slim vertical rectangle -->
+  <rect x="14" y="4" width="20" height="30" fill="#E8B84B"
+    style="filter: drop-shadow(0px 2px 2px rgba(120,80,0,0.35))"/>
+  <!-- Swallowtail bottom -->
+  <polygon points="14,34 34,34 24,44" fill="#E8B84B"/>
+  <!-- V notch cut-in -->
+  <polygon points="18,34 30,34 24,39" fill="#C28A18"/>
+  <!-- String hole -->
+  <circle cx="24" cy="13" r="3.5" fill="#B07818"/>
+  <circle cx="24" cy="13" r="1.8" fill="#F5D070"/>
+  <!-- Shine -->
+  <ellipse cx="20" cy="10" rx="5" ry="2.5" fill="#fff" opacity="0.18"
+    transform="rotate(-10 20 10)"/>
+</svg>

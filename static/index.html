@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title data-i18n="app.title">Local Gallery - AI 图片管理工具</title>
+    <script>
+        // 在 CSS 加载前立即设置主题和强调色，避免页面闪烁
+        (function() {
+            var theme = localStorage.getItem('theme');
+            if (!theme) {
+                theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+            }
+            var root = document.documentElement;
+            root.setAttribute('data-theme', theme);
+
+            var accent = localStorage.getItem('accentColor');
+            if (accent) {
+                var r = parseInt(accent.slice(1,3), 16);
+                var g = parseInt(accent.slice(3,5), 16);
+                var b = parseInt(accent.slice(5,7), 16);
+                var isDark = theme === 'dark';
+                var factor = isDark ? 1.15 : 0.85;
+                var offset = isDark ? 40 : -30;
+                var hr = Math.min(255, Math.round(r * factor + offset));
+                var hg = Math.min(255, Math.round(g * factor + offset));
+                var hb = Math.min(255, Math.round(b * factor + offset));
+                var glowAlpha = isDark ? 0.25 : 0.15;
+                root.style.setProperty('--accent', accent);
+                root.style.setProperty('--accent-hover', 'rgb(' + hr + ',' + hg + ',' + hb + ')');
+                root.style.setProperty('--accent-glow', 'rgba(' + r + ',' + g + ',' + b + ',' + glowAlpha + ')');
+            }
+        })();
+    </script>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <!-- 顶部工具栏 -->
+    <header id="topBar">
+        <div class="topbar-left">
+            <h1 class="app-title">Local Gallery</h1>
+        </div>
+        <div class="topbar-center">
+            <div class="search-group">
+                <div class="search-bar" id="searchBar">
+                    <input type="text" id="searchInput" class="search-input" data-i18n-placeholder="search.placeholder" placeholder="搜索前请先对文件夹索引" autocomplete="off" />
+                    <span class="search-hint" id="searchHint" style="display:none;"></span>
+                    <button id="searchClearBtn" class="search-clear-btn" data-i18n-title="search.clear" title="清除搜索 (Esc)" style="display:none;"><span class="icon icon-close"></span></button>
+                </div>
+                <button id="searchBtn" class="search-btn" data-i18n-title="search.search" title="搜索"><span class="icon icon-search"></span></button>
+                <button id="advancedSearchToggle" class="search-action-btn" data-i18n-title="search.advanced" title="Advanced"><span class="icon icon-settings" style="pointer-events:none;"></span> <span data-i18n="search.advanced" style="pointer-events:none;">Advanced</span></button>
+                <div class="search-actions" id="searchActions" style="display:none;">
+                    <button id="searchShowAllBtn" class="search-action-btn" data-i18n-title="search.show_all" title="显示全部搜索结果"><span data-i18n="search.show_all">显示全部</span></button>
+                    <button id="searchLoadMoreBtn" class="search-action-btn" data-i18n-title="search.load_more" title="加载更多搜索结果"><span data-i18n="search.load_more">加载更多</span></button>
+                </div>
+                <div class="advanced-search-panel" id="advancedSearchPanel" style="display:none;">
+                <div class="advanced-search-row">
+                    <label data-i18n="search.match_logic">匹配逻辑</label>
+                    <select id="advMatchMode">
+                        <option value="or" data-i18n="search.or">OR - 任一条件满足</option>
+                        <option value="and" data-i18n="search.and">AND - 所有条件必须满足</option>
+                    </select>
+                </div>
+                <div class="advanced-search-row">
+                    <label data-i18n="search.date_range">日期范围</label>
+                    <div class="date-range-inputs">
+                        <input type="text" id="advDateFrom" data-i18n-title="search.date_from" data-i18n-placeholder="search.date_placeholder" title="起始日期" placeholder="yyyy/mm/dd" />
+                        <span data-i18n="search.to">至</span>
+                        <input type="text" id="advDateTo" data-i18n-title="search.date_to" data-i18n-placeholder="search.date_placeholder" title="结束日期" placeholder="yyyy/mm/dd" />
+                    </div>
+                </div>
+                <div class="advanced-search-row">
+                    <label data-i18n="search.conditions">搜索条件</label>
+                    <div class="conditions-list" id="conditionsList">
+                        <div class="condition-row" id="conditionRow0">
+                            <select class="condition-field">
+                                <option value="all" data-i18n="search.all_fields">全部字段</option>
+                                <option value="path" data-i18n="search.field.path">路径</option>
+                                <option value="prompt" data-i18n="search.field.prompt">提示词</option>
+                                <option value="negative_prompt" data-i18n="search.field.negative_prompt">反向提示词</option>
+                                <option value="params_json" data-i18n="search.field.params">参数</option>
+                                <option value="folder_name" data-i18n="search.field.folder_name">文件夹名称</option>
+                            </select>
+                            <select class="condition-mode">
+                                <option value="contains" data-i18n="search.mode.contains">包含</option>
+                                <option value="exact" data-i18n="search.mode.exact">精确匹配</option>
+                                <option value="exclude" data-i18n="search.mode.exclude">排除</option>
+                                <option value="word" data-i18n="search.mode.word">全词匹配</option>
+                            </select>
+                            <input type="text" class="condition-value" data-i18n-placeholder="search.keyword_placeholder" placeholder="输入关键词..." />
+                            <button class="condition-remove-btn btn-small" data-i18n-title="search.remove_condition" title="移除此条件" style="display:none;"><span class="icon icon-close"></span></button>
+                        </div>
+                    </div>
+                    <button id="addConditionBtn" class="btn-small" data-i18n="search.add_condition">+ 添加条件</button>
+                </div>
+                <div class="advanced-search-row">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="advSearchFoldersCheck" />
+                        <span data-i18n="search.search_folders">搜索文件夹名称</span>
+                    </label>
+                    <span class="checkbox-hint" data-i18n="search.search_folders_hint">勾选后，输入的关键词也会匹配文件夹名称，展示文件夹下所有图片</span>
+                </div>
+                <div class="advanced-search-actions">
+                    <button id="advSearchApply" class="btn-primary"><span class="icon icon-search"></span> <span data-i18n="search.search_btn">搜索</span></button>
+                    <button id="advSearchReset" class="btn-secondary" data-i18n="search.reset">重置</button>
+                </div>
+                <div class="advanced-search-row">
+                    <label data-i18n="search.search_folder_label">搜索文件夹</label>
+                    <div class="folder-tags-area" id="folderTagsArea">
+                        <div class="folder-tags-list" id="folderTagsList"></div>
+                        <div class="folder-dropdown-wrapper">
+                            <input type="text" class="folder-search-input" id="folderSearchInput" data-i18n-placeholder="search.add_folder_placeholder" placeholder="搜索并添加文件夹..." autocomplete="off" />
+                            <div class="folder-dropdown-list" id="folderDropdownList" style="display:none;"></div>
+                        </div>
+                    </div>
+                </div>
+                </div>
+            </div>
+        </div>
+        <div class="topbar-right">
+            <button id="btnThumbSettings" title="设置"><span class="icon icon-settings"></span> <span data-i18n="toolbar.settings">设置</span></button>
+            <button id="btnRefresh" title="刷新图库"><span class="icon icon-reload"></span> <span data-i18n="toolbar.refresh">刷新</span></button>
+            <select id="langSelect" class="lang-select" style="background:var(--bg-input);color:var(--text-primary);border:1px solid var(--border-color);border-radius:var(--radius-sm);padding:4px 8px;font-size:13px;cursor:pointer;">
+                <option value="zh-CN">中文</option>
+                <option value="en-US">English</option>
+                <option value="ja-JP">日本語</option>
+                <option value="ko-KR">한국어</option>
+                <option value="fr-FR">Français</option>
+                <option value="de-DE">Deutsch</option>
+                <option value="es-ES">Español</option>
+                <option value="pt-BR">Português</option>
+                <option value="ru-RU">Русский</option>
+            </select>
+            <button id="btnToggleTheme" title="切换主题"><span class="icon icon-theme-dark"></span></button>
+        </div>
+    </header>
+
+    <!-- 主布局容器 -->
+    <div id="mainContainer">
+        <!-- D 形收缩按钮 -->
+        <button id="toggleLeftPanel" class="panel-toggle-left" data-i18n-title="panel.toggle" title="收起左侧面板"></button>
+        <button id="toggleRightPanel" class="panel-toggle-right" data-i18n-title="panel.toggle" title="收起右侧面板"></button>
+
+        <!-- ========== 左侧面板 ========== -->
+        <aside id="leftPanel">
+            <div class="panel-tabs">
+                <button class="panel-tab active" data-tab="folder"><span class="icon icon-folder"></span> <span data-i18n="panel.folder">文件夹</span></button>
+                <button class="panel-tab" data-tab="tag"><span class="icon icon-tag"></span> <span data-i18n="panel.tag">标签</span></button>
+                <button class="panel-tab" data-tab="api"><span class="icon icon-api"></span> <span data-i18n="panel.api">API</span></button>
+            </div>
+
+            <div class="panel-content active" id="panelFolder">
+                <div class="panel-toolbar">
+                    <button id="btnSelectFolder" class="btn-primary"><span class="icon icon-browse"></span> <span data-i18n="panel.select_folder">选择文件夹</span></button>
+                    <button id="btnRemoveFolder" class="btn-icon btn-danger" data-i18n-title="panel.remove_folder" title="移除选中的文件夹"><span class="icon icon-delete"></span></button>
+                    <button id="btnEditFolderOrder" class="btn-small" data-i18n-title="panel.edit_order_title" title="进入排序模式：拖动文件夹调整顺序"><span class="icon icon-edit"></span> <span data-i18n="panel.edit_order">排序</span></button>
+                    <button id="btnCollapseAllFolders" class="btn-small" data-i18n-title="panel.collapse_all_title" title="折叠所有展开的文件夹"><span class="icon icon-collapse"></span> <span data-i18n="panel.collapse_all">折叠全部</span></button>
+                </div>
+                <div class="folder-tree" id="folderTree">
+                    <p class="placeholder-text" data-i18n="panel.folder_placeholder">点击"选择文件夹"按钮，使用系统对话框选择图片目录</p>
+                </div>
+            </div>
+
+            <div class="panel-content" id="panelTag">
+                <div class="panel-toolbar">
+                    <button id="btnNewTag" class="btn-primary"><span class="icon icon-add"></span> <span data-i18n="panel.new_tag">新建标签</span></button>
+                    <button id="btnEditTags" class="btn-secondary"><span class="icon icon-edit"></span> <span data-i18n="panel.edit">编辑</span></button>
+                    <button id="btnTagColumns" class="btn-secondary" data-i18n-title="panel.tag_columns_title" title="切换标签列表单列/双列"><span class="icon icon-columns"></span> <span data-i18n="panel.tag_columns">双列</span></button>
+                    <div class="tag-filter">
+                        <label class="favorite-filter">
+                            <input type="checkbox" id="filterFavorites" />
+                            <span><span class="icon icon-favorite-on"></span> <span data-i18n="panel.only_favorites">仅显示收藏</span></span>
+                        </label>
+                    </div>
+                </div>
+                <div class="tag-tree" id="tagTree">
+                    <p class="placeholder-text" data-i18n="panel.tag_placeholder">暂无标签，点击"新建标签"开始创建</p>
+                </div>
+            </div>
+
+            <div class="panel-content" id="panelApi">
+                <div class="panel-toolbar">
+                    <select id="apiConfigSelect" class="config-select">
+                        <option value="" data-i18n="panel.select_config">-- 选择配置 --</option>
+                    </select>
+                    <button id="btnNewApiConfig" class="btn-icon" data-i18n-title="panel.new_config" title="新建配置"><span class="icon icon-add"></span></button>
+                    <button id="btnCloneApiConfig" class="btn-icon" data-i18n-title="panel.clone_config" title="克隆当前配置"><span class="icon icon-copy"></span></button>
+                    <button id="btnRenameApiConfig" class="btn-icon" data-i18n-title="panel.rename_config" title="重命名当前配置"><span class="icon icon-edit"></span></button>
+                    <button id="btnDeleteApiConfig" class="btn-icon btn-danger" data-i18n-title="panel.delete_config" title="删除配置"><span class="icon icon-delete"></span></button>
+                </div>
+                <div class="api-config-form" id="apiConfigForm">
+                    <div class="form-group">
+                        <label data-i18n="panel.config_name">配置名称</label>
+                        <input type="text" id="apiName" data-i18n-placeholder="panel.config_name_placeholder" placeholder="例如：本地 Qwen" />
+                    </div>
+                    <div class="form-group">
+                        <label>API Base URL</label>
+                        <input type="text" id="apiBaseUrl" placeholder="http://localhost:11434/v1" />
+                    </div>
+                    <div class="form-group">
+                        <label>API Key</label>
+                        <input type="password" id="apiKey" placeholder="sk-..." />
+                    </div>
+                    <div class="form-group">
+                        <label data-i18n="panel.model_name">模型名称</label>
+                        <input type="text" id="apiModel" data-i18n-placeholder="panel.model_placeholder" placeholder="输入模型名或点击"检测模型"自动获取" autocomplete="off" />
+                        <div class="model-dropdown-list" id="modelDropdownList" style="display:none;"></div>
+                    </div>
+                    <div class="form-actions" style="margin-bottom:8px;">
+                        <button id="btnSaveApiConfig" class="btn-primary" style="flex:1;"><span class="icon icon-save"></span> <span data-i18n="panel.save_config">保存配置</span></button>
+                        <button id="btnTestApiConfig" class="btn-secondary" style="flex:1;"><span class="icon icon-plug"></span> <span data-i18n="panel.test_api">检测模型</span></button>
+                    </div>
+                    <div class="form-group" style="margin-bottom:12px;">
+                        <label>
+                            <input type="checkbox" id="apiIsDefault" />
+                            <span data-i18n="panel.set_default">设为默认配置</span>
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label>Temperature</label>
+                        <input type="range" id="apiTemperature" min="0" max="2" step="0.1" value="0.7" />
+                        <span class="range-value" id="tempValue">0.7</span>
+                    </div>
+                    <div class="form-group">
+                        <label>Max Tokens</label>
+                        <input type="number" id="apiMaxTokens" value="2048" min="1" max="32768" />
+                    </div>
+                    <div class="form-group">
+                        <label data-i18n="panel.request_timeout">请求超时 (秒)</label>
+                        <input type="number" id="apiTimeout" value="120" min="10" max="600" />
+                    </div>
+                    <div class="form-section">
+                        <h4 class="form-section-title"><span class="icon icon-template"></span> <span data-i18n="panel.prompt_templates">提示词模板</span></h4>
+                        <div class="form-group">
+                            <label>
+                                <input type="checkbox" id="apiStripThinking" />
+                                <span data-i18n="panel.strip_thinking">移除 <think> 推理标签 (DeepSeek-R1 / QwQ)</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label data-i18n="panel.system_prompt">系统提示词 (System Prompt)</label>
+                            <textarea id="apiSystemPrompt" rows="4" data-i18n-placeholder="panel.system_prompt_placeholder" placeholder="你是一个专业的 AI 图片提示词分析专家...&#10;留空则使用默认提示词"></textarea>
+                        </div>
+                        <div class="form-group">
+                            <label data-i18n="panel.user_prompt">用户提示词 (User Prompt)</label>
+                            <textarea id="apiUserPrompt" rows="3" data-i18n-placeholder="panel.user_prompt_placeholder" placeholder="请分析这张 AI 生成的图片...&#10;留空则使用默认提示词"></textarea>
+                        </div>
+                    </div>
+                    <div class="form-section">
+                        <h4 class="form-section-title"><span class="icon icon-web"></span> <span data-i18n="panel.proxy_settings">代理设置</span></h4>
+                        <div class="form-group">
+                            <label>
+                                <input type="checkbox" id="apiProxyEnabled" />
+                                <span data-i18n="panel.enable_proxy">启用代理</span>
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label data-i18n="panel.proxy_host">代理地址</label>
+                            <input type="text" id="apiProxyHost" placeholder="127.0.0.1" />
+                        </div>
+                        <div class="form-group">
+                            <label data-i18n="panel.proxy_port">代理端口</label>
+                            <input type="number" id="apiProxyPort" placeholder="7890" min="1" max="65535" />
+                        </div>
+                    </div>
+                    <div class="form-section">
+                        <h4 class="form-section-title"><span class="icon icon-file"></span> <span data-i18n="panel.reverse_log">反推日志</span></h4>
+                        <button id="btnOpenReverseLog" class="btn-small" style="width:100%;"><span class="icon icon-browse"></span> <span data-i18n="panel.open_reverse_log">打开反推日志文件</span></button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="panel-batch-actions" id="batchActions" style="display:none;">
+                <span id="batchCount" data-i18n="batch.selected">已选 0 张</span>
+                <button id="btnBatchTag" class="btn-small"><span class="icon icon-tag" style="pointer-events:none;"></span> <span data-i18n="batch.tag" style="pointer-events:none;">打标签</span></button>
+                <button id="btnBatchUntag" class="btn-small"><span class="icon icon-none" style="pointer-events:none;"></span> <span data-i18n="batch.untag" style="pointer-events:none;">取消标签</span></button>
+                <button id="btnBatchFavorite" class="btn-small"><span class="icon icon-favorite-on" style="pointer-events:none;"></span> <span data-i18n="batch.favorite" style="pointer-events:none;">收藏</span></button>
+                <button id="btnBatchUnfavorite" class="btn-small"><span class="icon icon-broken" style="pointer-events:none;"></span> <span data-i18n="batch.unfavorite" style="pointer-events:none;">取消收藏</span></button>
+                <button id="btnBatchReverse" class="btn-small btn-accent"><span class="icon icon-bot" style="pointer-events:none;"></span> <span data-i18n="batch.reverse" style="pointer-events:none;">批量反推</span></button>
+                <button id="btnClearSelection" class="btn-small"><span class="icon icon-close" style="pointer-events:none;"></span> <span data-i18n="batch.clear_selection" style="pointer-events:none;">取消选择</span></button>
+            </div>
+
+            <div class="batch-progress" id="batchProgress" style="display:none;">
+                <span class="batch-progress-text" id="batchProgressText">0/0</span>
+                <div class="batch-progress-bar"><div class="batch-progress-fill" id="batchProgressFill"></div></div>
+                <button id="btnBatchPause" class="btn-small" data-i18n-title="batch.pause" title="暂停"><span class="icon icon-pause" style="pointer-events:none;"></span></button>
+                <button id="btnBatchStop" class="btn-small btn-danger-icon" data-i18n-title="batch.stop" title="停止"><span class="icon icon-close" style="pointer-events:none;"></span></button>
+            </div>
+        </aside>
+
+        <div class="panel-resizer" id="leftResizer"></div>
+
+        <main id="galleryContainer">
+            <div class="gallery-toolbar">
+                <div class="toolbar-left">
+                    <div class="layout-dropdown">
+                        <button class="layout-dropdown-btn" id="layoutDropdownBtn" data-i18n-title="toolbar.switch_layout" title="切换布局">
+                            <span class="icon icon-grid" id="layoutDropdownIcon"></span>
+                            <span class="dropdown-arrow">&#9662;</span>
+                        </button>
+                        <div class="layout-dropdown-menu" id="layoutDropdownMenu">
+                            <div class="layout-option" data-layout="grid">
+                                <span class="icon icon-grid"></span>
+                                <span data-i18n="toolbar.layout.grid">网格布局</span>
+                            </div>
+                            <div class="layout-option" data-layout="masonry">
+                                <span class="icon icon-masonry"></span>
+                                <span data-i18n="toolbar.layout.masonry">瀑布流</span>
+                            </div>
+                            <div class="layout-option" data-layout="pinterest">
+                                <span class="icon icon-pinterest"></span>
+                                <span data-i18n="toolbar.layout.pinterest">竖版瀑布流</span>
+                            </div>
+                            <div class="layout-option" data-layout="list">
+                                <span class="icon icon-list"></span>
+                                <span data-i18n="toolbar.layout.list">列表</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="thumbnail-slider">
+                        <label data-i18n="toolbar.thumbnail_size">缩略图大小</label>
+                        <input type="range" id="thumbnailSize" min="120" max="400" value="220" step="10" />
+                        <span id="thumbnailSizeValue">220px</span>
+                    </div>
+                    <div class="toolbar-divider"></div>
+                    <button id="btnEditMode" class="edit-mode-btn" data-i18n-title="toolbar.edit_mode_title" title="编辑模式：单击选择图片，支持 Ctrl/Shift 批量选择"><span class="icon icon-edit"></span> <span data-i18n="toolbar.edit_mode">编辑</span></button>
+                    <button id="btnInertiaToggle" class="edit-mode-btn" data-i18n-title="toolbar.inertia_title" title="惯性滚动：开启后滚轮有惯性滑行效果，右键空白区域可调参"><span class="icon icon-processing"></span> <span data-i18n="toolbar.inertia">惯性</span></button>
+                    <span class="image-count inertia-image-count" id="imageCount">0 <span data-i18n="toolbar.image_count">张图片</span></span>
+                </div>
+                <div class="toolbar-right">
+                    <button id="btnShowPromptCount" class="toolbar-prompt-count-btn" data-i18n-title="toolbar.show_prompt_count" title="显示提示词版本数量"><span class="icon icon-numbered"></span></button>
+                    <button id="lockRightPanel" class="toolbar-lock-btn" data-i18n-title="toolbar.lock_panel" title="锁定详情面板：锁定后单击图片放大，面板不弹出"><span class="icon icon-unlock"></span></button>
+                    <select id="sortOrder" class="sort-select">
+                        <option value="name-asc">A-Z</option>
+                        <option value="name-desc">Z-A</option>
+                        <option value="date-desc" selected data-i18n="sort.newest_first">新→旧</option>
+                        <option value="date-asc" data-i18n="sort.oldest_first">旧→新</option>
+                        <option value="size-desc" data-i18n="sort.largest_first">大→小</option>
+                        <option value="size-asc" data-i18n="sort.smallest_first">小→大</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="edit-mode-banner" id="editModeBanner">
+                <span class="edit-mode-hint"><span class="icon icon-edit"></span> <span data-i18n="edit.banner">编辑模式已开启 - 单击选择/取消选择图片，支持 <kbd>Ctrl</kbd> 多选、<kbd>Shift</kbd> 范围选择</span></span>
+                <button class="edit-mode-close" id="btnExitEditMode" data-i18n-title="edit.exit" title="退出编辑模式"><span class="icon icon-close"></span></button>
+            </div>
+
+            <div class="gallery-scroll" id="galleryScroll">
+                <div class="gallery-grid" id="galleryGrid"></div>
+                <p class="placeholder-text gallery-placeholder" id="galleryPlaceholder" data-i18n="gallery.placeholder">请先在左侧选择一个文件夹来浏览图片</p>
+            </div>
+
+            <div class="loading-indicator" id="loadingIndicator" style="display:none;">
+                <div class="spinner"></div>
+                <span data-i18n="gallery.loading">加载中...</span>
+            </div>
+        </main>
+
+        <aside id="rightPanel">
+            <div class="detail-layout" id="detailLayout">
+                <div class="detail-content" id="detailContent">
+                    <div class="detail-placeholder" id="detailPlaceholder">
+                        <p><span class="icon icon-back"></span> <span data-i18n="detail.click_to_view">点击图片查看详情</span></p>
+                    </div>
+                    <div class="detail-info" id="detailInfo" style="display:none;">
+                        <div class="detail-preview" id="detailPreview">
+                            <img id="detailImage" src="" alt="预览" />
+                            <div class="preview-actions">
+                                <button id="btnOpenOriginal" data-i18n-title="detail.locate_file" title="在文件资源管理器中定位此文件"><span class="icon icon-browse"></span> <span data-i18n="detail.locate_file">定位文件</span></button>
+                            </div>
+                        </div>
+                        <div class="detail-section">
+                            <h3><span class="icon icon-tag"></span> <span data-i18n="detail.tags_favorites">标签与收藏</span></h3>
+                            <div class="tags-display" id="imageTags"></div>
+                            <div class="tag-actions">
+                                <select id="tagSelect" class="tag-select">
+                                    <option value="" data-i18n="detail.add_tag">-- 添加标签 --</option>
+                                </select>
+                                <button id="btnAddTag" class="btn-small" data-i18n="detail.add">添加</button>
+                                <button id="btnToggleFavorite" class="btn-small"><span class="icon icon-favorite-on"></span> <span data-i18n="detail.favorite">收藏</span></button>
+                            </div>
+                        </div>
+                        <div class="detail-section">
+                            <h3><span class="icon icon-file"></span> <span data-i18n="detail.file_info">文件信息</span></h3>
+                            <div class="info-grid" id="fileInfo"></div>
+                        </div>
+                        <div class="detail-section">
+                            <div class="section-header">
+                                <h3><span class="icon icon-template"></span> <span data-i18n="detail.prompt">提示词</span></h3>
+                                <div class="prompt-version-nav">
+                                    <button id="btnPrevPrompt" data-i18n-title="detail.prev_version" title="上一个版本"><span class="icon icon-collapse"></span></button>
+                                    <span id="promptVersionLabel">1/1</span>
+                                    <button id="btnNextPrompt" data-i18n-title="detail.next_version" title="下一个版本"><span class="icon icon-expand"></span></button>
+                                    <button id="btnDeletePrompt" class="btn-danger-icon" data-i18n-title="detail.delete_version" title="删除当前版本"><span class="icon icon-close"></span></button>
+                                    <button id="btnAddPrompt" data-i18n-title="detail.add_prompt" title="添加自定义提示词"><span class="icon icon-add"></span></button>
+                                </div>
+                            </div>
+                            <div class="prompt-display" id="promptDisplay">
+                                <div class="prompt-block">
+                                    <label>Positive Prompt</label>
+                                    <pre id="positivePrompt"></pre>
+                                </div>
+                                <div class="prompt-block">
+                                    <label>Negative Prompt</label>
+                                    <pre id="negativePrompt"></pre>
+                                </div>
+                            </div>
+                            <button id="btnGeneratePrompt" class="btn-primary full-width"><span class="icon icon-bot"></span> <span data-i18n="detail.ai_reverse">AI 反推提示词</span></button>
+                            <button id="btnStopGenerate" class="btn-danger full-width" style="display:none;"><span class="icon icon-stop"></span> <span data-i18n="detail.stop_generate">停止生成</span></button>
+                            <select id="detailApiConfigSelect" class="detail-config-select" data-i18n-title="detail.select_api_config" title="选择 API 配置">
+                                <option value="" data-i18n="detail.select_api_config">-- 选择 API 配置 --</option>
+                            </select>
+                        </div>
+                        <div class="detail-section">
+                            <div class="section-header">
+                                <h3><span class="icon icon-settings"></span> <span data-i18n="detail.params">生成参数</span></h3>
+                                <div class="prompt-version-nav">
+                                    <button id="btnToggleRawMetadata" data-i18n-title="detail.metadata" title="在右侧单独展开原始元数据栏"><span data-i18n="detail.metadata">元数据</span></button>
+                                    <button id="btnCopyRawMetadata" data-i18n-title="detail.copy" title="复制原始元数据"><span data-i18n="detail.copy">复制</span></button>
+                                </div>
+                            </div>
+                            <div class="params-grid" id="paramsGrid"></div>
+                        </div>
+                    </div>
+                </div>
+                <aside class="raw-metadata-sidebar hidden" id="rawMetadataPanel">
+                    <div class="raw-metadata-sidebar-header">
+                        <div>
+                            <div class="raw-metadata-sidebar-title" data-i18n="detail.metadata">元数据</div>
+                            <div class="raw-metadata-tip" data-i18n="detail.metadata_tip">展示图片附带的全部原始元数据块</div>
+                        </div>
+                        <button id="btnCloseRawMetadata" class="btn-danger-icon" data-i18n-title="detail.close_metadata" title="关闭元数据栏"><span class="icon icon-close"></span></button>
+                    </div>
+                    <div class="raw-metadata-list" id="rawMetadataList"></div>
+                </aside>
+            </div>
+        </aside>
+    </div>
+
+    <!-- 移动端面板遮罩层 -->
+    <div class="panel-overlay" id="panelOverlay"></div>
+
+    <!-- 移动端底部导航栏 -->
+    <nav class="mobile-navbar" id="mobileNavbar">
+        <button id="mobileNavFolder" data-i18n-title="panel.folder" title="文件夹">
+            <span class="icon icon-folder"></span>
+            <span data-i18n="panel.folder">文件夹</span>
+        </button>
+        <button id="mobileNavInfo" data-i18n-title="detail.title" title="信息">
+            <span class="icon icon-file"></span>
+            <span data-i18n="detail.title">信息</span>
+        </button>
+    </nav>
+
+    <div class="modal-overlay" id="modalOverlay" style="display:none;">
+        <div class="modal-content" id="modalContent"></div>
+    </div>
+
+    <div class="image-viewer-overlay" id="imageViewerOverlay" style="display:none;">
+        <div class="image-viewer-container" id="imageViewerContainer">
+            <button class="image-viewer-close" id="imageViewerClose" data-i18n-title="viewer.close"><span class="icon icon-close"></span></button>
+            <button class="image-viewer-nav image-viewer-nav-prev" id="imageViewerPrev" data-i18n-title="viewer.prev">‹</button>
+            <button class="image-viewer-nav image-viewer-nav-next" id="imageViewerNext" data-i18n-title="viewer.next">›</button>
+            <div class="image-viewer-shortcuts" id="imageViewerShortcuts">
+                <button class="image-viewer-shortcut-btn" id="shortcutRotate"><span class="icon icon-refresh"></span> <kbd>R</kbd> <span class="shortcut-text" data-i18n="viewer.rotate_btn">旋转</span></button>
+                <button class="image-viewer-shortcut-btn" id="shortcutReset"><span class="icon icon-reset"></span> <kbd>0</kbd> <span class="shortcut-text" data-i18n="viewer.reset_btn">重置</span></button>
+                <button class="image-viewer-shortcut-btn" id="shortcutOriginal"><kbd>1:1</kbd></button>
+                <button class="image-viewer-shortcut-btn" id="shortcutFullscreen"><span class="icon icon-fullscreen"></span> <kbd>F</kbd> <span class="shortcut-text" data-i18n="viewer.fullscreen_btn">全屏</span></button>
+                <button class="image-viewer-shortcut-btn" id="shortcutPrev"><span class="icon icon-collapse"></span> <kbd>←</kbd></button>
+                <button class="image-viewer-shortcut-btn" id="shortcutNext"><kbd>→</kbd> <span class="icon icon-expand"></span></button>
+                <button class="image-viewer-shortcut-btn" id="shortcutFilmstrip"><span class="icon icon-menu"></span> <kbd>T</kbd> <span class="shortcut-text" data-i18n="viewer.filmstrip_btn">缩略图</span></button>
+                <button class="image-viewer-shortcut-btn" id="shortcutParams"><span class="icon icon-template"></span> <kbd>P</kbd> <span class="shortcut-text" data-i18n="viewer.params_btn">信息</span></button>
+                <button class="image-viewer-shortcut-btn" id="imageViewerSlideshowShortcut">
+                    <span class="icon icon-play"></span> <kbd>Space</kbd> <span class="shortcut-text" data-i18n="viewer.slideshow_btn">幻灯片</span>
+                </button>
+                <span class="image-viewer-interval-stepper" id="imageViewerIntervalStepper">
+                    <button class="image-viewer-interval-btn" id="intervalMinus">−</button>
+                    <span class="image-viewer-interval-val" id="intervalVal">2s</span>
+                    <button class="image-viewer-interval-btn" id="intervalPlus">+</button>
+                </span>
+                <button class="image-viewer-shortcut-btn" id="shortcutClose"><span class="icon icon-close"></span> <kbd>Esc</kbd> <span class="shortcut-text" data-i18n="viewer.close_btn">关闭</span></button>
+            </div>
+            <div class="image-viewer-wrapper" id="imageViewerWrapper">
+                <img id="imageViewerImg" src="" alt="" />
+            </div>
+            <div class="image-viewer-info" id="imageViewerInfo">
+                <div class="image-viewer-info-left">
+                    <span class="image-viewer-filename" id="imageViewerFilename"></span>
+                    <span class="image-viewer-position" id="imageViewerPosition"></span>
+                </div>
+                <div class="image-viewer-info-right"><span class="image-viewer-zoom-level" id="imageViewerZoomLevel">100%</span></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="image-viewer-filmstrip" id="imageViewerFilmstrip" style="display:none;">
+        <div class="image-viewer-filmstrip-list" id="imageViewerFilmstripList"></div>
+    </div>
+
+    <div class="toast-container" id="toastContainer"></div>
+
+    <input type="file" id="hiddenImportInput" accept=".json" style="display:none;" />
+    <input type="file" id="hiddenFolderInput" webkitdirectory directory multiple style="display:none;" />
+
+    <!-- Wails 运行时 -->
+    <script src="js/wails-bridge.js"></script>
+    <!-- JavaScript 模块 -->
+    <script src="js/i18n.js"></script>
+    <script src="js/storage.js"></script>
+    <script src="js/icon-helper.js"></script>
+    <script src="js/metadata.js"></script>
+    <script src="js/api.js"></script>
+    <script src="js/sidebar.js"></script>
+    <div class="image-context-menu" id="folderContextMenu" style="display:none;">
+        <button data-action="refresh"><span class="icon icon-refresh"></span> <span data-i18n="ctx.refresh">刷新</span></button>
+        <button data-action="convertTag"><span class="icon icon-tag"></span> <span data-i18n="ctx.convert_tag">转换为标签</span></button>
+    </div>
+    <div class="image-context-menu" id="imageContextMenu" style="display:none;">
+        <button id="ctxOpenInFolder"><span class="icon icon-browse"></span> <span data-i18n="ctx.open_folder">在文件夹中打开</span></button>
+        <button id="ctxTrackFolder"><span class="icon icon-search"></span> <span data-i18n="ctx.track_folder">追踪文件夹</span></button>
+    </div>
+
+    <!-- 文件夹类型选择对话框 -->
+    <script src="js/gallery.js"></script>
+    <script src="js/detail.js"></script>
+    <script src="js/search.js"></script>
+    <script src="js/import-export.js"></script>
+    <script src="js/settings.js"></script>
+    <script src="js/diagnose-import.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>

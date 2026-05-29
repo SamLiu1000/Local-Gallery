@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="gridCell" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#A0B8E0"/>
+      <stop offset="100%" stop-color="#5878B8"/>
+    </linearGradient>
+    <linearGradient id="gridCellAlt" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#8AA8D0"/>
+      <stop offset="100%" stop-color="#4868A8"/>
+    </linearGradient>
+    <filter id="gridShadow">
+      <feDropShadow dx="0" dy="1" stdDeviation="1" flood-color="#1A2848" flood-opacity="0.3"/>
+    </filter>
+  </defs>
+  <!-- 2x2 grid cells with slight 3D -->
+  <rect x="5" y="5" width="17" height="17" rx="3" fill="url(#gridCell)" filter="url(#gridShadow)"/>
+  <rect x="26" y="5" width="17" height="17" rx="3" fill="url(#gridCell)" filter="url(#gridShadow)"/>
+  <rect x="5" y="26" width="17" height="17" rx="3" fill="url(#gridCellAlt)" filter="url(#gridShadow)"/>
+  <rect x="26" y="26" width="17" height="17" rx="3" fill="url(#gridCell)" filter="url(#gridShadow)"/>
+  <!-- Shine on each cell -->
+  <rect x="5" y="5" width="17" height="7" rx="3" fill="#fff" opacity="0.2"/>
+  <rect x="26" y="5" width="17" height="7" rx="3" fill="#fff" opacity="0.2"/>
+  <rect x="5" y="26" width="17" height="7" rx="3" fill="#fff" opacity="0.2"/>
+  <rect x="26" y="26" width="17" height="7" rx="3" fill="#fff" opacity="0.2"/>
+</svg>

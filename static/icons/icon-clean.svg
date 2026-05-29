@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="brushHandle" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#C8A870"/>
+      <stop offset="100%" stop-color="#8A6030"/>
+    </linearGradient>
+    <linearGradient id="brushHead" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#E8D0A8"/>
+      <stop offset="100%" stop-color="#B09060"/>
+    </linearGradient>
+    <linearGradient id="sparkle" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFE860"/>
+      <stop offset="100%" stop-color="#FFB800"/>
+    </linearGradient>
+    <filter id="cleanShadow">
+      <feDropShadow dx="0" dy="2" stdDeviation="1.5" flood-color="#3A2000" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+  <!-- Broom handle -->
+  <rect x="22" y="5" width="5" height="26" rx="2.5" fill="url(#brushHandle)" transform="rotate(15 24.5 18)" filter="url(#cleanShadow)"/>
+  <rect x="22.5" y="5" width="1.5" height="26" rx="0.75" fill="#fff" opacity="0.3" transform="rotate(15 24.5 18)"/>
+  <!-- Broom head -->
+  <ellipse cx="17" cy="36" rx="13" ry="7" fill="url(#brushHead)" transform="rotate(15 17 36)" filter="url(#cleanShadow)"/>
+  <!-- Bristles -->
+  <g stroke="#8A6030" stroke-width="1.5" stroke-linecap="round" opacity="0.7" transform="rotate(15 17 36)">
+    <line x1="8" y1="38" x2="6" y2="44"/>
+    <line x1="12" y1="40" x2="11" y2="46"/>
+    <line x1="17" y1="41" x2="17" y2="47"/>
+    <line x1="22" y1="40" x2="23" y2="46"/>
+    <line x1="26" y1="38" x2="28" y2="44"/>
+  </g>
+  <!-- Sparkles -->
+  <path d="M36 10 L37.5 14 L41 10 L37.5 6 Z" fill="url(#sparkle)" opacity="0.9"/>
+  <path d="M40 20 L41 23 L44 20 L41 17 Z" fill="url(#sparkle)" opacity="0.7"/>
+  <circle cx="33" cy="18" r="1.5" fill="#FFE860" opacity="0.8"/>
+</svg>

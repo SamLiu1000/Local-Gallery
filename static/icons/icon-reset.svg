@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="resetGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#9AB0E8"/>
+      <stop offset="100%" stop-color="#5068B8"/>
+    </linearGradient>
+    <filter id="resetShadow">
+      <feDropShadow dx="0" dy="1.5" stdDeviation="1.5" flood-color="#1A2868" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+  <!-- Two curved arrows (reset/restore) -->
+  <g filter="url(#resetShadow)">
+    <!-- Top arrow -->
+    <path d="M24 8 A14 14 0 0 1 38 22" fill="none" stroke="url(#resetGrad)" stroke-width="5" stroke-linecap="round"/>
+    <polygon points="38,15 38,27 30,21" fill="#6888D0"/>
+    <!-- Bottom arrow -->
+    <path d="M24 40 A14 14 0 0 1 10 26" fill="none" stroke="url(#resetGrad)" stroke-width="5" stroke-linecap="round"/>
+    <polygon points="10,33 10,21 18,27" fill="#6888D0"/>
+  </g>
+  <!-- Shine -->
+  <path d="M24 8 A14 14 0 0 1 38 22" fill="none" stroke="#fff" stroke-width="1.5" stroke-linecap="round" opacity="0.4"/>
+</svg>

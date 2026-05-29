@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="stopGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#F06060"/>
+      <stop offset="100%" stop-color="#C01818"/>
+    </linearGradient>
+    <filter id="stopShadow">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#600000" flood-opacity="0.5"/>
+    </filter>
+  </defs>
+  <!-- Octagon stop sign shape -->
+  <polygon points="15,5 33,5 43,15 43,33 33,43 15,43 5,33 5,15" fill="url(#stopGrad)" filter="url(#stopShadow)"/>
+  <!-- Shine top edge -->
+  <polygon points="15,5 33,5 38,10 10,10" fill="#fff" opacity="0.2"/>
+  <!-- Stop square in center -->
+  <rect x="16" y="16" width="16" height="16" rx="2" fill="#fff"/>
+</svg>

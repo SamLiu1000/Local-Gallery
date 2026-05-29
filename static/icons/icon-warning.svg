@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="warnGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFD840"/>
+      <stop offset="100%" stop-color="#F09000"/>
+    </linearGradient>
+    <filter id="warnShadow">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#6A3000" flood-opacity="0.5"/>
+    </filter>
+  </defs>
+  <!-- Triangle -->
+  <polygon points="24,5 44,42 4,42" fill="url(#warnGrad)" filter="url(#warnShadow)"/>
+  <!-- Inner triangle shine -->
+  <polygon points="24,8 41,40 24,40" fill="#fff" opacity="0.1"/>
+  <!-- Shine top edge -->
+  <line x1="24" y1="5" x2="38" y2="31" stroke="#fff" stroke-width="1.5" opacity="0.3" stroke-linecap="round"/>
+  <!-- Exclamation mark -->
+  <rect x="21.5" y="17" width="5" height="14" rx="2.5" fill="#7A3800"/>
+  <circle cx="24" cy="36" r="3" fill="#7A3800"/>
+</svg>

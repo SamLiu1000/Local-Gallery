@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="userBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7090E0"/>
+      <stop offset="100%" stop-color="#3858B8"/>
+    </linearGradient>
+    <linearGradient id="userSkin" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#FFCFA0"/>
+      <stop offset="100%" stop-color="#E8A870"/>
+    </linearGradient>
+    <filter id="userShadow">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#0A1838" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+  <!-- Background circle -->
+  <circle cx="24" cy="24" r="20" fill="url(#userBg)" filter="url(#userShadow)"/>
+  <ellipse cx="18" cy="17" rx="7" ry="4" fill="#fff" opacity="0.18" transform="rotate(-30 18 17)"/>
+  <!-- Body / shoulders -->
+  <path d="M6 42 Q8 30 24 30 Q40 30 42 42 Z" fill="#5478C8" clip-path="url(#userClip)"/>
+  <clipPath id="userClip">
+    <circle cx="24" cy="24" r="20"/>
+  </clipPath>
+  <!-- Head -->
+  <circle cx="24" cy="19" r="9" fill="url(#userSkin)"/>
+  <!-- Face shine -->
+  <ellipse cx="21" cy="15" rx="3.5" ry="2" fill="#fff" opacity="0.3" transform="rotate(-20 21 15)"/>
+</svg>

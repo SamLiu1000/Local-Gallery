@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="gearTop" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#8A8FA8"/>
+      <stop offset="100%" stop-color="#545870"/>
+    </linearGradient>
+    <linearGradient id="gearCenter" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#9EA3BE"/>
+      <stop offset="100%" stop-color="#6B6F86"/>
+    </linearGradient>
+    <filter id="gearShadow">
+      <feDropShadow dx="0" dy="1.5" stdDeviation="1.5" flood-color="#2B2D3A" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+  <!-- Gear body -->
+  <g filter="url(#gearShadow)">
+    <path d="M24 6 L26.8 10.2 L31.8 9.1 L33.5 14 L38.5 15.8 L37.4 20.8 L41.6 24 L37.4 27.2 L38.5 32.2 L33.5 34 L31.8 38.9 L26.8 37.8 L24 42 L21.2 37.8 L16.2 38.9 L14.5 34 L9.5 32.2 L10.6 27.2 L6.4 24 L10.6 20.8 L9.5 15.8 L14.5 14 L16.2 9.1 L21.2 10.2 Z" fill="url(#gearTop)"/>
+  </g>
+  <!-- Inner hole -->
+  <circle cx="24" cy="24" r="8" fill="url(#gearCenter)"/>
+  <circle cx="24" cy="24" r="5" fill="#3D3F52"/>
+  <!-- Shine -->
+  <ellipse cx="20" cy="18" rx="5" ry="3" fill="#fff" opacity="0.15" transform="rotate(-30 20 18)"/>
+</svg>

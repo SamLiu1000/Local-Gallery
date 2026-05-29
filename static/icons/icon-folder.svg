@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="folderBack" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#E8A43C"/>
+      <stop offset="100%" stop-color="#B8720A"/>
+    </linearGradient>
+    <linearGradient id="folderFront" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#F5C060"/>
+      <stop offset="100%" stop-color="#D4900F"/>
+    </linearGradient>
+    <filter id="folderShadow">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#6B3E00" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+  <!-- Back panel -->
+  <path d="M4 16 L4 40 Q4 44 8 44 L40 44 Q44 44 44 40 L44 16 Z" fill="url(#folderBack)" filter="url(#folderShadow)"/>
+  <!-- Tab -->
+  <path d="M4 16 L4 13 Q4 10 7 10 L20 10 Q23 10 24 13 L25.5 16 Z" fill="#E8A43C"/>
+  <!-- Front panel -->
+  <path d="M4 20 L4 40 Q4 44 8 44 L40 44 Q44 44 44 40 L44 20 Z" fill="url(#folderFront)"/>
+  <!-- Shine -->
+  <path d="M6 20 L42 20 L42 24 Q24 27 6 24 Z" fill="#fff" opacity="0.15"/>
+</svg>

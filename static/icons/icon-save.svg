@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="diskBody" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#6880C0"/>
+      <stop offset="100%" stop-color="#3A509A"/>
+    </linearGradient>
+    <linearGradient id="diskLabel" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#E8EEFF"/>
+      <stop offset="100%" stop-color="#B8C0E0"/>
+    </linearGradient>
+    <filter id="diskShadow">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#101838" flood-opacity="0.5"/>
+    </filter>
+  </defs>
+  <!-- Floppy body -->
+  <rect x="6" y="6" width="36" height="36" rx="4" fill="url(#diskBody)" filter="url(#diskShadow)"/>
+  <!-- Notch top right -->
+  <rect x="30" y="6" width="12" height="8" rx="2" fill="#2A3878"/>
+  <!-- Metal slider -->
+  <rect x="31" y="7" width="5" height="6" rx="1" fill="#8090B8"/>
+  <!-- Label area -->
+  <rect x="9" y="20" width="30" height="18" rx="2" fill="url(#diskLabel)"/>
+  <!-- Label lines -->
+  <rect x="12" y="25" width="18" height="2" rx="1" fill="#7080A8" opacity="0.5"/>
+  <rect x="12" y="29" width="12" height="2" rx="1" fill="#7080A8" opacity="0.4"/>
+  <!-- Shine -->
+  <rect x="6" y="6" width="36" height="8" rx="4" fill="#fff" opacity="0.15"/>
+</svg>

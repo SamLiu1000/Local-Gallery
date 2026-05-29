@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="listRow" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#A0B8E0"/>
+      <stop offset="100%" stop-color="#5878B8"/>
+    </linearGradient>
+    <linearGradient id="listRowAlt" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#8AA8D0"/>
+      <stop offset="100%" stop-color="#4868A8"/>
+    </linearGradient>
+    <filter id="listShadow">
+      <feDropShadow dx="0" dy="1" stdDeviation="1" flood-color="#1A2848" flood-opacity="0.3"/>
+    </filter>
+  </defs>
+
+  <!-- 第1行 -->
+  <rect x="6" y="6" width="36" height="9" rx="3" fill="url(#listRow)" filter="url(#listShadow)"/>
+  <rect x="6" y="6" width="36" height="4" rx="3" fill="#fff" opacity="0.2"/>
+
+  <!-- 第2行 -->
+  <rect x="6" y="19.5" width="36" height="9" rx="3" fill="url(#listRow)" filter="url(#listShadow)"/>
+  <rect x="6" y="19.5" width="36" height="4" rx="3" fill="#fff" opacity="0.2"/>
+
+  <!-- 第3行 -->
+  <rect x="6" y="33" width="36" height="9" rx="3" fill="url(#listRowAlt)" filter="url(#listShadow)"/>
+  <rect x="6" y="33" width="36" height="4" rx="3" fill="#fff" opacity="0.2"/>
+</svg>

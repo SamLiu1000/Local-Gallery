@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="masonryB" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#A8C0E8"/>
+      <stop offset="100%" stop-color="#5878B8"/>
+    </linearGradient>
+    <filter id="masonryShadow">
+      <feDropShadow dx="0" dy="1" stdDeviation="1" flood-color="#000" flood-opacity="0.25"/>
+    </filter>
+  </defs>
+  
+  <!-- Top row: short card + tall card -->
+  <rect x="5"  y="5" width="11" height="17" rx="3" fill="url(#masonryB)" filter="url(#masonryShadow)"/>
+  <rect x="5"  y="5" width="11" height="5"  rx="3" fill="#fff" opacity="0.18"/>
+
+  <rect x="19" y="5" width="24" height="17" rx="3" fill="url(#masonryB)" filter="url(#masonryShadow)"/>
+  <rect x="19" y="5" width="24" height="5"  rx="3" fill="#fff" opacity="0.18"/>
+
+  <!-- Bottom row: tall card + short card -->
+  <rect x="5"  y="26" width="24" height="17" rx="3" fill="url(#masonryB)" filter="url(#masonryShadow)"/>
+  <rect x="5"  y="26" width="24" height="5"  rx="3" fill="#fff" opacity="0.18"/>
+
+  <rect x="33" y="26" width="10" height="17" rx="3" fill="url(#masonryB)" filter="url(#masonryShadow)"/>
+  <rect x="33" y="26" width="10" height="5"  rx="3" fill="#fff" opacity="0.18"/>
+</svg>
