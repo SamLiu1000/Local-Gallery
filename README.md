@@ -1,3 +1,5 @@
+[English](./README.md) | [中文](./README_zh.md)
+
 Local Gallery
 > A lightweight yet powerful image management tool with AI metadata support —
 > a hub of art and inspiration you'll want to open every day.
@@ -33,3 +35,10 @@ Just click the edit button at the top of the album, and you'll see the editing o
 </div>
 
 7. **AI-generated image metadata** — supports reading metadata from nearly all mainstream AI image generation tools.
+
+
+-----------------------------
+I've done deep optimization on image browsing performance, so even when you're browsing millions of images, it feels smooth and effortless. 
+The only time it uses up your computer's performance is the first time it generates thumbnails.
+
+If you find an exception with your own images, feel free to open an issue on GitHub and attach the original image — I'll add support for it when I get a chance.
