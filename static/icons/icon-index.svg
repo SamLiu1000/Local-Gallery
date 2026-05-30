@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#f97316" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <!-- 上方横索 -->
+  <line x1="4" y1="3" x2="20" y2="3" stroke-width="1.8"/>
+  
+  <!-- 左侧竖直绳（有结） -->
+  <line x1="7" y1="3" x2="7" y2="9.5"/>
+  
+  <!-- 绳结（左侧） -->
+  <ellipse cx="7" cy="11.2" rx="2.8" ry="2.2" stroke-width="1.6"/>
+  <path d="M5.5 10.2 Q7 9.2 8.5 10.2" stroke-width="1.4"/>
+  <path d="M5.5 12.2 Q7 13.2 8.5 12.2" stroke-width="1.4"/>
+  <path d="M7 9 L7 13.4" stroke-width="1.4"/>
+  
+  <line x1="7" y1="13.4" x2="7" y2="22" stroke-width="1.8"/>
+  
+  <!-- 中间竖直绳（上半段） -->
+  <line x1="12" y1="3" x2="12" y2="9"/>
+  
+  <!-- 中间绳下半段弯曲连接到右侧绳 -->
+  <path d="M12 9 C12 13 17 13 17 9" stroke-width="1.8"/>
+  
+  <!-- 右侧竖直绳（上半段） -->
+  <line x1="17" y1="3" x2="17" y2="9"/>
+  
+  <!-- 弯曲连接后的共同下端 -->
+  <line x1="14.5" y1="12" x2="14.5" y2="20" stroke-width="1.5"/>
+</svg>

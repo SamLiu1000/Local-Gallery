@@ -5,7 +5,7 @@
   "frontend:build": "",
   "frontend:dev:watcher": "",
   "frontend:dev:serverUrl": "",
-  "icon": "appicon.png",
+  "icon": "",
   "author": {
     "name": "SamLiu1000",
     "email": "sam.liu99@yahoo.com"
