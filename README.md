@@ -36,6 +36,11 @@ Just click the edit button at the top of the album, and you'll see the editing o
 
 7. **AI-generated image metadata** — supports reading metadata from nearly all mainstream AI image generation tools.
 
+8. **WiFi Access** — There's a 'WiFi Access' setting in the options. What this does is, once you launch the program, if your phone or tablet is on the same WiFi as your computer, you can access the mobile version of Local-Gallery through an address like http://192.168.5.30:25876. This is also one of the program's cool features.
+   
+<div align="center">
+<img width="360" alt="mobile" src="https://github.com/user-attachments/assets/526158d2-3877-4d13-abc5-10fc4a17c305" />
+</div>
 
 -----------------------------
 I've done deep optimization on image browsing performance, so even when you're browsing millions of images, it feels smooth and effortless. 
