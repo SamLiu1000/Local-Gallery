@@ -3690,11 +3690,14 @@ const Gallery = (() => {
         }
 
         // 垂直方向：优先下展，不够则上展
-        // 当 maxH 为 none（标签少时），不需要限制垂直高度
         const spaceBelow = vh - btnRect.bottom;
         const spaceAbove = btnRect.top;
         if (dropdown.style.maxHeight === 'none') {
-            dropdown.style.top = (btnRect.bottom + 4) + 'px';
+            if (spaceBelow >= spaceAbove) {
+                dropdown.style.top = (btnRect.bottom + 4) + 'px';
+            } else {
+                dropdown.style.bottom = (vh - btnRect.top + 4) + 'px';
+            }
         } else {
             const currentMaxH = parseFloat(dropdown.style.maxHeight);
             if (spaceBelow >= currentMaxH + 8 || spaceBelow >= spaceAbove) {
