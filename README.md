@@ -1,3 +1,5 @@
+[English](./README.md) | [中文](./README_zh.md)
+
 Local Gallery
 > A lightweight yet powerful image management tool with AI metadata support —
 > a hub of art and inspiration you'll want to open every day.
