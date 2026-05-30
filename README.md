@@ -1,29 +1,35 @@
-
-
-
-
-# Local Gallery
-
+Local Gallery
 > A lightweight yet powerful image management tool with AI metadata support —
 > a hub of art and inspiration you'll want to open every day.
-
 ---
-
 ## Features
-
 1. **Smart thumbnail caching** — load once, browse forever with silky-smooth performance.
 
-https://github.com/user-attachments/assets/6d4c5885-9055-4a5b-b7ce-bf105fbe191f
+<div align="center">
+<video src="https://github.com/user-attachments/assets/6d4c5885-9055-4a5b-b7ce-bf105fbe191f" width="360" controls></video>
+</div>
 
 3. **Fast & solid search** — find any image instantly across your entire collection.
 
 4. **Rich tagging system** — plain text tags, avatar-style tags, and full HTML tags. Supports SVG icons, system font icons, and lets you turn folders into tags for easier organization.
+You can make plain text tags, text with icons, icons only, images with text, images only, or even HTML effect tags.
+That means as long as your imagination is big enough, your tag styles can be turned into literally anything you want. 
+nd don't forget – you can also convert folder paths into tags and customize them however you like.
+
+<div align="center">
+<video src="https://github.com/user-attachments/assets/a517f01e-b4b1-4456-955d-dd27f8c16060" width="360" controls></video>
+</div>
 
 5. **AI integration** — customize API endpoints and system prompts to auto-generate image descriptions.
-
+   
 6. **Multiple prompts per image** — store several prompt descriptions for a single image, either via API or manually.
+This is one of the program's key features. I usually use it to build my own inspiration library.
+You can customize the API's system prompt so the AI can critique or describe the work for you.
+Or you can manually fill in the prompt as your own take on the artwork. It also supports batch AI descriptions.
+Just click the edit button at the top of the album, and you'll see the editing options appear below the folder navigation on the left.
+
+<div align="center">
+<img width="360" alt="edit" src="https://github.com/user-attachments/assets/0c45cf86-b182-47f2-b2f9-2cdf639d4807" />
+</div>
 
 7. **AI-generated image metadata** — supports reading metadata from nearly all mainstream AI image generation tools.
-
-   
----
