@@ -377,15 +377,28 @@ html, body {
 }
 /* 文件夹标签 + 搜索下拉 */
 .folder-multiselect {
-    max-height: 180px;
+    max-height: 220px;
     overflow-y: auto;
     background: var(--bg-input);
     border: 1px solid var(--border-color);
     border-radius: var(--radius-sm);
-    padding: 4px 0;
 }
 .folder-multiselect:focus-within {
     border-color: var(--accent);
+}
+.folder-filter-input {
+    width: 100%;
+    border: none;
+    border-bottom: 1px solid var(--border-color);
+    background: transparent;
+    color: var(--text-primary);
+    font-size: 12px;
+    padding: 5px 8px;
+    outline: none;
+    box-sizing: border-box;
+}
+.folder-filter-input::placeholder {
+    color: var(--text-muted);
 }
 .folder-checkbox-list {
     display: flex;

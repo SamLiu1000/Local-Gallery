@@ -23,6 +23,7 @@ const SearchModule = (() => {
     let advancedSearchPanel;
     let advMatchMode;
     let folderCheckboxList;
+    let folderFilterInput;
     let advDateFrom;
     let advDateTo;
     let conditionsList;
@@ -154,6 +155,7 @@ const SearchModule = (() => {
         advancedSearchPanel = document.getElementById('advancedSearchPanel');
         advMatchMode = document.getElementById('advMatchMode');
         folderCheckboxList = document.getElementById('folderCheckboxList');
+        folderFilterInput = document.getElementById('folderFilterInput');
         advDateFrom = document.getElementById('advDateFrom');
         advDateTo = document.getElementById('advDateTo');
         conditionsList = document.getElementById('conditionsList');
@@ -207,6 +209,13 @@ const SearchModule = (() => {
                 populateFolderCheckboxes();
             }
         });
+
+        // 文件夹筛选输入框：实时过滤列表
+        if (folderFilterInput) {
+            folderFilterInput.addEventListener('input', () => {
+                filterFolderCheckboxes();
+            });
+        }
 
         // 添加条件
         addConditionBtn.addEventListener('click', () => {
@@ -262,6 +271,7 @@ const SearchModule = (() => {
             isAdvancedMode = false;
             currentSearchParams = null;
             if (folderCheckboxList) populateFolderCheckboxes();
+            if (folderFilterInput) folderFilterInput.value = '';
             if (advDateFrom) advDateFrom.value = '';
             if (advDateTo) advDateTo.value = '';
             if (advSearchFoldersCheck) advSearchFoldersCheck.checked = false;
@@ -387,6 +397,31 @@ const SearchModule = (() => {
             });
         } catch (e) {
             return roots;
+        }
+    }
+
+    function filterFolderCheckboxes() {
+        if (!folderCheckboxList || !folderFilterInput) return;
+        const query = folderFilterInput.value.trim().toLowerCase();
+        const items = folderCheckboxList.querySelectorAll('.folder-checkbox-item');
+        let hasVisible = false;
+        for (const item of items) {
+            const text = item.textContent.toLowerCase();
+            const match = !query || text.includes(query);
+            item.style.display = match ? '' : 'none';
+            if (match) hasVisible = true;
+        }
+        // 无匹配项时显示提示
+        let empty = folderCheckboxList.querySelector('.folder-dropdown-empty');
+        if (!hasVisible && items.length > 0) {
+            if (!empty) {
+                empty = document.createElement('div');
+                empty.className = 'folder-dropdown-empty';
+                empty.textContent = t('search.no_folder_match');
+                folderCheckboxList.appendChild(empty);
+            }
+        } else if (empty) {
+            empty.remove();
         }
     }
 
