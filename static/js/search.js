@@ -22,10 +22,7 @@ const SearchModule = (() => {
     let advancedSearchToggle;
     let advancedSearchPanel;
     let advMatchMode;
-    let folderTagsArea;
-    let folderTagsList;
-    let folderSearchInput;
-    let folderDropdownList;
+    let folderCheckboxList;
     let advDateFrom;
     let advDateTo;
     let conditionsList;
@@ -156,10 +153,7 @@ const SearchModule = (() => {
         advancedSearchToggle = document.getElementById('advancedSearchToggle');
         advancedSearchPanel = document.getElementById('advancedSearchPanel');
         advMatchMode = document.getElementById('advMatchMode');
-        folderTagsArea = document.getElementById('folderTagsArea');
-        folderTagsList = document.getElementById('folderTagsList');
-        folderSearchInput = document.getElementById('folderSearchInput');
-        folderDropdownList = document.getElementById('folderDropdownList');
+        folderCheckboxList = document.getElementById('folderCheckboxList');
         advDateFrom = document.getElementById('advDateFrom');
         advDateTo = document.getElementById('advDateTo');
         conditionsList = document.getElementById('conditionsList');
@@ -210,7 +204,7 @@ const SearchModule = (() => {
             advancedSearchPanel.style.display = visible ? 'none' : 'flex';
             advancedSearchToggle.classList.toggle('active', !visible);
             if (!visible) {
-                populateFolderDropdown();
+                populateFolderCheckboxes();
             }
         });
 
@@ -267,9 +261,7 @@ const SearchModule = (() => {
             selectedFolders = [];
             isAdvancedMode = false;
             currentSearchParams = null;
-            if (folderTagsList) folderTagsList.innerHTML = '';
-            if (folderSearchInput) folderSearchInput.value = '';
-            if (folderDropdownList) folderDropdownList.style.display = 'none';
+            if (folderCheckboxList) populateFolderCheckboxes();
             if (advDateFrom) advDateFrom.value = '';
             if (advDateTo) advDateTo.value = '';
             if (advSearchFoldersCheck) advSearchFoldersCheck.checked = false;
@@ -304,28 +296,6 @@ const SearchModule = (() => {
             }
         });
 
-        // 文件夹搜索输入：聚焦/输入时显示下拉
-        if (folderSearchInput) {
-            folderSearchInput.addEventListener('focus', () => {
-                populateFolderDropdown();
-                showFolderDropdown();
-            });
-            folderSearchInput.addEventListener('input', () => {
-                filterFolderDropdown();
-                showFolderDropdown();
-            });
-            // 点击输入框所在区域也触发
-            if (folderTagsArea) {
-                folderTagsArea.addEventListener('click', (e) => {
-                    if (e.target === folderTagsArea) {
-                        folderSearchInput.focus();
-                    }
-                });
-            }
-        }
-
-        // 点击外部关闭下拉（已在下方全局 click 中处理）
-
         // 点击面板外部关闭
         document.addEventListener('click', (e) => {
             if (advancedSearchPanel && advancedSearchPanel.style.display !== 'none') {
@@ -334,16 +304,10 @@ const SearchModule = (() => {
                     advancedSearchToggle.classList.remove('active');
                 }
             }
-            // 点击文件夹下拉外部时关闭
-            if (folderDropdownList && folderDropdownList.style.display !== 'none') {
-                if (!folderTagsArea.contains(e.target)) {
-                    hideFolderDropdown();
-                }
-            }
         });
     }
 
-    // ==================== 文件夹下拉 + 标签 ====================
+    // ==================== 文件夹复选框列表 ====================
 
     function getFolderRoots() {
         let roots = [];
@@ -353,125 +317,77 @@ const SearchModule = (() => {
         return roots;
     }
 
-    function populateFolderDropdown() {
-        if (!folderDropdownList) return;
+    async function populateFolderCheckboxes() {
+        if (!folderCheckboxList) return;
 
-        const roots = getFolderRoots();
-        // 过滤掉已选中的
-        const available = roots.filter(r => !selectedFolders.includes(r.rootId));
+        let roots = getFolderRoots();
+        folderCheckboxList.innerHTML = '';
 
-        folderDropdownList.innerHTML = '';
-        if (available.length === 0) {
-            folderDropdownList.innerHTML = '<div class="folder-dropdown-empty">' + t('search.no_matching_folders') + '</div>';
+        if (roots.length === 0) {
+            folderCheckboxList.innerHTML = '<div class="folder-dropdown-empty">' + t('search.no_matching_folders') + '</div>';
             return;
         }
 
-        for (const root of available) {
+        // 按导航栏顺序排序
+        roots = await sortRootsBySidebarOrder(roots);
+
+        for (const root of roots) {
             const displayName = root.displayName || root.name;
-            const item = document.createElement('div');
-            item.className = 'folder-dropdown-item';
-            item.textContent = displayName;
-            item.dataset.rootId = root.rootId;
-            item.addEventListener('mousedown', (e) => {
-                e.preventDefault(); // 防止 blur 先于 click 触发
-                addFolderTag(root.rootId);
+            const label = document.createElement('label');
+            label.className = 'folder-checkbox-item';
+
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.value = root.rootId;
+            checkbox.checked = selectedFolders.includes(root.rootId);
+            checkbox.addEventListener('change', () => {
+                if (checkbox.checked) {
+                    if (!selectedFolders.includes(root.rootId)) {
+                        selectedFolders.push(root.rootId);
+                    }
+                } else {
+                    selectedFolders = selectedFolders.filter(id => id !== root.rootId);
+                }
             });
-            folderDropdownList.appendChild(item);
+
+            const span = document.createElement('span');
+            span.textContent = displayName;
+
+            label.appendChild(checkbox);
+            label.appendChild(span);
+            folderCheckboxList.appendChild(label);
         }
     }
 
-    function filterFolderDropdown() {
-        if (!folderDropdownList || !folderSearchInput) return;
-
-        const query = folderSearchInput.value.trim().toLowerCase();
-        const items = folderDropdownList.querySelectorAll('.folder-dropdown-item');
-        let visibleCount = 0;
-
-        for (const item of items) {
-            const match = !query || item.textContent.toLowerCase().includes(query);
-            item.style.display = match ? '' : 'none';
-            if (match) visibleCount++;
-        }
-
-        if (visibleCount === 0 && query) {
-            // 只在没有匹配项时显示空提示，避免闪烁
-            const empty = folderDropdownList.querySelector('.folder-dropdown-empty');
-            if (!empty) {
-                const div = document.createElement('div');
-                div.className = 'folder-dropdown-empty';
-                div.textContent = t('search.no_folder_match');
-                folderDropdownList.appendChild(div);
+    /**
+     * 按导航栏文件夹顺序排序，通过读取 sidebar 的排序设置
+     */
+    async function sortRootsBySidebarOrder(roots) {
+        try {
+            let orderList = [];
+            // 从后端读取 sidebar 的文件夹排序
+            if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails()) {
+                const result = await WailsBridge.getSidebarSetting('sidebar_folder_order');
+                if (result && result.success && result.value) {
+                    orderList = JSON.parse(result.value);
+                }
             }
-        } else {
-            const empty = folderDropdownList.querySelector('.folder-dropdown-empty');
-            if (empty) empty.remove();
-        }
-    }
+            if (!Array.isArray(orderList) && typeof Storage !== 'undefined' && Storage.getSetting) {
+                orderList = await Storage.getSetting('sidebar_folder_order', []);
+            }
+            if (!Array.isArray(orderList) || orderList.length === 0) return roots;
 
-    function showFolderDropdown() {
-        if (folderDropdownList) {
-            folderDropdownList.style.display = 'block';
-        }
-    }
+            const orderMap = new Map();
+            orderList.forEach((path, index) => orderMap.set(path, index));
 
-    function hideFolderDropdown() {
-        if (folderDropdownList) {
-            folderDropdownList.style.display = 'none';
-        }
-    }
-
-    function addFolderTag(rootId) {
-        if (selectedFolders.includes(rootId)) return;
-
-        selectedFolders.push(rootId);
-        renderFolderTags();
-        if (folderSearchInput) {
-            folderSearchInput.value = '';
-        }
-        // 重建下拉以排除已选项
-        populateFolderDropdown();
-        folderDropdownList.style.display = 'block';
-        folderSearchInput.focus();
-    }
-
-    function removeFolderTag(rootId) {
-        selectedFolders = selectedFolders.filter(id => id !== rootId);
-        renderFolderTags();
-        // 重建下拉以恢复该选项
-        populateFolderDropdown();
-    }
-
-    function renderFolderTags() {
-        if (!folderTagsList) return;
-
-        const roots = getFolderRoots();
-        folderTagsList.innerHTML = '';
-
-        for (const rootId of selectedFolders) {
-            const root = roots.find(r => r.rootId === rootId);
-            const displayName = root ? (root.displayName || root.name) : rootId;
-
-            const tag = document.createElement('span');
-            tag.className = 'folder-tag';
-            tag.innerHTML = `<span>${escapeHtmlStr(displayName)}</span>`;
-
-            const removeBtn = document.createElement('button');
-            removeBtn.className = 'folder-tag-remove';
-            removeBtn.textContent = '×';
-            removeBtn.title = t('search.remove_folder_title');
-            removeBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                removeFolderTag(rootId);
+            return [...roots].sort((a, b) => {
+                const ai = orderMap.has(a.rootId) ? orderMap.get(a.rootId) : Infinity;
+                const bi = orderMap.has(b.rootId) ? orderMap.get(b.rootId) : Infinity;
+                return ai - bi;
             });
-            tag.appendChild(removeBtn);
-            folderTagsList.appendChild(tag);
+        } catch (e) {
+            return roots;
         }
-    }
-
-    function escapeHtmlStr(str) {
-        const div = document.createElement('div');
-        div.textContent = str;
-        return div.innerHTML;
     }
 
     // ==================== 收集高级搜索条件 ====================

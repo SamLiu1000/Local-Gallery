@@ -197,6 +197,8 @@ func (a *App) ParseMetadataFast(filePath string) map[string]interface{} {
 		return a.parseJPEGToLegacy(filePath)
 	case ".webp":
 		return a.parseWebPToLegacy(filePath)
+	case ".mp4", ".webm", ".mkv":
+		return a.parseVideoToLegacy(filePath)
 	default:
 		return nil
 	}
@@ -700,5 +702,34 @@ func toLegacyWithRaw(parsed *metadata.ParsedParams, textChunks map[string]string
 		raw[k] = v
 	}
 	result["raw"] = raw
+	return result
+}
+
+// parseVideoToLegacy 从视频文件中提取 AI 元数据并转为旧版 map 格式
+func (a *App) parseVideoToLegacy(filePath string) map[string]interface{} {
+	meta := extractVideoMetadata(filePath)
+	if meta == nil {
+		return nil
+	}
+
+	prompt, _ := meta["prompt"].(string)
+	negativePrompt, _ := meta["negativePrompt"].(string)
+
+	result := map[string]interface{}{
+		"prompt":         prompt,
+		"negativePrompt": negativePrompt,
+		"params":         meta["params"],
+	}
+
+	if params, ok := meta["params"].(map[string]string); ok {
+		rawMap := make(map[string]interface{}, len(params)+2)
+		rawMap["prompt"] = prompt
+		rawMap["negativePrompt"] = negativePrompt
+		for k, v := range params {
+			rawMap[k] = v
+		}
+		result["raw"] = rawMap
+	}
+
 	return result
 }

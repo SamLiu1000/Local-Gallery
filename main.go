@@ -35,7 +35,7 @@ func main() {
 	}
 
 	// 读取上次保存的窗口状态
-	width, height := 1400, 900
+	width, height := 800, 600
 	if ws := LoadWindowState(userDataDir); ws != nil {
 		width, height = ws.Width, ws.Height
 	}

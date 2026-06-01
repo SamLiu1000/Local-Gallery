@@ -3122,6 +3122,9 @@ const Gallery = (() => {
         }
         galleryGrid.innerHTML = '';
         galleryGrid.appendChild(fragment);
+        // 重置渲染范围，确保后续 renderGrid 能正确全量重建
+        renderedRange = { start: -1, end: -1 };
+        _lastRenderScrollTop = scrollTop;
         updateImageCount();
     }
 
@@ -4418,7 +4421,7 @@ const Gallery = (() => {
         }
 
         const ext = (imgData.name || '').split('.').pop().toLowerCase();
-        if (!['png', 'jpg', 'jpeg', 'webp'].includes(ext)) {
+        if (!['png', 'jpg', 'jpeg', 'webp', 'mp4', 'webm', 'mkv'].includes(ext)) {
             console.log('[Gallery] resolveMetadataOnDemand: 不支持的文件格式', ext, imgData.name);
             return null;
         }
@@ -4850,24 +4853,12 @@ const Gallery = (() => {
             }
             galleryGrid.appendChild(fragment);
         } else {
-            // 网格模式：直接追加卡片，不重建已有 DOM
-            const fragment = document.createDocumentFragment();
-            for (const img of newImages) {
-                fragment.appendChild(createImageCard(img));
-            }
-            galleryGrid.appendChild(fragment);
-            // 更新虚拟滚动占位
-            const totalItems = (isFilteringActive ? filteredImages : images).length;
-            const columns = getColumnCount();
-            const rowH = (thumbnailSize + 36) + 8;
-            const totalRows = Math.ceil(totalItems / columns);
-            let spacer = galleryGrid.querySelector('.vs-spacer-bottom');
-            if (!spacer) {
-                spacer = document.createElement('div');
-                spacer.className = 'vs-spacer-bottom';
-                galleryGrid.appendChild(spacer);
-            }
-            spacer.style.height = Math.max(0, totalRows * rowH) + 'px';
+            // 网格模式：失效渲染范围后调用 renderGrid 全量重建虚拟滚动 DOM
+            // 直接追加卡片会破坏虚拟滚动的 spacer 结构，导致滚动条失效
+            renderedRange = { start: -1, end: -1 };
+            _lastRenderScrollTop = scrollTop;
+            const allDisplayImages = isFilteringActive ? filteredImages : images;
+            renderGrid(allDisplayImages);
         }
     }
 

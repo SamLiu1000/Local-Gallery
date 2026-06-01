@@ -487,7 +487,7 @@ const DetailPanel = (() => {
 
         // 按需解析元数据（仅在首次点击时解析，避免批量导入时全部解析）
         // ★ Gallery.resolveMetadataOnDemand 已支持 Wails 环境（通过 HTTP 获取图片数据）
-        if (!imgData.isVideo && !imgData.metadata && typeof Gallery !== 'undefined' && Gallery.resolveMetadataOnDemand) {
+        if (!imgData.metadata && typeof Gallery !== 'undefined' && Gallery.resolveMetadataOnDemand) {
             console.log('[Detail] 调用 resolveMetadataOnDemand...');
             try {
                 const meta = await Gallery.resolveMetadataOnDemand(imgData);

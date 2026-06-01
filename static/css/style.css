@@ -376,117 +376,37 @@ html, body {
     border-color: var(--accent);
 }
 /* 文件夹标签 + 搜索下拉 */
-.folder-tags-area {
-    flex: 1;
-    display: flex;
-    flex-wrap: wrap;
-    align-items: flex-start;
-    gap: 4px;
-    min-height: 30px;
+.folder-multiselect {
+    max-height: 180px;
+    overflow-y: auto;
     background: var(--bg-input);
     border: 1px solid var(--border-color);
     border-radius: var(--radius-sm);
-    padding: 4px 6px;
-    cursor: text;
+    padding: 4px 0;
 }
-.folder-tags-area:focus-within {
+.folder-multiselect:focus-within {
     border-color: var(--accent);
 }
-.folder-tags-list {
+.folder-checkbox-list {
     display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-    align-items: center;
+    flex-direction: column;
 }
-.folder-tag {
-    display: inline-flex;
+.folder-checkbox-item {
+    display: flex;
     align-items: center;
-    gap: 3px;
-    background: var(--accent);
-    color: #fff;
-    font-size: 11px;
-    padding: 2px 4px 2px 7px;
-    border-radius: 10px;
-    line-height: 1.5;
-    white-space: nowrap;
-    animation: tagIn 0.15s ease;
-}
-@keyframes tagIn {
-    from { transform: scale(0.85); opacity: 0; }
-    to { transform: scale(1); opacity: 1; }
-}
-.folder-tag-remove {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 14px;
-    height: 14px;
-    border-radius: 50%;
-    border: none;
-    background: rgba(255,255,255,0.25);
-    color: #fff;
-    font-size: 10px;
+    gap: 6px;
+    padding: 3px 8px;
     cursor: pointer;
-    padding: 0;
-    line-height: 1;
-    transition: background 0.15s;
-}
-.folder-tag-remove:hover {
-    background: rgba(255,255,255,0.45);
-}
-.folder-dropdown-wrapper {
-    position: relative;
-    flex: 1;
-    min-width: 120px;
-}
-.folder-search-input {
-    width: 100%;
-    border: none;
-    background: transparent;
-    color: var(--text-primary);
     font-size: 12px;
-    padding: 2px 0;
-    outline: none;
-    min-width: 0;
-}
-.folder-search-input::placeholder {
-    color: var(--text-muted);
-}
-.folder-dropdown-list {
-    position: absolute;
-    top: 100%;
-    left: 0;
-    right: 0;
-    margin-top: 3px;
-    max-height: 180px;
-    overflow-y: auto;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: var(--radius-sm);
-    z-index: 100;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-}
-.folder-dropdown-item {
-    display: block;
-    width: 100%;
-    padding: 6px 10px;
-    font-size: 12px;
-    color: var(--text-primary);
-    cursor: pointer;
-    border: none;
-    background: transparent;
-    text-align: left;
+    line-height: 1.4;
     transition: background 0.1s;
 }
-.folder-dropdown-item:hover,
-.folder-dropdown-item.active {
+.folder-checkbox-item:hover {
     background: var(--bg-hover);
 }
-.folder-dropdown-empty {
-    padding: 10px;
-    font-size: 12px;
-    color: var(--text-muted);
-    text-align: center;
+.folder-checkbox-item input[type="checkbox"] {
+    margin: 0;
+    flex-shrink: 0;
 }
 .date-range-inputs {
     display: flex;
