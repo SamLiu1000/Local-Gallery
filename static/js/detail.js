@@ -3,6 +3,26 @@
    大图预览、参数展示、提示词版本管理、标签与收藏
    ============================================================ */
 
+// EXIF 字段映射：后端 extractCameraEXIF 写入 raw 时使用固定中文 key，
+// 前端按此表查找数据，再通过 _t(label) 显示当前语言的标签
+const PHOTO_EXIF_FIELDS = [
+    { key: '拍摄时间', label: 'detail.photo_capture_time' },
+    { key: '相机厂商', label: 'detail.photo_camera_make' },
+    { key: '设备型号', label: 'detail.photo_camera_model' },
+    { key: '镜头型号', label: 'detail.photo_lens' },
+    { key: '光圈值', label: 'detail.photo_aperture' },
+    { key: '最大光圈', label: 'detail.photo_max_aperture' },
+    { key: '曝光时间', label: 'detail.photo_exposure' },
+    { key: '曝光补偿', label: 'detail.photo_exposure_comp' },
+    { key: 'ISO感光度', label: 'detail.photo_iso' },
+    { key: '焦距', label: 'detail.photo_focal' },
+    { key: '测光模式', label: 'detail.photo_metering' },
+    { key: '闪光灯', label: 'detail.photo_flash' },
+    { key: '白平衡', label: 'detail.photo_white_balance' },
+    { key: '曝光程序', label: 'detail.photo_exposure_program' },
+];
+const PHOTO_EXIF_KEYSET = PHOTO_EXIF_FIELDS.map(f => f.key);
+
 const ImageContextMenu = (() => {
     const t = (typeof I18n !== "undefined" ? I18n.t : (s) => s);
     let menu, btnOpen, btnTrack;
@@ -973,17 +993,12 @@ const DetailPanel = (() => {
             [_t('detail.photo_mod_time'), modTime],
         ];
 
-        // EXIF 字段（按参考面板顺序，只保留 raw 中存在的）
-        const exifOrder = [
-            _t('detail.photo_capture_time'), _t('detail.photo_camera_make'), _t('detail.photo_camera_model'), _t('detail.photo_lens'),
-            _t('detail.photo_aperture'), _t('detail.photo_max_aperture'), _t('detail.photo_exposure'), _t('detail.photo_exposure_comp'),
-            _t('detail.photo_iso'), _t('detail.photo_focal'), _t('detail.photo_metering'), _t('detail.photo_flash'), _t('detail.photo_white_balance'), _t('detail.photo_exposure_program'),
-        ];
-
+        // EXIF 字段（按固定 key 查找 raw，再用 i18n 标签显示）
         const exifRows = [];
-        for (const key of exifOrder) {
-            if (raw[key] !== undefined && raw[key] !== '') {
-                exifRows.push([key, raw[key]]);
+        for (const f of PHOTO_EXIF_FIELDS) {
+            const v = raw[f.key];
+            if (v !== undefined && v !== '') {
+                exifRows.push([_t(f.label), v]);
             }
         }
 
@@ -1014,8 +1029,7 @@ const DetailPanel = (() => {
 
         // 检测是否有相机 EXIF 数据
         const raw = imgData.metadata && imgData.metadata.raw ? imgData.metadata.raw : null;
-        const exifKeys = [_t('detail.photo_camera_make'), _t('detail.photo_camera_model'), _t('detail.photo_capture_time'), _t('detail.photo_exposure'), _t('detail.photo_aperture'), _t('detail.photo_iso'), _t('detail.photo_focal'), _t('detail.photo_lens')];
-        const hasExif = raw && exifKeys.some(k => raw[k] !== undefined);
+        const hasExif = raw && PHOTO_EXIF_KEYSET.some(k => raw[k] !== undefined);
 
         if (hasExif) {
             renderPhotoInfoPanel(imgData, raw);
@@ -1253,8 +1267,8 @@ const DetailPanel = (() => {
         }
 
         // 检测是否包含相机 EXIF 数据，有则自动展开
-        const cameraExifKeys = [_t('detail.photo_camera_make'), _t('detail.photo_camera_model'), _t('detail.photo_capture_time'), _t('detail.photo_exposure'), _t('detail.photo_aperture'), _t('detail.photo_iso'), _t('detail.photo_focal'), _t('detail.photo_lens'), _t('detail.photo_flash'), _t('detail.photo_metering'), _t('detail.photo_exposure_program'), _t('detail.photo_white_balance'), _t('detail.photo_max_aperture'), _t('detail.photo_exposure_comp'), 'GPS纬度', 'GPS经度'];
-        const hasCameraExif = cameraExifKeys.some(k => raw[k] !== undefined);
+        const hasCameraExif = PHOTO_EXIF_KEYSET.some(k => raw[k] !== undefined)
+            || raw['GPS纬度'] !== undefined || raw['GPS经度'] !== undefined;
 
 
         const entries = Object.entries(raw).sort((a, b) => a[0].localeCompare(b[0], 'zh-CN'));
@@ -2477,8 +2491,7 @@ async function toggleFullscreen() {
         const params = meta && meta.params ? meta.params : null;
         const prompt = meta && meta.prompt ? meta.prompt : '';
         const negPrompt = meta && meta.negativePrompt ? meta.negativePrompt : '';
-        const exifKeys = [_t('detail.photo_camera_make'), _t('detail.photo_camera_model'), _t('detail.photo_capture_time'), _t('detail.photo_exposure'), _t('detail.photo_aperture'), _t('detail.photo_iso'), _t('detail.photo_focal'), _t('detail.photo_lens'), _t('detail.photo_flash')];
-        const hasExif = raw && exifKeys.some(k => raw[k]);
+        const hasExif = raw && PHOTO_EXIF_KEYSET.some(k => raw[k]);
         const hasParams = params && Object.keys(params).length > 0;
         const hasPrompt = prompt || negPrompt;
 
@@ -2558,8 +2571,9 @@ async function toggleFullscreen() {
         // 相机 EXIF
         if (hasExif) {
             newSection();
-            for (const key of [_t('detail.photo_capture_time'), _t('detail.photo_camera_make'), _t('detail.photo_camera_model'), _t('detail.photo_lens'), _t('detail.photo_aperture'), _t('detail.photo_max_aperture'), _t('detail.photo_exposure'), _t('detail.photo_exposure_comp'), _t('detail.photo_iso'), _t('detail.photo_focal'), _t('detail.photo_metering'), _t('detail.photo_flash'), _t('detail.photo_white_balance'), _t('detail.photo_exposure_program')]) {
-                if (raw[key]) addRow(key, raw[key]);
+            for (const f of PHOTO_EXIF_FIELDS) {
+                const v = raw[f.key];
+                if (v) addRow(_t(f.label), v);
             }
         }
 

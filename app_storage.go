@@ -1,6 +1,7 @@
 package main
 
 import (
+	"container/list"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -141,6 +142,343 @@ func (a *App) loadImageIndex() {
 	// 自修复：检测并修复重复路径的 folderIndex 键（如 "K:/bid/K:\bid\..."）
 	a.fixDuplicatePathKeys()
 	fmt.Printf("[缓存] 已从 SQLite 加载图片索引: %d 张图片，%d 个文件夹\n", len(entries), len(a.folderIndex))
+}
+
+// ==================== 轻量索引 + LRU 按需加载 ====================
+
+const (
+	maxLoadedFolders = 32    // LRU 容量：按文件夹数
+	maxLoadedImages  = 50000 // LRU 硬上限：防单文件夹巨量
+)
+
+// normalizeFolderRel 将 image_cache.Folder 字段规范化为相对 root 的子路径。
+// 处理两种历史格式：完整路径（以 root 开头）和相对路径。
+func normalizeFolderRel(folder, rootNorm string) string {
+	if folder == "" {
+		return ""
+	}
+	folderNorm := strings.ReplaceAll(folder, "\\", "/")
+	if strings.HasPrefix(folderNorm, rootNorm+"/") {
+		return folderNorm[len(rootNorm)+1:]
+	}
+	if folderNorm == rootNorm {
+		return ""
+	}
+	return folderNorm
+}
+
+// toImageEntry 将 ImageCacheEntry 转为 ImageEntry（复用 loadImageIndex 内的构造）。
+func toImageEntry(e database.ImageCacheEntry) *ImageEntry {
+	rootNorm := strings.ReplaceAll(e.RootPath, "\\", "/")
+	folderRel := normalizeFolderRel(e.Folder, rootNorm)
+	return &ImageEntry{
+		ID: e.ID, Path: e.Path, Name: e.Name, Size: e.Size,
+		LastModified: e.LastModified, CreatedAt: e.CreatedAt,
+		Folder: folderRel, RootPath: e.RootPath,
+		Width: e.Width, Height: e.Height, IsVideo: e.IsVideo,
+		URL: fmt.Sprintf("/image/%s", e.ID),
+	}
+}
+
+// splitFolderKey 将规范化 folderKey 拆分为 (rootPath, folderRel)。
+// folderKey 形如 "K:/photos/sub"，返回 ("K:/photos", "sub")；folderKey 即 root 时返回 (rootPath, "")。
+// 需遍历 registeredRoots 做最长前缀匹配，因 rootPath 本身可能含 "/"。
+func (a *App) splitFolderKey(folderKey string) (rootPath, folderRel string) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	var bestRootNorm, bestRoot string
+	for root := range a.registeredRoots {
+		rootNorm := strings.ReplaceAll(root, "\\", "/")
+		if folderKey == rootNorm {
+			return root, ""
+		}
+		if strings.HasPrefix(folderKey, rootNorm+"/") {
+			if len(rootNorm) > len(bestRootNorm) {
+				bestRootNorm = rootNorm
+				bestRoot = root
+			}
+		}
+	}
+	if bestRoot != "" {
+		return bestRoot, folderKey[len(bestRootNorm)+1:]
+	}
+	return folderKey, ""
+}
+
+// loadFolderIndexLight 仅加载文件夹列表与计数，不读图片详情。启动时用，替代 loadImageIndex。
+func (a *App) loadFolderIndexLight() {
+	if a.imageDB == nil {
+		return
+	}
+	entries, err := a.imageDB.LoadFolderIndexLight()
+	if err != nil {
+		fmt.Printf("[缓存] 轻量索引加载失败 %v，回退全量\n", err)
+		a.loadImageIndex()
+		return
+	}
+	if len(entries) == 0 {
+		fmt.Printf("[缓存] 轻量索引为空，等待扫描填充\n")
+		return
+	}
+	a.mu.Lock()
+	a.images = make(map[string]*ImageEntry)     // 启动时空
+	a.folderIndex = make(map[string][]string)   // key 存在，value=nil 标记"未加载"
+	a.folderLoaded = make(map[string]bool)
+	a.folderCount = make(map[string]int)
+	if a.folderLRU == nil {
+		a.folderLRU = list.New()
+	}
+	if a.lruNodes == nil {
+		a.lruNodes = make(map[string]*list.Element)
+	}
+	a.folderLRU.Init()
+	a.lruNodes = make(map[string]*list.Element)
+	for _, e := range entries {
+		rootNorm := strings.ReplaceAll(e.RootPath, "\\", "/")
+		folderRel := normalizeFolderRel(e.Folder, rootNorm)
+		fk := rootNorm
+		if folderRel != "" {
+			fk = rootNorm + "/" + folderRel
+		}
+		a.folderIndex[fk] = nil // 标记未加载
+		count := int(e.Size)
+		a.folderCount[rootNorm] += count
+		if folderRel != "" {
+			parts := strings.Split(folderRel, "/")
+			for i := 1; i <= len(parts); i++ {
+				sub := rootNorm + "/" + strings.Join(parts[:i], "/")
+				a.folderCount[sub] += count
+			}
+		}
+	}
+	a.mu.Unlock()
+	a.fixDuplicatePathKeys()
+	fmt.Printf("[缓存] 轻量索引就绪: %d 个文件夹\n", len(a.folderIndex))
+}
+
+// rebuildFolderCountsFromSQL 从 SQL 重建 folderCount，覆盖所有根目录。
+// 用于扫描后或增量刷新后准确地刷新计数（a.images 是部分 LRU，不可信）。
+// 调用方需持写锁 a.mu.Lock()。
+func (a *App) rebuildFolderCountsFromSQLLocked() {
+	if a.imageDB == nil {
+		return
+	}
+	entries, err := a.imageDB.LoadFolderIndexLight()
+	if err != nil {
+		fmt.Printf("[计数] 从 SQL 重建 folderCount 失败: %v\n", err)
+		return
+	}
+	counts := make(map[string]int)
+	for _, e := range entries {
+		rootNorm := strings.ReplaceAll(e.RootPath, "\\", "/")
+		folderRel := normalizeFolderRel(e.Folder, rootNorm)
+		count := int(e.Size)
+		counts[rootNorm] += count
+		if folderRel != "" {
+			parts := strings.Split(folderRel, "/")
+			for i := 1; i <= len(parts); i++ {
+				sub := rootNorm + "/" + strings.Join(parts[:i], "/")
+				counts[sub] += count
+			}
+		}
+	}
+	a.folderCount = counts
+}
+
+// ensureFolderLoaded 同步加载某 folderKey 进缓存；带 double-check + LRU 淘汰。
+func (a *App) ensureFolderLoaded(folderKey string) {
+	a.mu.RLock()
+	if a.folderLoaded[folderKey] {
+		a.touchFolderLocked(folderKey)
+		a.mu.RUnlock()
+		return
+	}
+	a.mu.RUnlock()
+
+	root, folderRel := a.splitFolderKey(folderKey)
+	entries, err := a.imageDB.LoadImageCacheByFolder(root, folderRel)
+	if err != nil || len(entries) == 0 {
+		// 即使无图片也标记 loaded，避免重复查询空文件夹
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if a.folderLoaded[folderKey] {
+			return
+		}
+		a.folderLoaded[folderKey] = true
+		if a.folderIndex[folderKey] == nil {
+			a.folderIndex[folderKey] = []string{}
+		}
+		a.lruNodes[folderKey] = a.folderLRU.PushBack(folderKey)
+		a.evictLRU()
+		return
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.folderLoaded[folderKey] { // double-check
+		return
+	}
+	if a.folderIndex[folderKey] == nil {
+		a.folderIndex[folderKey] = make([]string, 0, len(entries))
+	}
+	for _, e := range entries {
+		entry := toImageEntry(e)
+		a.images[e.ID] = entry
+		a.folderIndex[folderKey] = append(a.folderIndex[folderKey], e.ID)
+	}
+	a.folderLoaded[folderKey] = true
+	a.lruNodes[folderKey] = a.folderLRU.PushBack(folderKey)
+	a.evictLRU()
+}
+
+// ensureRootLoaded 加载整个根目录所有子文件夹（全量遍历回退用）。
+func (a *App) ensureRootLoaded(rootPath string) {
+	rootNorm := strings.ReplaceAll(rootPath, "\\", "/")
+	// 先检查是否所有子 folderKey 都已 loaded
+	a.mu.RLock()
+	allLoaded := true
+	for folderKey := range a.folderIndex {
+		if folderKey == rootNorm || strings.HasPrefix(folderKey, rootNorm+"/") {
+			if !a.folderLoaded[folderKey] {
+				allLoaded = false
+				break
+			}
+		}
+	}
+	a.mu.RUnlock()
+	if allLoaded {
+		return
+	}
+
+	entries, err := a.imageDB.LoadImageCacheByRoot(rootPath)
+	if err != nil {
+		return
+	}
+	// 按 folderKey 分组
+	grouped := make(map[string][]database.ImageCacheEntry)
+	for _, e := range entries {
+		rootN := strings.ReplaceAll(e.RootPath, "\\", "/")
+		folderRel := normalizeFolderRel(e.Folder, rootN)
+		fk := rootN
+		if folderRel != "" {
+			fk = rootN + "/" + folderRel
+		}
+		grouped[fk] = append(grouped[fk], e)
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for fk, groupEntries := range grouped {
+		if a.folderLoaded[fk] {
+			continue
+		}
+		if a.folderIndex[fk] == nil {
+			a.folderIndex[fk] = make([]string, 0, len(groupEntries))
+		}
+		for _, e := range groupEntries {
+			entry := toImageEntry(e)
+			a.images[e.ID] = entry
+			a.folderIndex[fk] = append(a.folderIndex[fk], e.ID)
+		}
+		a.folderLoaded[fk] = true
+		a.lruNodes[fk] = a.folderLRU.PushBack(fk)
+	}
+	a.evictLRU()
+}
+
+// touchFolderLocked 更新 LRU 顺序（命中时调用，需持锁）。
+func (a *App) touchFolderLocked(folderKey string) {
+	if elem, ok := a.lruNodes[folderKey]; ok {
+		a.folderLRU.MoveToBack(elem)
+	}
+}
+
+// countLoadedImagesLocked 统计当前已加载的图片总数（需持锁）。
+func (a *App) countLoadedImagesLocked() int {
+	count := 0
+	for _, ids := range a.folderIndex {
+		if len(ids) > 0 {
+			count += len(ids)
+		}
+	}
+	return count
+}
+
+// evictLRU 淘汰最久未用的文件夹（需持写锁）。
+func (a *App) evictLRU() {
+	for len(a.folderLoaded) > maxLoadedFolders || a.countLoadedImagesLocked() > maxLoadedImages {
+		elem := a.folderLRU.Front()
+		if elem == nil {
+			return
+		}
+		oldKey := elem.Value.(string)
+		a.folderLRU.Remove(elem)
+		delete(a.lruNodes, oldKey)
+		for _, id := range a.folderIndex[oldKey] {
+			delete(a.images, id)
+		}
+		a.folderIndex[oldKey] = nil // 保留 key 标记"未加载"
+		delete(a.folderLoaded, oldKey)
+	}
+}
+
+// invalidateFolder 使某 folderKey 失效（扫描刷新时调用）。
+func (a *App) invalidateFolder(folderKey string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.folderLoaded[folderKey] {
+		return
+	}
+	for _, id := range a.folderIndex[folderKey] {
+		delete(a.images, id)
+	}
+	a.folderIndex[folderKey] = nil
+	delete(a.folderLoaded, folderKey)
+	if elem, ok := a.lruNodes[folderKey]; ok {
+		a.folderLRU.Remove(elem)
+		delete(a.lruNodes, folderKey)
+	}
+}
+
+// invalidateAllFolders 清空所有 LRU 缓存（scanAllFolders 原子替换前调用）。
+func (a *App) invalidateAllFolders() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.images = make(map[string]*ImageEntry)
+	a.folderLoaded = make(map[string]bool)
+	if a.folderLRU == nil {
+		a.folderLRU = list.New()
+	} else {
+		a.folderLRU.Init()
+	}
+	a.lruNodes = make(map[string]*list.Element)
+}
+
+// markFolderLoadedLocked 标记某 folderKey 已加载（扫描写入后调用，需持写锁）。
+// 同时更新 LRU。
+func (a *App) markFolderLoadedLocked(folderKey string, ids []string) {
+	if a.folderIndex[folderKey] == nil {
+		a.folderIndex[folderKey] = ids
+	} else {
+		// 已有 ID 列表，合并去重
+		existing := make(map[string]bool, len(a.folderIndex[folderKey]))
+		for _, id := range a.folderIndex[folderKey] {
+			existing[id] = true
+		}
+		for _, id := range ids {
+			if !existing[id] {
+				a.folderIndex[folderKey] = append(a.folderIndex[folderKey], id)
+				existing[id] = true
+			}
+		}
+	}
+	if !a.folderLoaded[folderKey] {
+		a.folderLoaded[folderKey] = true
+		a.lruNodes[folderKey] = a.folderLRU.PushBack(folderKey)
+		a.evictLRU()
+	} else {
+		a.touchFolderLocked(folderKey)
+	}
 }
 
 func (a *App) saveImageIndex() {

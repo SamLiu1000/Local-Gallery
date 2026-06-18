@@ -20,6 +20,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"container/list"
+
 	"local-gallery/internal/database"
 
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
@@ -34,6 +36,11 @@ type App struct {
 	images      map[string]*ImageEntry
 	folderIndex map[string][]string
 	folderCount map[string]int
+
+	// LRU 按文件夹加载缓存
+	folderLoaded map[string]bool              // folderKey 是否已加载进 a.images
+	folderLRU    *list.List                   // LRU 队列，elem.Value = folderKey
+	lruNodes     map[string]*list.Element     // folderKey → LRU 节点
 
 	registeredRoots map[string]bool
 	folderTypes     map[string]string // rootPath -> "ai" | "photo" | "mixed"
@@ -85,6 +92,9 @@ func NewApp(userDataDir, defaultUserDataDir string) *App {
 		images:             make(map[string]*ImageEntry),
 		folderIndex:        make(map[string][]string),
 		folderCount:        make(map[string]int),
+		folderLoaded:       make(map[string]bool),
+		folderLRU:          list.New(),
+		lruNodes:           make(map[string]*list.Element),
 		registeredRoots:    make(map[string]bool),
 		folderTypes:        make(map[string]string),
 		userDataFile:       filepath.Join(userDataDir, "user-data.json"),
@@ -121,18 +131,7 @@ func NewApp(userDataDir, defaultUserDataDir string) *App {
 	app.loadThumbSettings()     // 恢复缩略图并发数与缩放算法设置
 	app.migratePromptVersions() // migrate old promptVersions to SQLite
 	app.migrateUserData() // migrate registeredRoots/imageTags/favorites to SQLite
-	app.loadImageIndex()  // load image cache from SQLite
-
-	// 仅当缓存未提供 folderCount 时才从 images 重建（避免每次启动 O(N) 遍历）
-	if len(app.folderCount) == 0 && len(app.images) > 0 {
-		fmt.Printf("[启动] folderCount 缓存缺失，从 %d 张图片重建\n", len(app.images))
-		app.rebuildFolderCounts()
-	}
-
-	// ★ 异步预热 thumbCounts 缓存，不阻塞启动
-	if len(app.images) > 0 {
-		go app.PreloadThumbCounts()
-	}
+	app.loadFolderIndexLight() // ★ 轻量索引启动：仅加载文件夹列表+count，图片按需加载
 
 	app.startHTTPServer()
 
@@ -330,7 +329,7 @@ func (a *App) SaveAvatar(base64Data string) (string, error) {
 	return "/avatar/" + fileName, nil
 }
 
-// resolveImagePath 先查内存，再回退 SQLite，返回图片文件路径（空串表示未找到）
+// resolveImagePath 先查内存，再回退 SQLite image_cache，返回图片文件路径（空串表示未找到）
 func (a *App) resolveImagePath(imageID string) string {
 	a.mu.RLock()
 	entry, ok := a.images[imageID]
@@ -339,6 +338,10 @@ func (a *App) resolveImagePath(imageID string) string {
 		return entry.Path
 	}
 	if a.imageDB != nil {
+		// ★ 优先查 image_cache（扫描全集）；退化时再查 images（搜索索引子集）
+		if e, err := a.imageDB.GetImageEntry(imageID); err == nil && e != nil {
+			return e.Path
+		}
 		return a.imageDB.GetImagePath(imageID)
 	}
 	return ""
@@ -1034,131 +1037,201 @@ func (a *App) GetImages(folder string, offset int, limit int, sortOrder string) 
 	if limit <= 0 || limit > 500 {
 		limit = 500
 	}
-	var results []*ImageEntry
+
+	// 先做轻量检查（不持锁）：folderIndex 是否为空
 	a.mu.RLock()
-	a.debugLog(fmt.Sprintf("[GetImages] folder=%q offset=%d limit=%d | images=%d folderIndex=%d registeredRoots=%d scanningRoots=%v",
-		folder, offset, limit, len(a.images), len(a.folderIndex), len(a.registeredRoots), a.scanningRoots))
-	// 自修复：folderIndex 为空但 images 有数据时，自动重建索引
-	if len(a.folderIndex) == 0 && len(a.images) > 0 {
-		a.mu.RUnlock()
-		a.mu.Lock()
-		if len(a.folderIndex) == 0 && len(a.images) > 0 {
-			a.rebuildFolderIndex()
-			a.rebuildFolderCounts()
-			fmt.Println("[自修复] folderIndex 为空，已从 images 重建")
-		}
-		a.mu.Unlock()
-		a.mu.RLock()
-	}
-	// 自修复：images 和 folderIndex 都为空但有已注册目录时，触发后台扫描
-	if len(a.images) == 0 && len(a.folderIndex) == 0 && len(a.registeredRoots) > 0 {
-		a.mu.RUnlock()
-		fmt.Println("[自修复] 图片数据为空，触发后台全量扫描")
+	folderIndexLen := len(a.folderIndex)
+	registeredRootsLen := len(a.registeredRoots)
+	a.mu.RUnlock()
+
+	// 自修复：folderIndex 为空但有已注册目录时，触发后台扫描
+	if folderIndexLen == 0 && registeredRootsLen > 0 {
+		fmt.Println("[自修复] folderIndex 为空但有注册目录，触发后台全量扫描")
 		go a.scanAllFolders()
 		return &ImageListResult{Items: []SafeImage{}, Total: 0, Offset: offset, Limit: limit}
 	}
+
+	var results []*ImageEntry
+	var total int
+
 	if folder != "" {
 		normalizedFolder := strings.ReplaceAll(folder, "\\", "/")
-		// ★ 在已持有的 RLock 内完成 map 遍历（Go 不允许并发读写 map）
-		seen := make(map[string]bool)
-		for folderKey, ids := range a.folderIndex {
+
+		// 收集匹配的 folderKey（未加载的需 ensure）
+		a.mu.RLock()
+		var matchingKeys []string
+		for folderKey := range a.folderIndex {
 			if folderKey == normalizedFolder || strings.HasPrefix(folderKey, normalizedFolder+"/") {
-				for _, id := range ids {
-					if seen[id] {
-						continue
-					}
-					seen[id] = true
-					if entry, ok := a.images[id]; ok {
-						results = append(results, entry)
-					}
-				}
+				matchingKeys = append(matchingKeys, folderKey)
 			}
 		}
-		folderIndexLen := len(a.folderIndex)
-		fmt.Printf("[GetImages] 查询完成: results=%d\n", len(results))
-		if len(results) == 0 && folderIndexLen > 0 {
-			sampleKeys := make([]string, 0, 5)
-			for k := range a.folderIndex {
-				sampleKeys = append(sampleKeys, k)
-				if len(sampleKeys) >= 5 {
-					break
-				}
-			}
-			fmt.Printf("[GetImages] 查询无结果: normalizedFolder=%q folderIndexSamples=%v\n",
-				normalizedFolder, sampleKeys)
-			a.debugLog(fmt.Sprintf("[GetImages] 查询无结果: normalizedFolder=%q folderIndexSamples=%v",
-				normalizedFolder, sampleKeys))
+		a.mu.RUnlock()
+
+		// 对未加载的 folderKey 触发按需加载（ensureFolderLoaded 自管锁）
+		for _, fk := range matchingKeys {
+			a.ensureFolderLoaded(fk)
 		}
-		// 自修复：请求特定文件夹但无结果时，检查是否需要触发扫描
-		if len(results) == 0 && folderIndexLen == 0 {
+
+		// 自修复：无匹配 folderKey 且根目录未扫描时，触发扫描
+		if len(matchingKeys) == 0 && folderIndexLen == 0 {
 			needsScan := false
-			folderNorm := strings.ReplaceAll(folder, "\\", "/")
+			a.mu.RLock()
 			for root := range a.registeredRoots {
 				rootNorm := strings.ReplaceAll(root, "\\", "/")
-				if folderNorm == rootNorm || strings.HasPrefix(folderNorm, rootNorm+"/") {
+				if normalizedFolder == rootNorm || strings.HasPrefix(normalizedFolder, rootNorm+"/") {
 					if _, ok := a.folderCount[rootNorm]; !ok || a.folderCount[rootNorm] == 0 {
 						needsScan = true
 					}
 					break
 				}
 			}
+			a.mu.RUnlock()
 			if needsScan {
-				a.mu.RUnlock()
 				fmt.Println("[自修复] 文件夹无结果但根目录未扫描，触发异步扫描")
 				go a.scanRootAsync(folder)
 				return &ImageListResult{Items: []SafeImage{}, Total: 0, Offset: offset, Limit: limit}
 			}
 		}
-		a.mu.RUnlock()
-	} else {
-		for _, entry := range a.images {
-			results = append(results, entry)
+
+		// 遍历收集结果
+		a.mu.RLock()
+		seen := make(map[string]bool)
+		for _, fk := range matchingKeys {
+			ids := a.folderIndex[fk]
+			for _, id := range ids {
+				if seen[id] {
+					continue
+				}
+				seen[id] = true
+				if entry, ok := a.images[id]; ok {
+					results = append(results, entry)
+				}
+			}
 		}
 		a.mu.RUnlock()
+
+		fmt.Printf("[GetImages] folder=%q results=%d\n", normalizedFolder, len(results))
+		if len(results) == 0 {
+			sampleKeys := make([]string, 0, 5)
+			a.mu.RLock()
+			for k := range a.folderIndex {
+				sampleKeys = append(sampleKeys, k)
+				if len(sampleKeys) >= 5 {
+					break
+				}
+			}
+			a.mu.RUnlock()
+			fmt.Printf("[GetImages] 查询无结果: normalizedFolder=%q folderIndexSamples=%v\n",
+				normalizedFolder, sampleKeys)
+		}
+
+		total = len(results)
+		// 排序
+		sortImageEntries(results, sortOrder)
+		// 分页
+		if offset > len(results) {
+			offset = len(results)
+		}
+		end := len(results)
+		if limit > 0 && offset+limit < end {
+			end = offset + limit
+		}
+		paged := results[offset:end]
+
+		safe := make([]SafeImage, len(paged))
+		for i, entry := range paged {
+			w, h := entry.Width, entry.Height
+			if !entry.IsVideo && (w == 0 || h == 0) {
+				w2, h2 := getImageDimensions(entry.Path)
+				if w2 > 0 && h2 > 0 {
+					w, h = w2, h2
+				} else {
+					w, h = 400, 300
+				}
+			}
+			safe[i] = SafeImage{
+				ID:           entry.ID,
+				Name:         entry.Name,
+				Path:         entry.Path,
+				Size:         entry.Size,
+				LastModified: entry.LastModified,
+				CreatedAt:    entry.CreatedAt,
+				Folder:       entry.Folder,
+				RootPath:     entry.RootPath,
+				URL:          entry.URL,
+				ThumbURL:     fmt.Sprintf("/thumb/%s", entry.ID),
+				Width:        w,
+				Height:       h,
+				IsVideo:      entry.IsVideo,
+			}
+		}
+		return &ImageListResult{Items: safe, Total: total, Offset: offset, Limit: limit}
+	}
+
+	// folder == ""：SQL 分页加载（不再全量遍历 a.images）
+	if a.imageDB != nil {
+		entries, err := a.imageDB.LoadImageCachePaged(offset, limit, sortOrder)
+		if err != nil {
+			fmt.Printf("[GetImages] SQL 分页失败 %v\n", err)
+			return &ImageListResult{Items: []SafeImage{}, Total: 0, Offset: offset, Limit: limit}
+		}
+		count, _ := a.imageDB.CountImageCache()
+		total = count
+		safe := make([]SafeImage, len(entries))
+		for i, e := range entries {
+			entry := toImageEntry(e)
+			w, h := entry.Width, entry.Height
+			if !entry.IsVideo && (w == 0 || h == 0) {
+				w2, h2 := getImageDimensions(entry.Path)
+				if w2 > 0 && h2 > 0 {
+					w, h = w2, h2
+				} else {
+					w, h = 400, 300
+				}
+			}
+			safe[i] = SafeImage{
+				ID:           entry.ID,
+				Name:         entry.Name,
+				Path:         entry.Path,
+				Size:         entry.Size,
+				LastModified: entry.LastModified,
+				CreatedAt:    entry.CreatedAt,
+				Folder:       entry.Folder,
+				RootPath:     entry.RootPath,
+				URL:          entry.URL,
+				ThumbURL:     fmt.Sprintf("/thumb/%s", entry.ID),
+				Width:        w,
+				Height:       h,
+				IsVideo:      entry.IsVideo,
+			}
+		}
+		return &ImageListResult{Items: safe, Total: total, Offset: offset, Limit: limit}
+	}
+
+	return &ImageListResult{Items: []SafeImage{}, Total: 0, Offset: offset, Limit: limit}
+}
+
+func (a *App) GetImagesByPaths(paths []string, offset int, limit int, sortOrder string) *ImageListResult {
+	if len(paths) == 0 {
+		return &ImageListResult{Items: []SafeImage{}, Total: 0, Offset: offset, Limit: limit}
+	}
+	if a.imageDB == nil {
+		return &ImageListResult{Items: []SafeImage{}, Total: 0, Offset: offset, Limit: limit}
+	}
+	// ★ 改 SQL 查询：不再遍历 a.images
+	entries, err := a.imageDB.LoadImageCacheByPaths(paths)
+	if err != nil {
+		fmt.Printf("[GetImagesByPaths] SQL 查询失败 %v\n", err)
+		return &ImageListResult{Items: []SafeImage{}, Total: 0, Offset: offset, Limit: limit}
+	}
+	var results []*ImageEntry
+	for _, e := range entries {
+		results = append(results, toImageEntry(e))
 	}
 	total := len(results)
 
-	// 排序：根据 sortOrder 参数选择排序策略
-	switch sortOrder {
-	case "name-asc":
-		sort.SliceStable(results, func(i, j int) bool {
-			return results[i].Path < results[j].Path
-		})
-	case "name-desc":
-		sort.SliceStable(results, func(i, j int) bool {
-			return results[i].Path > results[j].Path
-		})
-	case "size-desc":
-		sort.SliceStable(results, func(i, j int) bool {
-			if results[i].Size != results[j].Size {
-				return results[i].Size > results[j].Size
-			}
-			return results[i].Path < results[j].Path
-		})
-	case "size-asc":
-		sort.SliceStable(results, func(i, j int) bool {
-			if results[i].Size != results[j].Size {
-				return results[i].Size < results[j].Size
-			}
-			return results[i].Path < results[j].Path
-		})
-	case "date-asc":
-		sort.SliceStable(results, func(i, j int) bool {
-			if results[i].LastModified != results[j].LastModified {
-				return results[i].LastModified < results[j].LastModified
-			}
-			return results[i].Path < results[j].Path
-		})
-	default: // "date-desc" 或空字符串（保持向后兼容）
-		sort.SliceStable(results, func(i, j int) bool {
-			if results[i].LastModified != results[j].LastModified {
-				return results[i].LastModified > results[j].LastModified
-			}
-			return results[i].Path < results[j].Path
-		})
-	}
+	sortImageEntries(results, sortOrder)
 
-	// 分页
 	if offset > len(results) {
 		offset = len(results)
 	}
@@ -1198,25 +1271,8 @@ func (a *App) GetImages(folder string, offset int, limit int, sortOrder string) 
 	return &ImageListResult{Items: safe, Total: total, Offset: offset, Limit: limit}
 }
 
-func (a *App) GetImagesByPaths(paths []string, offset int, limit int, sortOrder string) *ImageListResult {
-	if len(paths) == 0 {
-		return &ImageListResult{Items: []SafeImage{}, Total: 0, Offset: offset, Limit: limit}
-	}
-	pathSet := make(map[string]bool, len(paths))
-	for _, p := range paths {
-		pathSet[strings.ReplaceAll(p, "\\", "/")] = true
-	}
-	var results []*ImageEntry
-	a.mu.RLock()
-	for _, entry := range a.images {
-		normalized := strings.ReplaceAll(entry.Path, "\\", "/")
-		if pathSet[normalized] {
-			results = append(results, entry)
-		}
-	}
-	total := len(results)
-	a.mu.RUnlock()
-
+// sortImageEntries 根据 sortOrder 排序图片列表（原地）。
+func sortImageEntries(results []*ImageEntry, sortOrder string) {
 	switch sortOrder {
 	case "name-asc":
 		sort.SliceStable(results, func(i, j int) bool {
@@ -1247,7 +1303,7 @@ func (a *App) GetImagesByPaths(paths []string, offset int, limit int, sortOrder 
 			}
 			return results[i].Path < results[j].Path
 		})
-	default:
+	default: // "date-desc" 或空
 		sort.SliceStable(results, func(i, j int) bool {
 			if results[i].LastModified != results[j].LastModified {
 				return results[i].LastModified > results[j].LastModified
@@ -1255,44 +1311,6 @@ func (a *App) GetImagesByPaths(paths []string, offset int, limit int, sortOrder 
 			return results[i].Path < results[j].Path
 		})
 	}
-
-	if offset > len(results) {
-		offset = len(results)
-	}
-	end := len(results)
-	if limit > 0 && offset+limit < end {
-		end = offset + limit
-	}
-	paged := results[offset:end]
-
-	safe := make([]SafeImage, len(paged))
-	for i, entry := range paged {
-		w, h := entry.Width, entry.Height
-		if !entry.IsVideo && (w == 0 || h == 0) {
-			w2, h2 := getImageDimensions(entry.Path)
-			if w2 > 0 && h2 > 0 {
-				w, h = w2, h2
-			} else {
-				w, h = 400, 300
-			}
-		}
-		safe[i] = SafeImage{
-			ID:           entry.ID,
-			Name:         entry.Name,
-			Path:         entry.Path,
-			Size:         entry.Size,
-			LastModified: entry.LastModified,
-			CreatedAt:    entry.CreatedAt,
-			Folder:       entry.Folder,
-			RootPath:     entry.RootPath,
-			URL:          entry.URL,
-			ThumbURL:     fmt.Sprintf("/thumb/%s", entry.ID),
-			Width:        w,
-			Height:       h,
-			IsVideo:      entry.IsVideo,
-		}
-	}
-	return &ImageListResult{Items: safe, Total: total, Offset: offset, Limit: limit}
 }
 
 func (a *App) GetFolders() []*FolderNode {
@@ -1364,7 +1382,21 @@ func (a *App) GetImageFile(imageID string) *FileData {
 	entry, ok := a.images[imageID]
 	a.mu.RUnlock()
 	if !ok {
-		return nil
+		// LRU 未命中：回退 SQLite 单点查询
+		if a.imageDB != nil {
+			if e, err := a.imageDB.GetImageEntry(imageID); err == nil && e != nil {
+				entry = &ImageEntry{
+					ID: e.ID, Path: e.Path, Name: e.Name, Size: e.Size,
+					LastModified: e.LastModified, CreatedAt: e.CreatedAt,
+					Folder: e.Folder, RootPath: e.RootPath,
+					Width: e.Width, Height: e.Height, IsVideo: e.IsVideo,
+					URL: fmt.Sprintf("/image/%s", e.ID),
+				}
+			}
+		}
+		if entry == nil {
+			return nil
+		}
 	}
 	data, err := os.ReadFile(entry.Path)
 	if err != nil {

@@ -660,33 +660,29 @@ const Sidebar = (() => {
         isFolderTreeRefreshing = true;
         const requestId = ++currentRefreshId; // ★ 请求序号，旧请求结果丢弃
         try {
-            // ★ 启动时一次性从存储加载到内存，之后只读内存
-            await initExpandedStates();
-
-            // 1. 从后端获取文件夹树
-            let serverTree = [];
-            let retryCount = 0;
-            const maxRetries = 3;
-            while (retryCount < maxRetries) {
-                try {
-                    if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails()) {
-                        serverTree = await WailsBridge.getFolders();
-                    } else {
-                        const response = await fetch('/api/folders');
-                        if (response.ok) serverTree = await response.json();
+            // ★ 并行启动：展开状态加载 + 后端文件夹树拉取（互不依赖）
+            const expandedReady = initExpandedStates();
+            const serverTreePromise = (async () => {
+                let tree = [];
+                const maxRetries = 3;
+                for (let retryCount = 0; retryCount < maxRetries; retryCount++) {
+                    try {
+                        if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails()) {
+                            tree = await WailsBridge.getFolders();
+                        } else {
+                            const response = await fetch('/api/folders');
+                            if (response.ok) tree = await response.json();
+                        }
+                        if (tree.length > 0 || retryCount >= maxRetries - 1) break;
+                    } catch (err) {
+                        console.warn('[Sidebar] 从后端加载文件夹树失败:', err.message);
                     }
-                    // 如果返回有数据的文件夹树，或已经重试多次，则退出循环
-                    if (serverTree.length > 0 || retryCount >= maxRetries - 1) break;
-                } catch (err) {
-                    console.warn('[Sidebar] 从后端加载文件夹树失败:', err.message);
+                    // 缩短重试间隔：后端轻量索引加载已很快
+                    await new Promise(resolve => setTimeout(resolve, 150));
                 }
-                retryCount++;
-                // 等待后端初始化完成后重试
-                await new Promise(resolve => setTimeout(resolve, 500));
-            }
-            if (serverTree.length === 0 && retryCount > 0) {
-                console.log('[Sidebar] 多次重试后仍无文件夹数据，可能后端尚未加载完成');
-            }
+                return tree;
+            })();
+            const [_, serverTree] = await Promise.all([expandedReady, serverTreePromise]);
 
             // ★ 异步 IO 后检查：请求已过期则丢弃
             if (requestId !== currentRefreshId) return;
@@ -707,7 +703,7 @@ const Sidebar = (() => {
             }
             applyDisplayNames(mergedTree, importedRootsList);
 
-            // 5. 排序
+            // 5. 排序：必须在首次渲染前完成，否则会看到跳动
             await loadFolderOrder(mergedTree);
 
             if (requestId !== currentRefreshId) return; // 再次检查
@@ -994,6 +990,8 @@ const Sidebar = (() => {
                 toggleIndexRoot(node.path, idxBtn);
             });
             header.appendChild(idxBtn);
+            // ★ 立即套用缓存的索引状态，避免重建 DOM 后短暂回到默认图标导致闪烁
+            applyCachedIndexStatus(idxBtn, node.path);
         }
 
         header.appendChild(renameBtn);
@@ -1167,32 +1165,50 @@ const Sidebar = (() => {
     // ★ 索引状态轮询
     let indexStatusPollTimer = null;
     let indexStatusPollAbort = null;
+    // ★ 缓存上次拿到的状态，渲染时立刻套用，避免重建 DOM 后短暂回到默认图标
+    const indexStatusCache = new Map(); // rootPath -> { indexing, done, total, indexed }
+
+    function applyIndexStatusToBtn(btn, info) {
+        if (!btn) return;
+        const icon = btn.querySelector('.index-icon');
+        if (!icon) return;
+        let desiredClass, desiredTitle, addCls = '', removeCls = '';
+        if (info.indexing) {
+            desiredClass = 'index-icon icon icon-indexing';
+            desiredTitle = t('sidebar.indexing_progress', { indexed: info.indexed, total: info.total });
+            addCls = 'indexing'; removeCls = 'done';
+        } else if (info.done) {
+            desiredClass = 'index-icon icon icon-index-done';
+            desiredTitle = t('sidebar.indexed_count', { n: info.total });
+            addCls = 'done'; removeCls = 'indexing';
+        } else {
+            desiredClass = 'index-icon icon icon-index';
+            desiredTitle = info.total > 0 ? t('sidebar.click_to_index', { n: info.total }) : t('sidebar.no_images');
+        }
+        // 只有真变化才写 DOM，避免无谓重绘导致背景图闪烁
+        if (icon.className !== desiredClass) icon.className = desiredClass;
+        if (btn.title !== desiredTitle) btn.title = desiredTitle;
+        if (addCls && !btn.classList.contains(addCls)) btn.classList.add(addCls);
+        if (removeCls && btn.classList.contains(removeCls)) btn.classList.remove(removeCls);
+        if (!info.indexing && !info.done) {
+            btn.classList.remove('done', 'indexing');
+        }
+    }
+
+    // 渲染时由 createFolderItem 调用，立即套用缓存中的状态
+    function applyCachedIndexStatus(btn, rootPath) {
+        const info = indexStatusCache.get(rootPath);
+        if (info) applyIndexStatusToBtn(btn, info);
+    }
 
     async function updateIndexStatusUI() {
         if (typeof WailsBridge === 'undefined') return;
         try {
             const statusList = await WailsBridge.getFolderIndexStatus();
             for (const info of statusList) {
-                const rootPath = info.rootPath;
-                const btn = document.querySelector(`.tree-index-btn[data-root-path="${CSS.escape(rootPath)}"]`);
-                if (!btn) continue;
-                const icon = btn.querySelector('.index-icon');
-                if (!icon) continue;
-                if (info.indexing) {
-                    icon.className = 'index-icon icon icon-indexing';
-                    btn.title = t('sidebar.indexing_progress', { indexed: info.indexed, total: info.total });
-                    btn.classList.add('indexing');
-                    btn.classList.remove('done');
-                } else if (info.done) {
-                    icon.className = 'index-icon icon icon-index-done';
-                    btn.title = t('sidebar.indexed_count', { n: info.total });
-                    btn.classList.add('done');
-                    btn.classList.remove('indexing');
-                } else {
-                    icon.className = 'index-icon icon icon-index';
-                    btn.title = info.total > 0 ? t('sidebar.click_to_index', { n: info.total }) : t('sidebar.no_images');
-                    btn.classList.remove('done', 'indexing');
-                }
+                indexStatusCache.set(info.rootPath, info);
+                const btn = document.querySelector(`.tree-index-btn[data-root-path="${CSS.escape(info.rootPath)}"]`);
+                applyIndexStatusToBtn(btn, info);
             }
         } catch (e) {
             // 忽略

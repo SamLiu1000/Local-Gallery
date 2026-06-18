@@ -815,6 +815,219 @@ func (idb *ImageDB) LoadAllImageCache() ([]ImageCacheEntry, error) {
 	return entries, rows.Err()
 }
 
+// LoadFolderIndexLight 仅加载文件夹列表与计数（不读图片详情）。
+// 返回的 entry 仅填充 RootPath/Folder；Size 字段复用为 COUNT(*)。
+func (idb *ImageDB) LoadFolderIndexLight() ([]ImageCacheEntry, error) {
+	idb.mu.Lock()
+	defer idb.mu.Unlock()
+	rows, err := idb.db.Query(`SELECT root_path, folder, COUNT(*) FROM image_cache GROUP BY root_path, folder`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var entries []ImageCacheEntry
+	for rows.Next() {
+		var e ImageCacheEntry
+		if err := rows.Scan(&e.RootPath, &e.Folder, &e.Size); err != nil {
+			return entries, err
+		}
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
+// LoadImageCacheByFolder 按根目录+相对文件夹精确加载。folder="" 表示根目录直接子文件。
+func (idb *ImageDB) LoadImageCacheByFolder(rootPath, folder string) ([]ImageCacheEntry, error) {
+	idb.mu.Lock()
+	defer idb.mu.Unlock()
+	rows, err := idb.db.Query(`SELECT id, path, name, size, last_modified, created_at,
+		folder, root_path, width, height, is_video FROM image_cache WHERE root_path=? AND folder=?`, rootPath, folder)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var entries []ImageCacheEntry
+	for rows.Next() {
+		var e ImageCacheEntry
+		var isVideo int
+		if err := rows.Scan(&e.ID, &e.Path, &e.Name, &e.Size, &e.LastModified,
+			&e.CreatedAt, &e.Folder, &e.RootPath, &e.Width, &e.Height, &isVideo); err != nil {
+			return entries, err
+		}
+		e.IsVideo = isVideo != 0
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
+// LoadImageCacheByRoot 加载整个根目录所有子文件夹的图片。
+func (idb *ImageDB) LoadImageCacheByRoot(rootPath string) ([]ImageCacheEntry, error) {
+	idb.mu.Lock()
+	defer idb.mu.Unlock()
+	rows, err := idb.db.Query(`SELECT id, path, name, size, last_modified, created_at,
+		folder, root_path, width, height, is_video FROM image_cache WHERE root_path=?`, rootPath)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var entries []ImageCacheEntry
+	for rows.Next() {
+		var e ImageCacheEntry
+		var isVideo int
+		if err := rows.Scan(&e.ID, &e.Path, &e.Name, &e.Size, &e.LastModified,
+			&e.CreatedAt, &e.Folder, &e.RootPath, &e.Width, &e.Height, &isVideo); err != nil {
+			return entries, err
+		}
+		e.IsVideo = isVideo != 0
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
+// LoadImageCachePaged 按 offset/limit 分页加载全部图片（folder="" 时用）。
+func (idb *ImageDB) LoadImageCachePaged(offset, limit int, sortOrder string) ([]ImageCacheEntry, error) {
+	idb.mu.Lock()
+	defer idb.mu.Unlock()
+	order := "last_modified DESC"
+	switch sortOrder {
+	case "name":
+		order = "name ASC"
+	case "size":
+		order = "size DESC"
+	case "created":
+		order = "created_at DESC"
+	case "modified":
+		order = "last_modified DESC"
+	}
+	query := `SELECT id, path, name, size, last_modified, created_at,
+		folder, root_path, width, height, is_video FROM image_cache ORDER BY ` + order + ` LIMIT ? OFFSET ?`
+	rows, err := idb.db.Query(query, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var entries []ImageCacheEntry
+	for rows.Next() {
+		var e ImageCacheEntry
+		var isVideo int
+		if err := rows.Scan(&e.ID, &e.Path, &e.Name, &e.Size, &e.LastModified,
+			&e.CreatedAt, &e.Folder, &e.RootPath, &e.Width, &e.Height, &isVideo); err != nil {
+			return entries, err
+		}
+		e.IsVideo = isVideo != 0
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
+// GetImageEntry 单点查询某 imageID（推广 resolveImagePath 回退模式）。
+func (idb *ImageDB) GetImageEntry(id string) (*ImageCacheEntry, error) {
+	idb.mu.Lock()
+	defer idb.mu.Unlock()
+	var e ImageCacheEntry
+	var isVideo int
+	err := idb.db.QueryRow(`SELECT id, path, name, size, last_modified, created_at,
+		folder, root_path, width, height, is_video FROM image_cache WHERE id=? LIMIT 1`, id).
+		Scan(&e.ID, &e.Path, &e.Name, &e.Size, &e.LastModified,
+			&e.CreatedAt, &e.Folder, &e.RootPath, &e.Width, &e.Height, &isVideo)
+	if err != nil {
+		return nil, err
+	}
+	e.IsVideo = isVideo != 0
+	return &e, nil
+}
+
+// LoadImageCacheByPaths 按路径集合批量查询。超过 500 个路径分批查询。
+func (idb *ImageDB) LoadImageCacheByPaths(paths []string) ([]ImageCacheEntry, error) {
+	idb.mu.Lock()
+	defer idb.mu.Unlock()
+	var entries []ImageCacheEntry
+	const batchSize = 500
+	for i := 0; i < len(paths); i += batchSize {
+		end := i + batchSize
+		if end > len(paths) {
+			end = len(paths)
+		}
+		batch := paths[i:end]
+		placeholders := make([]string, len(batch))
+		args := make([]interface{}, len(batch))
+		for j, p := range batch {
+			placeholders[j] = "?"
+			args[j] = p
+		}
+		query := `SELECT id, path, name, size, last_modified, created_at,
+			folder, root_path, width, height, is_video FROM image_cache WHERE path IN (` +
+			strings.Join(placeholders, ",") + `)`
+		rows, err := idb.db.Query(query, args...)
+		if err != nil {
+			return entries, err
+		}
+		for rows.Next() {
+			var e ImageCacheEntry
+			var isVideo int
+			if err := rows.Scan(&e.ID, &e.Path, &e.Name, &e.Size, &e.LastModified,
+				&e.CreatedAt, &e.Folder, &e.RootPath, &e.Width, &e.Height, &isVideo); err != nil {
+				rows.Close()
+				return entries, err
+			}
+			e.IsVideo = isVideo != 0
+			entries = append(entries, e)
+		}
+		rows.Close()
+	}
+	return entries, nil
+}
+
+// LoadImageCacheIDs 返回所有 imageID（用于 CleanOrphanedThumbs 等场景）。
+func (idb *ImageDB) LoadImageCacheIDs() ([]string, error) {
+	idb.mu.Lock()
+	defer idb.mu.Unlock()
+	rows, err := idb.db.Query(`SELECT id FROM image_cache`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return ids, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// LoadImageCacheMetaForThumbCounts 加载缩略图计数所需的轻量元数据（id/root_path/folder/is_video）。
+// 用于 computeThumbCounts 与 bbolt thumbSet 做集合运算。
+type ImageMetaForThumb struct {
+	ID       string
+	RootPath string
+	Folder   string
+	IsVideo  bool
+}
+
+func (idb *ImageDB) LoadImageCacheMetaForThumbCounts() ([]ImageMetaForThumb, error) {
+	idb.mu.Lock()
+	defer idb.mu.Unlock()
+	rows, err := idb.db.Query(`SELECT id, root_path, folder, is_video FROM image_cache`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var metas []ImageMetaForThumb
+	for rows.Next() {
+		var m ImageMetaForThumb
+		var isVideo int
+		if err := rows.Scan(&m.ID, &m.RootPath, &m.Folder, &isVideo); err != nil {
+			return metas, err
+		}
+		m.IsVideo = isVideo != 0
+		metas = append(metas, m)
+	}
+	return metas, rows.Err()
+}
+
 // UpdateImageDimensions 更新单张图片的宽高（补全旧数据时使用）
 func (idb *ImageDB) UpdateImageDimensions(id string, width, height int) error {
 	idb.mu.Lock()

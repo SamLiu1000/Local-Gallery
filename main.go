@@ -107,6 +107,9 @@ func main() {
 				app.ensureImageIndex()
 				fmt.Println("[启动任务] ensureImageIndex 完成（已包含增量刷新）")
 				// app.repairSearchIndex()
+				if app.ctx != nil {
+					wailsruntime.EventsEmit(app.ctx, "index:ready", nil)
+				}
 				fmt.Println("[启动任务] 全部后台启动任务完成")
 			}()
 		},

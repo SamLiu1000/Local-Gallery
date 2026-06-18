@@ -483,26 +483,36 @@ func (a *App) StartPreGenThumbs(folders []string) map[string]interface{} {
 		normFolders[i] = strings.ReplaceAll(f, "\\", "/")
 	}
 
-	// 收集所有选中文件夹及其子文件夹中的图片，按 ID 去重
-	seen := make(map[string]bool)
-	var entries []*ImageEntry
+	// 收集所有选中文件夹及其子文件夹下的 folderKey
 	a.mu.RLock()
+	var keysToLoad []string
 	for _, folder := range normFolders {
 		prefix := folder + "/"
-		for k, ids := range a.folderIndex {
+		for k := range a.folderIndex {
 			if k == folder || strings.HasPrefix(k, prefix) {
-				for _, id := range ids {
-					if !seen[id] {
-						seen[id] = true
-						if entry := a.images[id]; entry != nil {
-							entries = append(entries, entry)
-						}
-					}
-				}
+				keysToLoad = append(keysToLoad, k)
 			}
 		}
 	}
 	a.mu.RUnlock()
+
+	// ★ 直接从 SQL 拉取条目，避免 LRU 淘汰造成漏数据
+	seen := make(map[string]bool)
+	var entries []*ImageEntry
+	for _, k := range keysToLoad {
+		root, folderRel := a.splitFolderKey(k)
+		dbEntries, err := a.imageDB.LoadImageCacheByFolder(root, folderRel)
+		if err != nil {
+			continue
+		}
+		for _, e := range dbEntries {
+			if seen[e.ID] {
+				continue
+			}
+			seen[e.ID] = true
+			entries = append(entries, toImageEntry(e))
+		}
+	}
 
 	if len(entries) == 0 {
 		return map[string]interface{}{"success": false, "message": "文件夹无图片数据"}
@@ -738,7 +748,8 @@ func (a *App) computeThumbCounts() map[string]int {
 	}
 
 	result := make(map[string]int)
-	if a.thumbDB != nil {
+	if a.thumbDB != nil && a.imageDB != nil {
+		// 1. 从 bbolt 读取所有已缓存缩略图的 ID
 		thumbSet := make(map[string]bool)
 		a.thumbDB.View(func(tx *bbolt.Tx) error {
 			b := tx.Bucket(thumbBucket)
@@ -752,23 +763,26 @@ func (a *App) computeThumbCounts() map[string]int {
 			return nil
 		})
 
-		a.mu.RLock()
-		for _, entry := range a.images {
-			rootPath := strings.ReplaceAll(entry.RootPath, "\\", "/")
-			folder := strings.ReplaceAll(entry.Folder, "\\", "/")
-			// 视频直接算作已完成，有缩略图的图片也算
-			if entry.IsVideo || thumbSet[entry.ID] {
-				result[rootPath]++
-				if folder != "" {
-					parts := strings.Split(folder, "/")
-					for i := 1; i <= len(parts); i++ {
-						subPath := rootPath + "/" + strings.Join(parts[:i], "/")
-						result[subPath]++
+		// 2. 从 SQLite 读取轻量元数据（id/root_path/folder/is_video），与 thumbSet 做集合运算
+		// 不再遍历 a.images（LRU 缓存可能未加载全部）
+		metas, err := a.imageDB.LoadImageCacheMetaForThumbCounts()
+		if err == nil {
+			for _, m := range metas {
+				rootPath := strings.ReplaceAll(m.RootPath, "\\", "/")
+				folder := strings.ReplaceAll(m.Folder, "\\", "/")
+				// 视频直接算作已完成，有缩略图的图片也算
+				if m.IsVideo || thumbSet[m.ID] {
+					result[rootPath]++
+					if folder != "" {
+						parts := strings.Split(folder, "/")
+						for i := 1; i <= len(parts); i++ {
+							subPath := rootPath + "/" + strings.Join(parts[:i], "/")
+							result[subPath]++
+						}
 					}
 				}
 			}
 		}
-		a.mu.RUnlock()
 	}
 
 	cachedThumbCounts = result
@@ -813,6 +827,21 @@ func (a *App) incrementThumbCount(imageID string) {
 	a.mu.RLock()
 	entry, ok := a.images[imageID]
 	a.mu.RUnlock()
+	if !ok {
+		// LRU 未命中：回退 SQL 单点查询（缩略图刚生成时图片可能未在缓存）
+		if a.imageDB != nil {
+			if e, err := a.imageDB.GetImageEntry(imageID); err == nil && e != nil {
+				entry = &ImageEntry{
+					ID: e.ID, Path: e.Path, Name: e.Name, Size: e.Size,
+					LastModified: e.LastModified, CreatedAt: e.CreatedAt,
+					Folder: e.Folder, RootPath: e.RootPath,
+					Width: e.Width, Height: e.Height, IsVideo: e.IsVideo,
+					URL: fmt.Sprintf("/image/%s", e.ID),
+				}
+				ok = true
+			}
+		}
+	}
 	if !ok || entry.IsVideo {
 		return
 	}
@@ -870,12 +899,15 @@ func (a *App) CleanOrphanedThumbs() map[string]interface{} {
 		return map[string]interface{}{"success": false, "error": "BoltDB 未初始化"}
 	}
 
-	a.mu.RLock()
-	validIDs := make(map[string]bool, len(a.images))
-	for id := range a.images {
-		validIDs[id] = true
+	// ★ 从 SQL 读取所有 imageID，不再依赖 a.images（LRU 可能未加载全部）
+	validIDs := make(map[string]bool)
+	if a.imageDB != nil {
+		if ids, err := a.imageDB.LoadImageCacheIDs(); err == nil {
+			for _, id := range ids {
+				validIDs[id] = true
+			}
+		}
 	}
-	a.mu.RUnlock()
 
 	var cleaned int
 	a.thumbDB.Update(func(tx *bbolt.Tx) error {
@@ -906,12 +938,15 @@ func (a *App) CleanOrphanedThumbs() map[string]interface{} {
 
 // cleanThumbGenLocks 移除 thumbGenLocks 中不属于当前 images 的孤立锁，防止 sync.Map 无限增长
 func (a *App) cleanThumbGenLocks() {
-	a.mu.RLock()
-	validIDs := make(map[string]bool, len(a.images))
-	for id := range a.images {
-		validIDs[id] = true
+	// ★ 从 SQL 读取所有 imageID，不再依赖 a.images
+	validIDs := make(map[string]bool)
+	if a.imageDB != nil {
+		if ids, err := a.imageDB.LoadImageCacheIDs(); err == nil {
+			for _, id := range ids {
+				validIDs[id] = true
+			}
+		}
 	}
-	a.mu.RUnlock()
 
 	thumbGenLocks.Range(func(key, value interface{}) bool {
 		if id, ok := key.(string); ok && !validIDs[id] {

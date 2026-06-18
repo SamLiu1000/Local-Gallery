@@ -60,19 +60,15 @@ const App = (() => {
         // 主题初始化
         initTheme();
 
-        // Phase 1: 存储初始化（Sidebar 数据加载的前置依赖）
-        try {
-            await Storage.init();
-        } catch (err) {
+        // Phase 1: 启动并行任务（不阻塞 UI 模块初始化）
+        const storageReady = Storage.init().catch(err => {
             console.warn('[App] 存储初始化失败，部分功能可能不可用:', err.message);
             showToast(t('toast.storage_init_failed') + ': ' + err.message, 'warning');
-        }
-
-        // 加载自定义配色（需在 Storage.init 之后）
-        await loadAccentColor();
-
-        // 初始化图标路径（优先从 user/icons 目录加载，支持用户自定义）
-        await initIcons();
+        });
+        // 配色加载依赖 Storage.init，但不阻塞主流程
+        const accentReady = storageReady.then(() => loadAccentColor()).catch(() => {});
+        // 图标初始化 fire-and-forget（失败有默认图标兜底）
+        initIcons().catch(err => console.warn('[Icons] 初始化失败:', err));
 
         try {
             // Phase 2: 初始化各 UI 模块（同步，仅绑定 DOM 和回调）
@@ -117,9 +113,14 @@ const App = (() => {
             // 绑定全局事件（锁按钮、刷新、编辑模式等）
             bindGlobalEvents();
 
-            // Phase 3: 并行加载——设置同步、导入信息恢复、侧边栏数据三者同时进行
-            //   侧边栏数据和导入信息互不依赖，设置项之间也互不依赖
-            const settingsSync = Promise.all([
+            // Phase 3: 侧边栏数据立即并行启动（不依赖 Storage），其他设置同步等 Storage 就绪
+            const sidebarReady = Promise.all([
+                Sidebar.refreshFolderTree(),
+                Sidebar.refreshTagTree(),
+                Sidebar.refreshApiConfigSelect()
+            ]);
+
+            const settingsSync = storageReady.then(() => Promise.all([
                 syncSetting('theme', applyTheme, 'theme'),
                 syncSetting('leftPanelWidth', (v) => {
                     const w = parseInt(v, 10);
@@ -131,7 +132,7 @@ const App = (() => {
                         localStorage.setItem('leftPanelWidth', String(w));
                     }
                 }, 'leftPanelWidth')
-            ]);
+            ]));
 
             const importedRootsReady = (typeof Gallery !== 'undefined' && Gallery.loadImportedRootsFromServer)
                 ? Gallery.loadImportedRootsFromServer().then(savedRoots => {
@@ -142,14 +143,8 @@ const App = (() => {
                 })
                 : Promise.resolve([]);
 
-            const sidebarReady = Promise.all([
-                Sidebar.refreshFolderTree(),
-                Sidebar.refreshTagTree(),
-                Sidebar.refreshApiConfigSelect()
-            ]);
-
             // 等待所有并行任务完成
-            await Promise.all([settingsSync, importedRootsReady, sidebarReady]);
+            await Promise.all([settingsSync, importedRootsReady, sidebarReady, accentReady]);
 
             console.log('[App] 等待用户选择本地文件夹...');
 
@@ -159,13 +154,15 @@ const App = (() => {
             // ★ 检查是否自动启动局域网服务
             checkLANAutoStart();
 
-            // 启动后延迟刷新侧边栏，确保后台增量扫描的结果能反映到 UI
-            setTimeout(() => {
-                if (typeof Sidebar !== 'undefined' && Sidebar.refreshFolderTree) {
-                    console.log('[App] 执行启动后延迟刷新');
-                    Sidebar.refreshFolderTree();
-                }
-            }, 2500);
+            // 后端 ensureImageIndex 完成时刷新侧栏（事件驱动，替代固定 setTimeout）
+            if (window.runtime && window.runtime.EventsOn) {
+                window.runtime.EventsOn('index:ready', () => {
+                    if (typeof Sidebar !== 'undefined' && Sidebar.refreshFolderTree) {
+                        console.log('[App] 收到 index:ready，刷新侧栏');
+                        Sidebar.refreshFolderTree();
+                    }
+                });
+            }
         } catch (err) {
             console.error('[App] 初始化失败:', err);
             showToast(t('toast.init_failed') + ': ' + err.message, 'error');
@@ -340,15 +337,15 @@ const App = (() => {
 
     async function initIcons() {
         let baseURL = '';
-        // 重试逻辑：Go 后端可能还没就绪
-        for (let retry = 0; retry < 3; retry++) {
+        // 优先用 WailsBridge 启动时已预热的缓存，避免重试 RPC
+        if (typeof WailsBridge !== 'undefined' && WailsBridge._httpBaseURL) {
+            baseURL = WailsBridge._httpBaseURL;
+        } else {
             try {
                 baseURL = await WailsBridge.getHTTPBaseURL();
-                if (baseURL) break;
             } catch (e) {
-                console.warn('[Icons] 获取 HTTP 服务器地址失败 (attempt ' + (retry+1) + '/3):', e);
+                console.warn('[Icons] 获取 HTTP 服务器地址失败:', e);
             }
-            if (retry < 2) await new Promise(r => setTimeout(r, 500));
         }
         if (!baseURL) {
             console.warn('[Icons] 无法获取 HTTP 服务器地址，使用默认嵌入图标');

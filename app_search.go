@@ -240,20 +240,38 @@ func (a *App) batchIndexImages(images map[string]*ImageEntry, folderType string)
 
 // repairSearchIndex 修复搜索索引：将内存中有但数据库中缺失的图片元数据补写回 SQLite
 // 在应用启动时异步调用，确保之前扫描的图片也能被搜索到
+//
+// 注意：轻量索引加载后 a.images 仅含 LRU 缓存中的部分图片，此函数不再可靠。
+// 现已改为按根目录 ensureRootLoaded 后再遍历。main.go 已注释调用，保留函数备用。
 func (a *App) repairSearchIndex() {
 	if a.imageDB == nil {
 		return
 	}
 
 	a.mu.RLock()
-	totalImages := len(a.images)
+	totalRoots := len(a.registeredRoots)
+	rootsCopy := make([]string, 0, totalRoots)
+	for root := range a.registeredRoots {
+		rootsCopy = append(rootsCopy, root)
+	}
 	a.mu.RUnlock()
 
-	if totalImages == 0 {
+	if totalRoots == 0 {
 		return
 	}
 
-	// 快速路径：如果数据库记录数与内存图片数一致，说明全部已索引，直接跳过
+	// 对每个根目录：ensureRootLoaded 后再检查索引
+	for _, rootPath := range rootsCopy {
+		a.ensureRootLoaded(rootPath)
+	}
+
+	// 快速路径：如果数据库记录数与 image_cache 一致，跳过
+	a.mu.RLock()
+	totalImages := len(a.images)
+	a.mu.RUnlock()
+	if totalImages == 0 {
+		return
+	}
 	if stats := a.imageDB.GetStats(); stats != nil {
 		if dbCount, ok := stats["totalImages"].(int); ok && dbCount >= totalImages {
 			fmt.Printf("[索引修复] 搜索索引完整（DB: %d, 内存: %d），跳过检查\n", dbCount, totalImages)
@@ -261,7 +279,6 @@ func (a *App) repairSearchIndex() {
 		}
 	}
 
-	// 详细修复：找出数据库中缺失的图片并补索引
 	existingIDs, err := a.imageDB.GetExistingIDs()
 	if err != nil {
 		fmt.Printf("[索引修复] 获取已有 ID 失败: %v\n", err)
@@ -363,31 +380,28 @@ func (a *App) IndexRoot(rootPath string) {
 			cancel()
 		}()
 
-		// 收集该根目录下的所有图片
+		// photo 类型根目录跳过
 		a.mu.RLock()
-		var toIndex []*ImageEntry
-		rootNorm := strings.ReplaceAll(rootPath, "\\", "/")
-		for folderKey, ids := range a.folderIndex {
-			if folderKey == rootNorm || strings.HasPrefix(folderKey, rootNorm+"/") {
-				for _, id := range ids {
-					if entry, ok := a.images[id]; ok {
-						if ft, ok2 := a.folderTypes[entry.RootPath]; ok2 && ft == "photo" {
-							continue
-						}
-						toIndex = append(toIndex, entry)
-					}
-				}
-			}
-		}
-		total := len(toIndex)
+		ft := a.folderTypes[rootPath]
 		a.mu.RUnlock()
+		if ft == "photo" {
+			fmt.Printf("[索引] %s 是 photo 类型，跳过\n", rootPath)
+			return
+		}
 
+		// ★ 直接从 SQL 读取该根目录所有图片元数据，避免 LRU 淘汰漏数据
+		entries, err := a.imageDB.LoadImageCacheByRoot(rootPath)
+		if err != nil {
+			fmt.Printf("[索引] %s 读取 image_cache 失败: %v\n", rootPath, err)
+			return
+		}
+		total := len(entries)
 		if total == 0 {
 			fmt.Printf("[索引] %s 无图片需索引\n", rootPath)
 			return
 		}
 
-		for i, entry := range toIndex {
+		for i, e := range entries {
 			select {
 			case <-ctx.Done():
 				fmt.Printf("[索引] %s 已取消 (进度 %d/%d)\n", rootPath, i, total)
@@ -395,12 +409,12 @@ func (a *App) IndexRoot(rootPath string) {
 			default:
 			}
 
-			if _, err := os.Stat(entry.Path); err != nil {
+			if _, err := os.Stat(e.Path); err != nil {
 				continue // 文件已删除
 			}
-			a.indexImageMetadata(entry.ID, entry.Path, entry.Name,
-				entry.Size, entry.LastModified, entry.CreatedAt,
-				entry.Folder, entry.RootPath)
+			a.indexImageMetadata(e.ID, e.Path, e.Name,
+				e.Size, e.LastModified, e.CreatedAt,
+				e.Folder, e.RootPath)
 
 			if (i+1)%500 == 0 {
 				fmt.Printf("[索引] %s 进度: %d / %d\n", rootPath, i+1, total)

@@ -907,6 +907,23 @@ const Gallery = (() => {
     let cachedImageBaseURL = ''; // ★ 原图独立 origin
     let cachedThumbGen = 0;
 
+    // ★ 复用 WailsBridge 启动时预热的 baseURL，避免重复 RPC 与重试循环
+    async function ensureBaseURLs() {
+        if (typeof WailsBridge === 'undefined' || !WailsBridge.isWails()) return;
+        if (!cachedHttpBaseURL) {
+            cachedHttpBaseURL = WailsBridge._httpBaseURL || '';
+            if (!cachedHttpBaseURL) {
+                try { cachedHttpBaseURL = await WailsBridge.getHTTPBaseURL(); } catch (e) {}
+            }
+        }
+        if (!cachedImageBaseURL) {
+            cachedImageBaseURL = WailsBridge._imageBaseURL || '';
+            if (!cachedImageBaseURL) {
+                try { cachedImageBaseURL = await WailsBridge.getImageBaseURL(); } catch (e) {}
+            }
+        }
+    }
+
     function makeThumbURL(imgID, lastModified) {
         return cachedHttpBaseURL + '/thumb/' + imgID + '?t=' + lastModified + '&g=' + cachedThumbGen;
     }
@@ -943,33 +960,10 @@ const Gallery = (() => {
                 const result = await WailsBridge.getImages({ folder: folderPath || '', offset, limit, sortOrder: sortOrder || 'date-desc' });
                 serverImages = result.items || result;
                 total = result.total || 0;
-                // ★ 缓存 httpBaseURL，带重试机制
+                await ensureBaseURLs();
                 if (!cachedHttpBaseURL) {
-                    for (let retry = 0; retry < 3; retry++) {
-                        try {
-                            cachedHttpBaseURL = await WailsBridge.getHTTPBaseURL();
-                            if (cachedHttpBaseURL) break;
-                        } catch (e) {
-                            console.warn('[Gallery] 获取 HTTP 服务器地址失败 (attempt ' + (retry+1) + '/3):', e);
-                        }
-                        if (retry < 2) await new Promise(r => setTimeout(r, 500));
-                    }
-                    if (!cachedHttpBaseURL) {
-                        console.error('[Gallery] 获取 HTTP 服务器地址失败');
-                        return { images: [], total: 0 };
-                    }
-                }
-                // ★ 缓存原图独立 origin
-                if (!cachedImageBaseURL) {
-                    for (let retry = 0; retry < 3; retry++) {
-                        try {
-                            cachedImageBaseURL = await WailsBridge.getImageBaseURL();
-                            if (cachedImageBaseURL) break;
-                        } catch (e) {
-                            console.warn('[Gallery] 获取原图服务器地址失败 (attempt ' + (retry+1) + '/3):', e);
-                        }
-                        if (retry < 2) await new Promise(r => setTimeout(r, 500));
-                    }
+                    console.error('[Gallery] 获取 HTTP 服务器地址失败');
+                    return { images: [], total: 0 };
                 }
             } else {
                 let url = '/api/images';
@@ -1043,28 +1037,7 @@ const Gallery = (() => {
                 const result = await WailsBridge.getImagesByPaths(paths, offset, limit, sortOrder || 'date-desc');
                 serverImages = result.items || result;
                 total = result.total || 0;
-                if (!cachedHttpBaseURL) {
-                    for (let retry = 0; retry < 3; retry++) {
-                        try {
-                            cachedHttpBaseURL = await WailsBridge.getHTTPBaseURL();
-                            if (cachedHttpBaseURL) break;
-                        } catch (e) {
-                            console.warn('[Gallery] 获取 HTTP 服务器地址失败 (attempt ' + (retry+1) + '/3):', e);
-                        }
-                        if (retry < 2) await new Promise(r => setTimeout(r, 500));
-                    }
-                }
-                if (!cachedImageBaseURL) {
-                    for (let retry = 0; retry < 3; retry++) {
-                        try {
-                            cachedImageBaseURL = await WailsBridge.getImageBaseURL();
-                            if (cachedImageBaseURL) break;
-                        } catch (e) {
-                            console.warn('[Gallery] 获取原图服务器地址失败 (attempt ' + (retry+1) + '/3):', e);
-                        }
-                        if (retry < 2) await new Promise(r => setTimeout(r, 500));
-                    }
-                }
+                await ensureBaseURLs();
             } else {
                 const response = await fetch('/api/images-by-paths', {
                     method: 'POST',
@@ -2273,25 +2246,36 @@ const Gallery = (() => {
                     // ★ 后端返回 0 张图片时
                     if (serverImages.length === 0 && await isServerRegisteredPath(folderPath)) {
                         if (folderLoadTotal > 0) {
-                            // total > 0 说明后端知道有图但暂未返回 → 短轮询等待扫描完成
+                            // total > 0 说明后端知道有图但暂未返回 → 监听 scan:complete 事件而非轮询
                             showScanningPlaceholder();
-                            const maxPoll = Date.now() + 20000;
-                            let pollCount = 0;
-                            while (serverImages.length === 0 && Date.now() < maxPoll) {
-                                if (signal.aborted) return;
-                                await new Promise(r => setTimeout(r, 2000));
-                                const pollResult = await loadImagesFromServer(folderPath, 0, FOLDER_LOOKAHEAD);
-                                const pollImages = pollResult.images;
-                                folderLoadTotal = pollResult.total;
-                                pollCount++;
-                                if (pollImages.length > 0) {
-                                    serverImages.push(...pollImages);
-                                    folderLoadOffset = pollImages.length;
-                                    folderCacheMeta[normalizedFolder] = { total: pollResult.total };
-                                    console.log('[Gallery] 扫描完成，获取到', pollImages.length, '张图片（轮询', pollCount, '次）');
-                                    break;
+                            await new Promise(resolve => {
+                                let resolved = false;
+                                const finish = () => {
+                                    if (resolved) return;
+                                    resolved = true;
+                                    if (window.runtime && window.runtime.EventsOff) {
+                                        try { window.runtime.EventsOff('scan:complete'); } catch (e) {}
+                                    }
+                                    resolve();
+                                };
+                                if (window.runtime && window.runtime.EventsOn) {
+                                    window.runtime.EventsOn('scan:complete', (data) => {
+                                        const scanRoot = ((data && data.rootPath) || '').replace(/\\/g, '/');
+                                        const fp = (folderPath || '').replace(/\\/g, '/');
+                                        if (scanRoot === '' || fp === scanRoot || fp.startsWith(scanRoot + '/')) {
+                                            finish();
+                                        }
+                                    });
                                 }
-                            }
+                                // 兜底超时
+                                setTimeout(finish, 20000);
+                            });
+                            if (signal.aborted) return;
+                            const retryResult = await loadImagesFromServer(folderPath, 0, FOLDER_LOOKAHEAD);
+                            serverImages = retryResult.images;
+                            folderLoadTotal = retryResult.total;
+                            folderLoadOffset = serverImages.length;
+                            folderCacheMeta[normalizedFolder] = { total: retryResult.total };
                             if (serverImages.length === 0) {
                                 showLoading(false);
                                 galleryGrid.innerHTML = `
@@ -4697,20 +4681,7 @@ const Gallery = (() => {
         const isWails = typeof WailsBridge !== 'undefined' && WailsBridge.isWails();
 
         // 确保 cachedHttpBaseURL 已获取（搜索可能在浏览文件夹之前触发）
-        if (isWails && !cachedHttpBaseURL) {
-            try {
-                cachedHttpBaseURL = await WailsBridge.getHTTPBaseURL();
-            } catch (e) {
-                console.warn('[Gallery] 获取 HTTP 服务器地址失败:', e);
-            }
-        }
-        if (isWails && !cachedImageBaseURL) {
-            try {
-                cachedImageBaseURL = await WailsBridge.getImageBaseURL();
-            } catch (e) {
-                console.warn('[Gallery] 获取图片服务器地址失败:', e);
-            }
-        }
+        await ensureBaseURLs();
 
         // 为搜索结果设置 URL
         for (const img of galleryImages) {

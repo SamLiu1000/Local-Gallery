@@ -1,6 +1,7 @@
 package main
 
 import (
+	"container/list"
 	"fmt"
 	"image"
 	_ "image/gif"
@@ -133,8 +134,20 @@ func (a *App) scanAllFolders() int {
 	}
 
 	a.mu.Lock()
+	// ★ 与 LRU 协同：清空旧 LRU 状态，写入扫描结果并标记所有 folderKey 为 loaded
 	a.images = tempImages
 	a.folderIndex = tempFolderIndex
+	a.folderLoaded = make(map[string]bool)
+	if a.folderLRU == nil {
+		a.folderLRU = list.New()
+	} else {
+		a.folderLRU.Init()
+	}
+	a.lruNodes = make(map[string]*list.Element)
+	for fk := range tempFolderIndex {
+		a.folderLoaded[fk] = true
+		a.lruNodes[fk] = a.folderLRU.PushBack(fk)
+	}
 	a.rebuildFolderCounts()
 	a.mu.Unlock()
 
@@ -390,12 +403,13 @@ func (a *App) removeByRoot(rootPath string) {
 		}
 	}
 
-	// 收集要删除的图片ID，用于清理缩略图
+	// 收集要删除的图片ID，用于清理缩略图（从 folderIndex 收集，不遍历 a.images）
 	a.mu.RLock()
 	var idsToRemove []string
-	for id, entry := range a.images {
-		if entry.RootPath == rootPath {
-			idsToRemove = append(idsToRemove, id)
+	rootNorm := strings.ReplaceAll(rootPath, "\\", "/")
+	for folderKey, ids := range a.folderIndex {
+		if folderKey == rootNorm || strings.HasPrefix(folderKey, rootNorm+"/") {
+			idsToRemove = append(idsToRemove, ids...)
 		}
 	}
 	a.mu.RUnlock()
@@ -409,27 +423,34 @@ func (a *App) removeByRoot(rootPath string) {
 }
 
 // removeByRootFromMemory 只清除内存中的 images 和 folderIndex
+// removeByRootFromMemory 从内存清理某 rootPath 的所有数据（需持 a.mu 写锁）。
+// 基于 folderIndex 定位 root 下所有 folderKey，同步清理 LRU 状态。
 func (a *App) removeByRootFromMemory(rootPath string) {
-	var idsToRemove []string
-	for id, entry := range a.images {
-		if entry.RootPath == rootPath {
-			idsToRemove = append(idsToRemove, id)
+	rootNorm := strings.ReplaceAll(rootPath, "\\", "/")
+	// 收集 root 下所有 folderKey
+	var keysToRemove []string
+	for folderKey := range a.folderIndex {
+		if folderKey == rootNorm || strings.HasPrefix(folderKey, rootNorm+"/") {
+			keysToRemove = append(keysToRemove, folderKey)
 		}
 	}
-	for _, id := range idsToRemove {
-		delete(a.images, id)
-	}
-	for folderKey, ids := range a.folderIndex {
-		var remaining []string
-		for _, id := range ids {
-			if _, exists := a.images[id]; exists {
-				remaining = append(remaining, id)
-			}
+	// 从 a.images 删除这些 folderKey 下的所有 ID，并清 LRU
+	for _, fk := range keysToRemove {
+		for _, id := range a.folderIndex[fk] {
+			delete(a.images, id)
 		}
-		if len(remaining) == 0 {
-			delete(a.folderIndex, folderKey)
-		} else {
-			a.folderIndex[folderKey] = remaining
+		delete(a.folderIndex, fk)
+		delete(a.folderLoaded, fk)
+		if elem, ok := a.lruNodes[fk]; ok {
+			a.folderLRU.Remove(elem)
+			delete(a.lruNodes, fk)
+		}
+	}
+	// 清理 folderCount
+	delete(a.folderCount, rootNorm)
+	for k := range a.folderCount {
+		if strings.HasPrefix(k, rootNorm+"/") {
+			delete(a.folderCount, k)
 		}
 	}
 }
@@ -670,10 +691,23 @@ func (a *App) scanRootAsync(rootPath string) {
 	if !a.registeredRoots[rootPath] { a.mu.Unlock(); fmt.Printf("[后台扫描] 根目录已被移除，丢弃扫描结果: %s\n", rootPath); return }
 	a.removeByRootFromMemory(rootPath)
 	for k, v := range localImages { a.images[k] = v }
-	for k, v := range localFolderIndex { a.folderIndex[k] = append(a.folderIndex[k], v...) }
-	a.rebuildFolderCounts()
+	for k, v := range localFolderIndex {
+		a.folderIndex[k] = append(a.folderIndex[k], v...)
+		if !a.folderLoaded[k] {
+			a.folderLoaded[k] = true
+			if a.folderLRU != nil {
+				a.lruNodes[k] = a.folderLRU.PushBack(k)
+			}
+		} else {
+			a.touchFolderLocked(k)
+		}
+	}
+	a.evictLRU()
 	a.mu.Unlock()
 	a.saveImageIndexForRoot(rootPath)
+	a.mu.Lock()
+	a.rebuildFolderCountsFromSQLLocked()
+	a.mu.Unlock()
 
 	// 再次确保 folderCount 正确后再通知完成
 	a.mu.Lock()
@@ -693,7 +727,7 @@ func (a *App) scanRootAsync(rootPath string) {
 }
 func (a *App) ensureImageIndex() {
 	a.mu.RLock()
-	totalImages := len(a.images)
+	totalFolders := len(a.folderIndex)
 	totalRoots := len(a.registeredRoots)
 	a.mu.RUnlock()
 
@@ -702,8 +736,8 @@ func (a *App) ensureImageIndex() {
 		return
 	}
 
-	// 快速路径：有图片且所有根目录在 folderCount 中都有记录
-	if totalImages > 0 {
+	// 快速路径：folderIndex 有记录且所有根目录在 folderCount 中都有记录
+	if totalFolders > 0 {
 		a.mu.RLock()
 		allOk := true
 		for root := range a.registeredRoots {
@@ -725,7 +759,7 @@ func (a *App) ensureImageIndex() {
 		}
 		a.mu.RUnlock()
 		if allOk {
-			fmt.Printf("[启动修复] 图片缓存完整（%d 张，%d 个根目录），跳过检查\n", totalImages, totalRoots)
+			fmt.Printf("[启动修复] folderIndex 完整（%d 个文件夹，%d 个根目录），跳过检查\n", totalFolders, totalRoots)
 			return
 		}
 	}
@@ -748,7 +782,7 @@ func (a *App) ensureImageIndex() {
 			continue
 		}
 
-		if totalImages == 0 {
+		if totalFolders == 0 {
 			rootsToScan = append(rootsToScan, root)
 			continue
 		}
@@ -775,8 +809,8 @@ func (a *App) ensureImageIndex() {
 	}
 
 	if len(rootsToScan) > 0 {
-		if totalImages == 0 {
-			fmt.Printf("[启动修复] 图片缓存为空但已注册 %d 个目录，触发增量扫描\n", len(rootsToScan))
+		if totalFolders == 0 {
+			fmt.Printf("[启动修复] folderIndex 为空但已注册 %d 个目录，触发增量扫描\n", len(rootsToScan))
 		} else {
 			fmt.Printf("[启动修复] 发现 %d 个文件夹缺失索引，开始增量补扫\n", len(rootsToScan))
 		}
@@ -1052,8 +1086,10 @@ func (a *App) refreshFolderInternal(folderPath string) *FolderDiffResult {
 		a.images[entry.ID] = entry
 	}
 	// 从 folderIndex 中移除已删除的 ID
+	affectedKeys := make(map[string]bool)
 	for folderKey, ids := range a.folderIndex {
 		if folderKey == normalizedFolder || strings.HasPrefix(folderKey, normalizedFolder+"/") {
+			affectedKeys[folderKey] = true
 			var remaining []string
 			for _, id := range ids {
 				if _, ok := a.images[id]; ok {
@@ -1061,7 +1097,7 @@ func (a *App) refreshFolderInternal(folderPath string) *FolderDiffResult {
 				}
 			}
 			if len(remaining) == 0 {
-				delete(a.folderIndex, folderKey)
+				a.folderIndex[folderKey] = nil // 保留 key 占位
 			} else {
 				a.folderIndex[folderKey] = remaining
 			}
@@ -1075,12 +1111,25 @@ func (a *App) refreshFolderInternal(folderPath string) *FolderDiffResult {
 			folderKey = rootNorm + "/" + strings.ReplaceAll(entry.Folder, "\\", "/")
 		}
 		a.folderIndex[folderKey] = append(a.folderIndex[folderKey], entry.ID)
+		affectedKeys[folderKey] = true
 	}
-	a.rebuildFolderCounts()
+	// ★ 与 LRU 协同：增量刷新结果即权威数据，标记受影响 folderKey 为 loaded
+	for fk := range affectedKeys {
+		if !a.folderLoaded[fk] {
+			a.folderLoaded[fk] = true
+			a.lruNodes[fk] = a.folderLRU.PushBack(fk)
+		} else {
+			a.touchFolderLocked(fk)
+		}
+	}
+	a.evictLRU()
 	a.mu.Unlock()
 
 	// === Phase 4: JSON 持久化 ===
 	a.saveImageIndexForRoot(folderPath)
+	a.mu.Lock()
+	a.rebuildFolderCountsFromSQLLocked()
+	a.mu.Unlock()
 
 	// 构造返回结果
 	addedSafe := make([]SafeImage, len(addedEntries))
