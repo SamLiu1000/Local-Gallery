@@ -116,6 +116,8 @@
   "gallery.folder_empty_hint": "图片较多或硬盘较慢时可能需要一些时间",
   "gallery.load_failed": "加载失败",
   "gallery.loading": "加载中...",
+  "gallery.loading_more": "正在加载更多图片...",
+  "gallery.all_loaded": "已加载全部图片",
   "gallery.no_images": "暂无图片，请点击左侧\"选择文件夹\"按钮添加图片目录",
   "gallery.placeholder": "请先在左侧选择一个文件夹来浏览图片",
   "inertia.accel": "加速系数 (ACCELERATION)",

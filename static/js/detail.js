@@ -820,6 +820,8 @@ const DetailPanel = (() => {
 
     async function generatePrompt() {
         if (!currentImage) return;
+        const targetImage = currentImage;
+        const targetPath = currentImage.path;
 
         // 获取 API 配置：优先使用右侧面板选择的配置，否则使用默认配置
         const selectedId = detailApiConfigSelect?.value;
@@ -847,9 +849,9 @@ const DetailPanel = (() => {
             let base64;
 
             // 方法1：Wails 环境 — 通过 Go 桥接直接获取图片（绕过 HTTP/CORS）
-            if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails() && currentImage.id) {
+            if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails() && targetImage.id) {
                 try {
-                    const fileData = await WailsBridge.getImageFile(currentImage.id);
+                    const fileData = await WailsBridge.getImageFile(targetImage.id);
                     if (fileData && fileData.data) {
                         base64 = fileData.data;
                     }
@@ -859,18 +861,18 @@ const DetailPanel = (() => {
             }
 
             // 方法2：File 对象（浏览器 File System Access API）
-            if (!base64 && currentImage.file) {
-                base64 = await ApiService.fileToBase64(currentImage.file);
+            if (!base64 && targetImage.file) {
+                base64 = await ApiService.fileToBase64(targetImage.file);
             }
 
             // 方法3：通过 URL 加载（blob: / data: / http:）
-            if (!base64 && currentImage.thumbnailUrl) {
-                base64 = await ApiService.urlToBase64(currentImage.thumbnailUrl);
+            if (!base64 && targetImage.thumbnailUrl) {
+                base64 = await ApiService.urlToBase64(targetImage.thumbnailUrl);
             }
 
             // 方法4：通过图片原始 URL 加载
-            if (!base64 && currentImage.url) {
-                base64 = await ApiService.urlToBase64(currentImage.url);
+            if (!base64 && targetImage.url) {
+                base64 = await ApiService.urlToBase64(targetImage.url);
             }
 
             if (!base64) {
@@ -879,16 +881,19 @@ const DetailPanel = (() => {
 
             const result = await ApiService.reversePrompt(base64, config, generateAbortController.signal);
 
-            // 保存为新的提示词版本
-            const version = await Storage.addPromptVersion(currentImage.path, {
+            // 保存为新的提示词版本（始终绑定到启动反推时的图片路径）
+            const version = await Storage.addPromptVersion(targetPath, {
                 positivePrompt: result.positivePrompt,
                 negativePrompt: result.negativePrompt,
                 source: 'ai_generated'
             });
 
-            currentPromptVersions.push(version);
-            currentPromptIndex = currentPromptVersions.length - 1;
-            renderCurrentPrompt();
+            // 只有当前仍展示同一张图片时，才更新右侧面板 UI
+            if (currentImage === targetImage) {
+                currentPromptVersions.push(version);
+                currentPromptIndex = currentPromptVersions.length - 1;
+                renderCurrentPrompt();
+            }
             if (typeof Gallery !== 'undefined') { Gallery.refreshPromptCounts(); }
             App.showToast(_t('detail.ai_reverse_done'), 'success');
         } catch (err) {

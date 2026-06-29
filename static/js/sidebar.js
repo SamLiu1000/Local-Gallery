@@ -862,6 +862,26 @@ const Sidebar = (() => {
         updateEditOrderButtonUI();
     }
 
+    function applyFolderProgress(countEl, total, thumbCount) {
+        if (!countEl) return;
+        const safeTotal = Math.max(0, Number(total) || 0);
+        const safeThumbCount = Math.max(0, Number(thumbCount) || 0);
+        const displayThumbCount = Math.min(safeThumbCount, safeTotal);
+        countEl.textContent = safeTotal;
+        countEl.dataset.total = safeTotal;
+        countEl.dataset.thumbCount = displayThumbCount;
+        countEl.style.background = '';
+        if (safeTotal > 0 && displayThumbCount > 0) {
+            const pct = Math.min(100, Math.max(0, Math.round((displayThumbCount / safeTotal) * 100)));
+            countEl.style.background = 'linear-gradient(to right, var(--thumb-fill, var(--bg-tertiary)) ' + pct + '%, var(--count-bg, var(--bg-input)) ' + pct + '%)';
+            countEl.title = t('sidebar.image_count_tooltip').replace('{total}', safeTotal).replace('{thumb}', displayThumbCount).replace('{pct}', pct);
+        } else if (safeTotal > 0) {
+            countEl.title = t('sidebar.image_count_no_thumb').replace('{total}', safeTotal);
+        } else {
+            countEl.title = t('sidebar.image_count_zero');
+        }
+    }
+
     /**
      * 创建单个文件夹树节点（递归）
      */
@@ -906,18 +926,7 @@ const Sidebar = (() => {
         const thumbCount = node.thumbCount || 0;
         const count = document.createElement('span');
         count.className = 'tree-count';
-        count.textContent = total;
-        count.dataset.total = total;
-        count.dataset.thumbCount = thumbCount;
-        if (total > 0 && thumbCount > 0) {
-            const pct = Math.round((thumbCount / total) * 100);
-            count.style.background = 'linear-gradient(to right, var(--thumb-fill, var(--bg-tertiary)) ' + pct + '%, var(--count-bg, var(--bg-input)) ' + pct + '%)';
-            count.title = t('sidebar.image_count_tooltip').replace('{total}', total).replace('{thumb}', thumbCount).replace('{pct}', pct);
-        } else if (total > 0) {
-            count.title = t('sidebar.image_count_no_thumb').replace('{total}', total);
-        } else {
-            count.title = t('sidebar.image_count_zero');
-        }
+        applyFolderProgress(count, total, thumbCount);
 
         // 编辑模式下的排序按钮组（上下箭头 + 拖拽手柄）
         const sortActions = document.createElement('span');
@@ -1697,8 +1706,7 @@ const Sidebar = (() => {
             if (rootNode) {
                 const countEl = rootNode.querySelector(':scope > .tree-node-header > .tree-count');
                 if (countEl) {
-                    countEl.textContent = count;
-                    countEl.dataset.total = count;
+                    applyFolderProgress(countEl, count, countEl.dataset.thumbCount);
                 }
             }
         }
@@ -1743,6 +1751,7 @@ const Sidebar = (() => {
                         if (count >= 0) {
                             updateLocalCount(count);
                             updateDOMCount(count);
+                            await refreshFolderTree();
                             if (count > 0 && typeof Gallery !== 'undefined' && Gallery.filterByFolder) {
                                 if (Gallery._beginScanLoad) Gallery._beginScanLoad(folderPath);
                                 await Gallery.filterByFolder(folderPath, folderName);
@@ -5724,14 +5733,13 @@ const Sidebar = (() => {
     }
 
     // 轻量更新文件夹计数（不重建 DOM），用于增量扫描时实时更新数字
-    function _updateFolderCounts(rootPath, totalCount) {
+    function _updateFolderCounts(rootPath, totalCount, thumbCount) {
         if (!folderTree) return;
         const rootNode = folderTree.querySelector('.tree-node[data-path="' + CSS.escape(rootPath) + '"]');
         if (!rootNode) return;
         const countEl = rootNode.querySelector(':scope > .tree-node-header > .tree-count');
         if (countEl) {
-            countEl.textContent = totalCount;
-            countEl.dataset.total = totalCount;
+            applyFolderProgress(countEl, totalCount, thumbCount ?? countEl.dataset.thumbCount);
         }
     }
 
@@ -5743,9 +5751,16 @@ const Sidebar = (() => {
 
         // 从后端只查这一个文件夹的 count
         let count = -1;
+        let thumbCount = 0;
         try {
             if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails()) {
-                count = await WailsBridge.getFolderCount(folderPath);
+                if (WailsBridge.getFolderProgress) {
+                    const progress = await WailsBridge.getFolderProgress(folderPath);
+                    count = progress.count ?? -1;
+                    thumbCount = progress.thumbCount ?? 0;
+                } else {
+                    count = await WailsBridge.getFolderCount(folderPath);
+                }
             }
         } catch (e) {
             // 后端不可用，回退到整树刷新
@@ -5759,6 +5774,7 @@ const Sidebar = (() => {
                 const nodePath = (node.path || '').replace(/\\/g, '/').toLowerCase();
                 if (nodePath === normalizedTarget) {
                     node.imageCount = count;
+                    node.thumbCount = thumbCount;
                     return true;
                 }
                 if (node.children && node.children.length > 0) {
@@ -5775,8 +5791,7 @@ const Sidebar = (() => {
             if (rootNode) {
                 const countEl = rootNode.querySelector(':scope > .tree-node-header > .tree-count');
                 if (countEl) {
-                    countEl.textContent = count;
-                    countEl.dataset.total = count;
+                    applyFolderProgress(countEl, count, thumbCount);
                 }
             }
         }

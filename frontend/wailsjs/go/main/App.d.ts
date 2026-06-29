@@ -46,6 +46,8 @@ export function GetFolderCount(arg1:string):Promise<number>;
 
 export function GetFolderIndexStatus():Promise<Array<main.IndexRootInfo>>;
 
+export function GetFolderProgress(arg1:string):Promise<Record<string, number>>;
+
 export function GetFolders():Promise<Array<main.FolderNode>>;
 
 export function GetHTTPBaseURL():Promise<string>;

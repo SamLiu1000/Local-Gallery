@@ -575,5 +575,7 @@
   "viewer.rotate_btn": "Rotate",
   "viewer.slideshow": "Slideshow",
   "viewer.slideshow_btn": "Slideshow",
-  "viewer.wheel_zoom": "Scroll to zoom"
+  "viewer.wheel_zoom": "Scroll to zoom",
+  "gallery.loading_more": "더 많은 이미지를 로드하는 중...",
+  "gallery.all_loaded": "모든 이미지를 로드했습니다"
 }

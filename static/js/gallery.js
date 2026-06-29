@@ -40,7 +40,9 @@ const Gallery = (() => {
     let folderLoadTotal = 0;          // 当前文件夹服务器的图片总数
     let folderLoadOffset = 0;         // 已加载偏移量
     const FOLDER_LOOKAHEAD = 250;    // 视窗后方保持预加载的图片张数
+    const FOLDER_FETCH_BATCH = 500;  // 后端单次分页上限，滚动中提前拉满一批
     let isLoadingMoreFolder = false;  // 防止重复触发增量加载
+    let _loadMoreFollowupTimer = null; // 增量加载后继续检查，避免停在批次边界
     let folderCacheMeta = {};         // { [normalizedFolderPath]: { total: number } }  切换文件夹时优先使用缓存，避免重复请求后端
     let importedRoots = [];         // [{ rootId, path, name, handleName, displayName }]
     let directoryHandles = [];      // [{ id, name, handle }] 用于 File System Access API 持久化
@@ -261,11 +263,11 @@ const Gallery = (() => {
                             filterByFolder(currentFolderFilter, null, { forceRefresh: true });
                         }
                     }
-                    // ★ 轻量更新：只更新 scanRoot 对应节点的计数，不重建整棵树
-                    if (typeof Sidebar !== 'undefined' && Sidebar._updateSingleFolderCount) {
-                        Sidebar._updateSingleFolderCount(scanRoot);
-                    } else if (typeof Sidebar !== 'undefined' && Sidebar.refreshFolderTree) {
+                    // ★ 扫描完成后刷新整棵树，导入后的子文件夹和展开按钮需要后端完整树数据
+                    if (typeof Sidebar !== 'undefined' && Sidebar.refreshFolderTree) {
                         Sidebar.refreshFolderTree();
+                    } else if (typeof Sidebar !== 'undefined' && Sidebar._updateSingleFolderCount) {
+                        Sidebar._updateSingleFolderCount(scanRoot);
                     }
                 });
                 // 开始加载时设 pending，完成后移入 loaded
@@ -282,7 +284,7 @@ const Gallery = (() => {
 
                     // ★ 轻量更新侧栏计数
                     if (typeof Sidebar !== 'undefined' && Sidebar._updateFolderCounts) {
-                        Sidebar._updateFolderCounts(batchRoot, data.totalSoFar);
+                        Sidebar._updateFolderCounts(batchRoot, data.totalSoFar, data.thumbCount);
                     } else if (typeof Sidebar !== 'undefined' && Sidebar._updateSingleFolderCount) {
                         Sidebar._updateSingleFolderCount(batchRoot);
                     } else if (typeof Sidebar !== 'undefined' && Sidebar.refreshFolderTree) {
@@ -444,17 +446,18 @@ const Gallery = (() => {
                     if (currentLayout === 'grid' || currentLayout === 'masonry' || currentLayout === 'pinterest' || currentLayout === 'list') {
                         updateVirtualScroll();
                     }
-                    checkLoadMoreOnScroll();
+                    checkLoadMoreOnScroll(true);
                 });
             }
 
-            // ★ Observer 重连：滚动真正停止 150ms 后才执行，避免滚动中频繁触发
+            // ★ Observer 重连和底部加载：滚动真正停止后再执行，避免拖动滚动条时改变 scrollHeight
             if (_observerDebounceTimer) clearTimeout(_observerDebounceTimer);
             _observerDebounceTimer = setTimeout(() => {
                 _isScrolling = false;
                 _observerDebounceTimer = null;
                 galleryGrid.classList.remove('is-scrolling');
                 _resumeImageObserver();
+                checkLoadMoreOnScroll();
             }, 150);
         });
 
@@ -463,7 +466,19 @@ const Gallery = (() => {
             if (!_inertiaEnabled) return;
             if (e.buttons === 1) return;
             e.preventDefault();
-            _inertiaV += e.deltaY * ACCELERATION;
+
+            const delta = e.deltaY * ACCELERATION;
+            // ★ 边界反向输入立即归零：到底部时 wheel 向上、到顶部时 wheel 向下
+            //   避免残留的同向速度吞掉用户的反向意图
+            if (_inertiaV !== 0 && Math.sign(delta) !== Math.sign(_inertiaV)) {
+                const atBottom = galleryScroll.scrollTop + galleryScroll.clientHeight >= galleryScroll.scrollHeight - 1;
+                const atTop = galleryScroll.scrollTop <= 0;
+                if ((delta < 0 && atBottom) || (delta > 0 && atTop)) {
+                    _inertiaV = 0;
+                }
+            }
+
+            _inertiaV += delta;
             _inertiaV = Math.max(-MAX_VELOCITY, Math.min(MAX_VELOCITY, _inertiaV));
             _lastWheelTime = performance.now();
 
@@ -532,10 +547,14 @@ const Gallery = (() => {
                 let vel = v * 16; // 转为每帧速度
                 function glide() {
                     vel *= friction;
+                    const prevScrollTop = galleryScroll.scrollTop;
                     galleryScroll.scrollBy(0, -vel);
-                    if (Math.abs(vel) > 0.3) {
-                        _dragScroll.rafId = requestAnimationFrame(glide);
+                    const newScrollTop = galleryScroll.scrollTop;
+                    // ★ 边界停止：到顶/底时立即结束滑行，避免空转抖动
+                    if (Math.abs(vel) <= 0.3 || Math.abs(newScrollTop - prevScrollTop) < 0.5) {
+                        return;
                     }
+                    _dragScroll.rafId = requestAnimationFrame(glide);
                 }
                 _dragScroll.rafId = requestAnimationFrame(glide);
             }
@@ -724,8 +743,19 @@ const Gallery = (() => {
         }
 
         // ★ 一次性令牌：保护本次 scrollBy 触发的 scroll 事件不被取消
+        const prevScrollTop = galleryScroll.scrollTop;
         _inertiaScrolling = true;
         galleryScroll.scrollBy(0, _inertiaV);
+        const newScrollTop = galleryScroll.scrollTop;
+
+        // ★ 边界停止：scrollBy 未实际改变 scrollTop（已到顶/底），立即归零速度
+        //   否则惯性引擎会空转，_inertiaV 缓慢衰减期间用户的反向 wheel 输入被吞掉
+        if (Math.abs(newScrollTop - prevScrollTop) < 0.5) {
+            _inertiaV = 0;
+            _inertiaId = null;
+            _inertiaScrolling = false;
+            return;
+        }
 
         // 滚轮停止超过 RELEASE_DELAY ms → 切换为松手摩擦（快速衰减）
         const friction = (now - _lastWheelTime > RELEASE_DELAY)
@@ -1974,62 +2004,82 @@ const Gallery = (() => {
     // ★ 节流时间戳，防止 scroll 事件连续触发多次加载
     let _lastScrollCheckTime = 0;
 
-    function checkLoadMoreOnScroll() {
-        if (!isFilteringActive || !currentFolderFilter) return;
-        if (isLoadingMoreFolder) return;
-        if (folderLoadTotal > 0 && folderLoadOffset >= folderLoadTotal) return;
+    function getViewportLastImageIndex() {
+        if (!galleryScroll || filteredImages.length === 0) return 0;
 
-        // ★ 节流：同一帧内最多触发一次
-        const now = Date.now();
-        if (now - _lastScrollCheckTime < 200) return;
-        _lastScrollCheckTime = now;
+        const viewBottom = galleryScroll.scrollTop + galleryScroll.clientHeight;
 
-        // ★ 计算当前视窗底部对应的图片索引（视窗内最后一张的索引）
-        let viewportLastIndex;
         if (currentLayout === 'masonry') {
-            // 瀑布流：找到视窗底部所在行的最后一张
-            const viewBottom = galleryScroll.scrollTop + galleryScroll.clientHeight;
             const rowH = thumbnailSize + 8;
             const lastVisibleRow = Math.floor(viewBottom / rowH);
             const lastItem = masonryLayout.findLast ?
                 masonryLayout.findLast(item => item.row <= lastVisibleRow) :
                 [...masonryLayout].reverse().find(item => item.row <= lastVisibleRow);
-            viewportLastIndex = lastItem ? lastItem.imgIndex : 0;
-        } else if (currentLayout === 'pinterest') {
-            // 竖版瀑布流：用 y 坐标估算视窗底部图片索引
-            const viewBottom = galleryScroll.scrollTop + galleryScroll.clientHeight;
-            const lastItem = pinterestLayout.length > 0 ?
+            return lastItem ? lastItem.imgIndex : 0;
+        }
+
+        if (currentLayout === 'pinterest') {
+            return pinterestLayout.length > 0 ?
                 pinterestLayout.reduce((best, item) => {
                     if (item.y <= viewBottom && item.imgIndex > best) return item.imgIndex;
                     return best;
                 }, 0) : 0;
-            viewportLastIndex = lastItem;
-        } else if (currentLayout === 'list') {
-            // 列表：两列，每行 2 张图
+        }
+
+        if (currentLayout === 'list') {
             const rowStep = thumbnailSize + 8;
-            const viewBottom = galleryScroll.scrollTop + galleryScroll.clientHeight;
             const lastVisibleRow = Math.floor(viewBottom / rowStep);
-            viewportLastIndex = Math.min(
+            return Math.min(
                 Math.max(0, (lastVisibleRow + 1) * 2 - 1),
                 Math.max(0, filteredImages.length - 1)
             );
-        } else {
-            // 网格：行高固定，直接算索引
-            const columns = getColumnCount();
-            const rowHeight = thumbnailSize + 36 + 8;
-            const viewBottom = galleryScroll.scrollTop + galleryScroll.clientHeight;
-            const lastVisibleRow = Math.floor(viewBottom / rowHeight);
-            viewportLastIndex = Math.min((lastVisibleRow + 1) * columns - 1, filteredImages.length - 1);
         }
 
-        // ★ 视窗后方已加载的张数 = 已加载总数 - 视窗底部索引 - 1
+        const columns = getColumnCount();
+        const rowHeight = thumbnailSize + 36 + 8;
+        const lastVisibleRow = Math.floor(viewBottom / rowHeight);
+        return Math.min((lastVisibleRow + 1) * columns - 1, filteredImages.length - 1);
+    }
+
+    function getLoadedBottomDistance() {
+        if (!galleryScroll) return Infinity;
+        return Math.max(0, galleryScroll.scrollHeight - (galleryScroll.scrollTop + galleryScroll.clientHeight));
+    }
+
+    function shouldLoadMoreFolderImages(imagesAheadOfViewport) {
+        if (!galleryScroll) return imagesAheadOfViewport <= FOLDER_LOOKAHEAD;
+        const bottomBuffer = Math.max(galleryScroll.clientHeight * 8, thumbnailSize * 24);
+        return imagesAheadOfViewport <= FOLDER_LOOKAHEAD || getLoadedBottomDistance() <= bottomBuffer;
+    }
+
+    function checkLoadMoreOnScroll(allowDuringScroll = false) {
+        if (!isFilteringActive || !currentFolderFilter) return;
+        if (!allowDuringScroll && _isScrolling) return;
+        if (isLoadingMoreFolder) return;
+        if (folderLoadTotal > 0 && folderLoadOffset >= folderLoadTotal) return;
+
+        const now = Date.now();
+        const throttleMs = allowDuringScroll ? 80 : 200;
+        if (now - _lastScrollCheckTime < throttleMs) return;
+        _lastScrollCheckTime = now;
+
+        const viewportLastIndex = getViewportLastImageIndex();
         const imagesAheadOfViewport = filteredImages.length - viewportLastIndex - 1;
 
-        // ★ 视窗后方不足 FOLDER_LOOKAHEAD 张时触发加载
-        if (imagesAheadOfViewport < FOLDER_LOOKAHEAD) {
+        if (shouldLoadMoreFolderImages(imagesAheadOfViewport)) {
             _abortOutOfViewportLoads();
             loadMoreFolderImages();
         }
+    }
+
+    function scheduleLoadMoreFollowup() {
+        if (_loadMoreFollowupTimer) return;
+        _loadMoreFollowupTimer = setTimeout(() => {
+            _loadMoreFollowupTimer = null;
+            if (!_isScrolling) {
+                checkLoadMoreOnScroll();
+            }
+        }, 80);
     }
 
     async function loadMoreFolderImages() {
@@ -2039,40 +2089,9 @@ const Gallery = (() => {
         try {
             const folderPath = currentFolderFilter;
 
-            // ★ 计算视窗后方已有多少张，再决定本次拉取数量（补足到 FOLDER_LOOKAHEAD）
-            let viewportLastIndex = 0;
-            if (currentLayout === 'masonry') {
-                const viewBottom = galleryScroll.scrollTop + galleryScroll.clientHeight;
-                const rowH = thumbnailSize + 8;
-                const lastVisibleRow = Math.floor(viewBottom / rowH);
-                const lastItem = masonryLayout.findLast ?
-                    masonryLayout.findLast(item => item.row <= lastVisibleRow) :
-                    [...masonryLayout].reverse().find(item => item.row <= lastVisibleRow);
-                viewportLastIndex = lastItem ? lastItem.imgIndex : 0;
-            } else if (currentLayout === 'pinterest') {
-                const viewBottom = galleryScroll.scrollTop + galleryScroll.clientHeight;
-                viewportLastIndex = pinterestLayout.length > 0 ?
-                    pinterestLayout.reduce((best, item) => {
-                        if (item.y <= viewBottom && item.imgIndex > best) return item.imgIndex;
-                        return best;
-                    }, 0) : 0;
-            } else if (currentLayout === 'list') {
-                const rowStep = thumbnailSize + 8;
-                const viewBottom = galleryScroll.scrollTop + galleryScroll.clientHeight;
-                const lastVisibleRow = Math.floor(viewBottom / rowStep);
-                viewportLastIndex = Math.min(
-                    Math.max(0, (lastVisibleRow + 1) * 2 - 1),
-                    Math.max(0, filteredImages.length - 1)
-                );
-            } else {
-                const columns = getColumnCount();
-                const rowHeight = thumbnailSize + 36 + 8;
-                const viewBottom = galleryScroll.scrollTop + galleryScroll.clientHeight;
-                const lastVisibleRow = Math.floor(viewBottom / rowHeight);
-                viewportLastIndex = Math.min((lastVisibleRow + 1) * columns - 1, filteredImages.length - 1);
-            }
+            const viewportLastIndex = getViewportLastImageIndex();
             const imagesAheadOfViewport = Math.max(0, filteredImages.length - viewportLastIndex - 1);
-            const fetchCount = Math.max(FOLDER_LOOKAHEAD - imagesAheadOfViewport, FOLDER_LOOKAHEAD);
+            const fetchCount = Math.max(FOLDER_FETCH_BATCH, FOLDER_LOOKAHEAD - imagesAheadOfViewport);
 
             const result = await loadImagesFromServer(folderPath, folderLoadOffset, fetchCount);
 
@@ -2096,7 +2115,6 @@ const Gallery = (() => {
             updateImageCount();
 
             if (currentLayout === 'masonry') {
-                // 瀑布流：绝对定位追加，不影响已有卡片，安全
                 const newFiltered = filteredImages.slice(prevFilteredLength);
                 if (newFiltered.length > 0) appendImageCards(newFiltered);
             } else if (currentLayout === 'pinterest') {
@@ -2106,23 +2124,11 @@ const Gallery = (() => {
                 const newFiltered = filteredImages.slice(prevFilteredLength);
                 if (newFiltered.length > 0) appendImageCards(newFiltered);
             } else {
-                // ★ Grid 模式：只更新 spacer-bottom 高度，绝对不动 scrollTop 和已有卡片
-                //   不重置 renderedRange，避免触发全量重建 → scrollTop 被浏览器回弹 → 再次触发加载的死循环
-                const columns = getColumnCount();
-                const rowHeight = (thumbnailSize + 36) + 8;
-                const totalItems = filteredImages.length;
-                const endIndex = renderedRange.end > 0 ? renderedRange.end : 0;
-                const remainingRows = Math.ceil(Math.max(0, totalItems - endIndex) / columns);
-                const spacerBottom = galleryGrid.querySelector('.vs-spacer-bottom');
-                if (spacerBottom) {
-                    spacerBottom.style.height = `${Math.max(0, remainingRows * rowHeight)}px`;
-                } else {
-                    // spacerBottom 不存在（首次或全量渲染未完成），才回退到失效重建
-                    renderedRange = { start: -1, end: -1 };
-                }
-                // ★ 立即预热新加载图片的缩略图，避免用户滚动到这些卡片时看到黑框
+                const newFiltered = filteredImages.slice(prevFilteredLength);
+                if (newFiltered.length > 0) appendImageCards(newFiltered);
                 _prewarmThumbnails(filteredImages, 0, prevFilteredLength);
             }
+
 
         } catch (err) {
             console.warn('[Gallery] 增量加载文件夹图片失败:', err.message);
@@ -2130,6 +2136,9 @@ const Gallery = (() => {
             isLoadingMoreFolder = false;
             // 重置节流时间戳，允许下次合法触发
             _lastScrollCheckTime = 0;
+            if (folderLoadTotal <= 0 || folderLoadOffset < folderLoadTotal) {
+                scheduleLoadMoreFollowup();
+            }
         }
     }
 
@@ -2231,12 +2240,12 @@ const Gallery = (() => {
                     }
 
                     console.log('[filterByFolder] 缓存未命中，调用 loadImagesFromServer:', normalizedFolder);
-                    const firstResult = await loadImagesFromServer(folderPath, 0, FOLDER_LOOKAHEAD);
+                    const firstResult = await loadImagesFromServer(folderPath, 0, FOLDER_FETCH_BATCH);
                     let serverImages = firstResult.images;
                     folderLoadTotal = firstResult.total;
                     console.log('[filterByFolder] loadImagesFromServer 返回:', serverImages.length, '张, total:', folderLoadTotal);
                     console.log('[filterByFolder] 第一张图片数据:', serverImages[0] ? JSON.stringify(serverImages[0]) : '无');
-                    // ★ 使用实际返回数量，而非 FOLDER_LOOKAHEAD，避免跳过数据
+                    // ★ 使用实际返回数量，而非固定批次大小，避免跳过数据
                     folderLoadOffset = serverImages.length;
                     isLoadingMoreFolder = false;
 
@@ -2271,7 +2280,7 @@ const Gallery = (() => {
                                 setTimeout(finish, 20000);
                             });
                             if (signal.aborted) return;
-                            const retryResult = await loadImagesFromServer(folderPath, 0, FOLDER_LOOKAHEAD);
+                            const retryResult = await loadImagesFromServer(folderPath, 0, FOLDER_FETCH_BATCH);
                             serverImages = retryResult.images;
                             folderLoadTotal = retryResult.total;
                             folderLoadOffset = serverImages.length;

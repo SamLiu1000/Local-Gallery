@@ -575,5 +575,7 @@
   "viewer.rotate_btn": "Повернуть",
   "viewer.slideshow": "Слайд-шоу",
   "viewer.slideshow_btn": "Слайд-шоу",
-  "viewer.wheel_zoom": "Прокрутка для увеличения"
+  "viewer.wheel_zoom": "Прокрутка для увеличения",
+  "gallery.loading_more": "Загрузка ещё изображений...",
+  "gallery.all_loaded": "Все изображения загружены"
 }

@@ -575,5 +575,7 @@
   "viewer.rotate_btn": "Rotar",
   "viewer.slideshow": "Presentación",
   "viewer.slideshow_btn": "Presentación",
-  "viewer.wheel_zoom": "Desplazar para ampliar"
+  "viewer.wheel_zoom": "Desplazar para ampliar",
+  "gallery.loading_more": "Cargando más imágenes...",
+  "gallery.all_loaded": "Todas las imágenes cargadas"
 }

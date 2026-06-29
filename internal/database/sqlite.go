@@ -884,23 +884,74 @@ func (idb *ImageDB) LoadImageCacheByRoot(rootPath string) ([]ImageCacheEntry, er
 	return entries, rows.Err()
 }
 
+func imageCacheOrderBy(sortOrder string) string {
+	switch sortOrder {
+	case "name-asc", "name":
+		return "name ASC, path ASC"
+	case "name-desc":
+		return "name DESC, path ASC"
+	case "size-desc", "size":
+		return "size DESC, path ASC"
+	case "size-asc":
+		return "size ASC, path ASC"
+	case "date-asc":
+		return "last_modified ASC, path ASC"
+	case "created":
+		return "created_at DESC, path ASC"
+	case "modified", "date-desc", "":
+		return "last_modified DESC, path ASC"
+	default:
+		return "last_modified DESC, path ASC"
+	}
+}
+
+// LoadImageCacheByFolderTreePaged 按根目录+相对文件夹前缀分页加载文件夹树图片。
+func (idb *ImageDB) LoadImageCacheByFolderTreePaged(rootPath, folder string, offset, limit int, sortOrder string) ([]ImageCacheEntry, int, error) {
+	idb.mu.Lock()
+	defer idb.mu.Unlock()
+	if limit <= 0 {
+		limit = 500
+	}
+	folder = strings.ReplaceAll(strings.Trim(folder, "/"), "\\", "/")
+	where := "root_path=?"
+	args := []interface{}{rootPath}
+	if folder != "" {
+		where += " AND (folder=? OR folder LIKE ?)"
+		args = append(args, folder, folder+"/%")
+	}
+	var total int
+	if err := idb.db.QueryRow("SELECT COUNT(*) FROM image_cache WHERE "+where, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	queryArgs := append([]interface{}{}, args...)
+	queryArgs = append(queryArgs, limit, offset)
+	query := `SELECT id, path, name, size, last_modified, created_at,
+		folder, root_path, width, height, is_video FROM image_cache WHERE ` + where + ` ORDER BY ` + imageCacheOrderBy(sortOrder) + ` LIMIT ? OFFSET ?`
+	rows, err := idb.db.Query(query, queryArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var entries []ImageCacheEntry
+	for rows.Next() {
+		var e ImageCacheEntry
+		var isVideo int
+		if err := rows.Scan(&e.ID, &e.Path, &e.Name, &e.Size, &e.LastModified,
+			&e.CreatedAt, &e.Folder, &e.RootPath, &e.Width, &e.Height, &isVideo); err != nil {
+			return entries, total, err
+		}
+		e.IsVideo = isVideo != 0
+		entries = append(entries, e)
+	}
+	return entries, total, rows.Err()
+}
+
 // LoadImageCachePaged 按 offset/limit 分页加载全部图片（folder="" 时用）。
 func (idb *ImageDB) LoadImageCachePaged(offset, limit int, sortOrder string) ([]ImageCacheEntry, error) {
 	idb.mu.Lock()
 	defer idb.mu.Unlock()
-	order := "last_modified DESC"
-	switch sortOrder {
-	case "name":
-		order = "name ASC"
-	case "size":
-		order = "size DESC"
-	case "created":
-		order = "created_at DESC"
-	case "modified":
-		order = "last_modified DESC"
-	}
 	query := `SELECT id, path, name, size, last_modified, created_at,
-		folder, root_path, width, height, is_video FROM image_cache ORDER BY ` + order + ` LIMIT ? OFFSET ?`
+		folder, root_path, width, height, is_video FROM image_cache ORDER BY ` + imageCacheOrderBy(sortOrder) + ` LIMIT ? OFFSET ?`
 	rows, err := idb.db.Query(query, limit, offset)
 	if err != nil {
 		return nil, err

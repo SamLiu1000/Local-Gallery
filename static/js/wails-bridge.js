@@ -168,6 +168,13 @@ const WailsBridge = (() => {
         return getApp().GetFolderCount(folderPath);
     }
 
+    async function getFolderProgress(folderPath) {
+        if (!isWailsEnv) {
+            return { count: -1, thumbCount: 0 };
+        }
+        return getApp().GetFolderProgress(folderPath);
+    }
+
     async function getImageFile(imageID) {
         if (!isWailsEnv) {
             const response = await fetch('/image/' + imageID);
@@ -751,6 +758,7 @@ const WailsBridge = (() => {
         getImagesByPaths,
         getFolders,
         getFolderCount,
+        getFolderProgress,
         getImageFile,
         getThumbnail,
         openFileLocation,

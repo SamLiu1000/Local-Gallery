@@ -38,9 +38,9 @@ type App struct {
 	folderCount map[string]int
 
 	// LRU 按文件夹加载缓存
-	folderLoaded map[string]bool              // folderKey 是否已加载进 a.images
-	folderLRU    *list.List                   // LRU 队列，elem.Value = folderKey
-	lruNodes     map[string]*list.Element     // folderKey → LRU 节点
+	folderLoaded map[string]bool          // folderKey 是否已加载进 a.images
+	folderLRU    *list.List               // LRU 队列，elem.Value = folderKey
+	lruNodes     map[string]*list.Element // folderKey → LRU 节点
 
 	registeredRoots map[string]bool
 	folderTypes     map[string]string // rootPath -> "ai" | "photo" | "mixed"
@@ -67,8 +67,9 @@ type App struct {
 	imageDB    *database.ImageDB
 	userDataDB *database.UserDataDB
 	thumbDB    *bbolt.DB // 缩略图 BoltDB 单文件存储
+	thumbDBMu  sync.Mutex
 
-	indexingRoots  map[string]context.CancelFunc
+	indexingRoots   map[string]context.CancelFunc
 	indexingRootsMu sync.Mutex
 
 	proxyCancels  map[string]context.CancelFunc
@@ -109,7 +110,9 @@ func NewApp(userDataDir, defaultUserDataDir string) *App {
 	app.applySavedUserDataDir()
 
 	// 初始化 BoltDB 缩略图存储
-	app.openThumbDB()
+	if err := app.openThumbDB(); err != nil {
+		fmt.Printf("[缩略图] %v\n", err)
+	}
 
 	// 初始化 SQLite 图片元数据库
 	dbPath := filepath.Join(app.userDataDir, "images.db")
@@ -130,8 +133,8 @@ func NewApp(userDataDir, defaultUserDataDir string) *App {
 	app.loadUserData()
 	app.loadThumbSettings()     // 恢复缩略图并发数与缩放算法设置
 	app.migratePromptVersions() // migrate old promptVersions to SQLite
-	app.migrateUserData() // migrate registeredRoots/imageTags/favorites to SQLite
-	app.loadFolderIndexLight() // ★ 轻量索引启动：仅加载文件夹列表+count，图片按需加载
+	app.migrateUserData()       // migrate registeredRoots/imageTags/favorites to SQLite
+	app.loadFolderIndexLight()  // ★ 轻量索引启动：仅加载文件夹列表+count，图片按需加载
 
 	app.startHTTPServer()
 
@@ -503,9 +506,14 @@ func (a *App) ScanFolderQuick(path, folderType string, quick bool) *ScanResult {
 			a.saveRegisteredRoots()
 
 			if a.ctx != nil {
+				thumbCount := 0
+				if thumbCounts := a.getCachedThumbCounts(); thumbCounts != nil {
+					thumbCount = thumbCounts[normalizedRoot]
+				}
 				wailsruntime.EventsEmit(a.ctx, "scan:complete", map[string]interface{}{
-					"rootPath": resolvedPath,
-					"count":    imageCount,
+					"rootPath":   resolvedPath,
+					"count":      imageCount,
+					"thumbCount": thumbCount,
 				})
 			}
 			go a.saveImageIndexForRoot(resolvedPath)
@@ -525,7 +533,7 @@ func (a *App) ScanFolderQuick(path, folderType string, quick bool) *ScanResult {
 	// 通知前端文件夹已添加，开始扫描
 	if a.ctx != nil {
 		wailsruntime.EventsEmit(a.ctx, "folder:added", map[string]interface{}{
-			"rootPath": resolvedPath,
+			"rootPath":   resolvedPath,
 			"folderType": folderType,
 		})
 	}
@@ -561,7 +569,7 @@ func (a *App) countFilesQuick(rootPath string) int {
 	// Walk 完成后一次性写入全局 map
 	a.mu.Lock()
 	for fp, ids := range localFolderIndex {
-		a.folderIndex[fp] = append(a.folderIndex[fp], ids...)
+		a.folderIndex[fp] = ids
 	}
 	for id, entry := range localImages {
 		if _, exists := a.images[id]; !exists {
@@ -570,9 +578,7 @@ func (a *App) countFilesQuick(rootPath string) int {
 	}
 	a.folderCount[normalizedRoot] = count
 	for folderPath, cnt := range folderCounts {
-		if _, exists := a.folderCount[folderPath]; !exists {
-			a.folderCount[folderPath] = cnt
-		}
+		a.folderCount[folderPath] = cnt
 	}
 	a.mu.Unlock()
 
@@ -853,11 +859,11 @@ func (a *App) DebugAppState() map[string]interface{} {
 		fmt.Println("")
 
 		rootsData = append(rootsData, map[string]interface{}{
-			"path":           rp,
-			"folderCount":    fc,
-			"imagesCount":    imgCount,
+			"path":             rp,
+			"folderCount":      fc,
+			"imagesCount":      imgCount,
 			"folderIndexCount": idxCount,
-			"diskCount":      diskCount,
+			"diskCount":        diskCount,
 		})
 	}
 	fmt.Println("========================================")
@@ -902,9 +908,9 @@ func (a *App) DebugAppState() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"totalImages":    len(a.images),
-		"totalRoots":     len(a.registeredRoots),
-		"roots":          rootsData,
+		"totalImages": len(a.images),
+		"totalRoots":  len(a.registeredRoots),
+		"roots":       rootsData,
 	}
 }
 
@@ -959,13 +965,13 @@ func (a *App) DebugPagination(folderPath string) map[string]interface{} {
 	fmt.Println("")
 
 	return map[string]interface{}{
-		"folderPath":      folderPath,
+		"folderPath":       folderPath,
 		"normalizedFolder": normalizedFolder,
-		"matchedKeys":     matchedKeys,
-		"totalIDs":        totalIDs,
-		"uniqueIDs":       uniqueIDs,
-		"folderCount":     fc,
-		"sampleKeys":      sampleKeys,
+		"matchedKeys":      matchedKeys,
+		"totalIDs":         totalIDs,
+		"uniqueIDs":        uniqueIDs,
+		"folderCount":      fc,
+		"sampleKeys":       sampleKeys,
 	}
 }
 
@@ -1057,6 +1063,66 @@ func (a *App) GetImages(folder string, offset int, limit int, sortOrder string) 
 	if folder != "" {
 		normalizedFolder := strings.ReplaceAll(folder, "\\", "/")
 
+		rootPath := ""
+		folderRel := ""
+		a.mu.RLock()
+		for root := range a.registeredRoots {
+			rootNorm := strings.ReplaceAll(root, "\\", "/")
+			if normalizedFolder == rootNorm || strings.HasPrefix(normalizedFolder, rootNorm+"/") {
+				rootPath = root
+				folderRel = strings.TrimPrefix(normalizedFolder, rootNorm)
+				folderRel = strings.TrimPrefix(folderRel, "/")
+				break
+			}
+		}
+		a.mu.RUnlock()
+
+		if rootPath != "" && a.imageDB != nil {
+			entries, dbTotal, err := a.imageDB.LoadImageCacheByFolderTreePaged(rootPath, folderRel, offset, limit, sortOrder)
+			if err == nil {
+				safe := make([]SafeImage, len(entries))
+				loadedEntries := make(map[string]*ImageEntry, len(entries))
+				for i, e := range entries {
+					w, h := e.Width, e.Height
+					if !e.IsVideo && (w == 0 || h == 0) {
+						w2, h2 := getImageDimensions(e.Path)
+						if w2 > 0 && h2 > 0 {
+							w, h = w2, h2
+						} else {
+							w, h = 400, 300
+						}
+					}
+					entry := toImageEntry(e)
+					entry.Width = w
+					entry.Height = h
+					loadedEntries[e.ID] = entry
+					safe[i] = SafeImage{
+						ID:           e.ID,
+						Name:         e.Name,
+						Path:         e.Path,
+						Size:         e.Size,
+						LastModified: e.LastModified,
+						CreatedAt:    e.CreatedAt,
+						Folder:       e.Folder,
+						RootPath:     e.RootPath,
+						URL:          "",
+						ThumbURL:     fmt.Sprintf("/thumb/%s", e.ID),
+						Width:        w,
+						Height:       h,
+						IsVideo:      e.IsVideo,
+					}
+				}
+				a.mu.Lock()
+				for id, entry := range loadedEntries {
+					a.images[id] = entry
+				}
+				a.mu.Unlock()
+				fmt.Printf("[GetImages] SQL folder=%q offset=%d limit=%d returned=%d total=%d\n", normalizedFolder, offset, limit, len(safe), dbTotal)
+				return &ImageListResult{Items: safe, Total: dbTotal, Offset: offset, Limit: limit}
+			}
+			fmt.Printf("[GetImages] SQL folder pagination failed, fallback to memory index: %v\n", err)
+
+		}
 		// 收集匹配的 folderKey（未加载的需 ensure）
 		a.mu.RLock()
 		var matchingKeys []string
@@ -1377,6 +1443,19 @@ func (a *App) GetFolderCount(folderPath string) int {
 	return -1
 }
 
+func (a *App) GetFolderProgress(folderPath string) map[string]int {
+	normalized := strings.ReplaceAll(folderPath, "\\", "/")
+	count := a.GetFolderCount(folderPath)
+	thumbCount := 0
+	thumbCounts := a.getCachedThumbCounts()
+	if thumbCounts == nil {
+		go a.PreloadThumbCounts()
+	} else {
+		thumbCount = thumbCounts[normalized]
+	}
+	return map[string]int{"count": count, "thumbCount": thumbCount}
+}
+
 func (a *App) GetImageFile(imageID string) *FileData {
 	a.mu.RLock()
 	entry, ok := a.images[imageID]
@@ -1574,10 +1653,19 @@ func (a *App) GetImportedRoots() []database.ImportedRoot {
 // SaveRootsWithMeta 保存导入根目录（含元数据）
 func (a *App) SaveRootsWithMeta(roots []database.ImportedRoot) map[string]interface{} {
 	a.mu.Lock()
+	previousRoots := make(map[string]bool, len(a.registeredRoots))
+	for root := range a.registeredRoots {
+		previousRoots[strings.ToLower(strings.ReplaceAll(root, "\\", "/"))] = true
+	}
+	hasNewRoot := false
 	a.registeredRoots = make(map[string]bool, len(roots))
 	a.folderTypes = make(map[string]string, len(roots))
 	for _, r := range roots {
 		a.registeredRoots[r.Path] = true
+		rootKey := strings.ToLower(strings.ReplaceAll(r.Path, "\\", "/"))
+		if !previousRoots[rootKey] {
+			hasNewRoot = true
+		}
 		if r.FolderType != "" {
 			a.folderTypes[r.Path] = r.FolderType
 		}
@@ -1589,7 +1677,9 @@ func (a *App) SaveRootsWithMeta(roots []database.ImportedRoot) map[string]interf
 			return map[string]interface{}{"success": false, "error": err.Error()}
 		}
 	}
-	go a.scanAllFolders()
+	if hasNewRoot {
+		go a.scanAllFolders()
+	}
 	return map[string]interface{}{"success": true}
 }
 
@@ -1968,22 +2058,41 @@ func (a *App) shutdown(ctx context.Context) {
 
 // ==================== BoltDB 缩略图存储 ====================
 
-func (a *App) openThumbDB() {
+func (a *App) openThumbDB() error {
+	a.thumbDBMu.Lock()
+	defer a.thumbDBMu.Unlock()
+	return a.openThumbDBLocked()
+}
+
+func (a *App) openThumbDBLocked() error {
+	if a.thumbDB != nil {
+		return nil
+	}
+
 	dbPath := a.GetThumbDir()
+	if dbPath == "" {
+		return fmt.Errorf("缩略图数据库路径为空")
+	}
 	dir := filepath.Dir(dbPath)
-	os.MkdirAll(dir, 0755)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("无法创建缩略图目录: %w", err)
+	}
+
 	// 崩溃后文件锁可能短暂残留，给 5s 超时
 	db, err := bbolt.Open(dbPath, 0644, &bbolt.Options{Timeout: 5 * time.Second})
 	if err != nil {
-		fmt.Printf("[缩略图] 无法打开 BoltDB: %v\n", err)
-		return
+		return fmt.Errorf("无法打开 BoltDB: %w", err)
 	}
-	db.Update(func(tx *bbolt.Tx) error {
+	if err := db.Update(func(tx *bbolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists([]byte("thumbs"))
 		return err
-	})
+	}); err != nil {
+		db.Close()
+		return fmt.Errorf("无法初始化 BoltDB bucket: %w", err)
+	}
 	a.thumbDB = db
 	fmt.Printf("[缩略图] BoltDB 已打开: %s\n", dbPath)
+	return nil
 }
 
 // ==================== 内部工具 ====================

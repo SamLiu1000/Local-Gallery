@@ -575,5 +575,7 @@
   "viewer.rotate_btn": "回転",
   "viewer.slideshow": "スライドショー",
   "viewer.slideshow_btn": "スライドショー",
-  "viewer.wheel_zoom": "スクロールでズーム"
+  "viewer.wheel_zoom": "スクロールでズーム",
+  "gallery.loading_more": "さらに画像を読み込んでいます...",
+  "gallery.all_loaded": "すべての画像を読み込みました"
 }

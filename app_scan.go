@@ -155,9 +155,14 @@ func (a *App) scanAllFolders() int {
 	fmt.Printf("[扫描] 全部完成: 共 %d 张图片，%d 个根目录\n", totalCount, len(roots))
 	// 通知前端扫描完成
 	if a.ctx != nil {
+		thumbCount := 0
+		if thumbCounts := a.getCachedThumbCounts(); thumbCounts != nil {
+			thumbCount = thumbCounts[""]
+		}
 		wailsruntime.EventsEmit(a.ctx, "scan:complete", map[string]interface{}{
-			"rootPath": "",
-			"count":    totalCount,
+			"rootPath":   "",
+			"count":      totalCount,
+			"thumbCount": thumbCount,
 		})
 	}
 	return totalCount
@@ -484,10 +489,11 @@ func (a *App) rebuildFolderCounts() {
 	a.folderCount = counts
 }
 
-
 // incrementFolderCounts incrementally updates folderCount for new entries only.
 func (a *App) incrementFolderCounts(entries map[string]*ImageEntry) {
-	if a.folderCount == nil { a.folderCount = make(map[string]int) }
+	if a.folderCount == nil {
+		a.folderCount = make(map[string]int)
+	}
 	for _, entry := range entries {
 		rp := strings.ReplaceAll(entry.RootPath, "\\", "/")
 		fd := strings.ReplaceAll(entry.Folder, "\\", "/")
@@ -647,9 +653,14 @@ func (a *App) buildFolderTreeRecursive(currentPath, rootPath string) []*FolderNo
 }
 
 func (a *App) scanRootAsync(rootPath string) {
-	if a.bgPaused.Load() == 1 { return }
+	if a.bgPaused.Load() == 1 {
+		return
+	}
 	a.scanMu.Lock()
-	if a.scanningRoots[rootPath] { a.scanMu.Unlock(); return }
+	if a.scanningRoots[rootPath] {
+		a.scanMu.Unlock()
+		return
+	}
 	a.scanningRoots[rootPath] = true
 	a.scanMu.Unlock()
 	defer func() { a.scanMu.Lock(); delete(a.scanningRoots, rootPath); a.scanMu.Unlock() }()
@@ -670,27 +681,47 @@ func (a *App) scanRootAsync(rootPath string) {
 
 	a.scanWalkBatched(rootPath, func(batchImages map[string]*ImageEntry, batchFolderIndex map[string][]string, folderRel string, batchCount int) {
 		a.mu.Lock()
-		if !a.registeredRoots[rootPath] { a.mu.Unlock(); return }
-		for k, v := range batchImages { a.images[k] = v; localImages[k] = v }
-		for k, v := range batchFolderIndex { a.folderIndex[k] = append(a.folderIndex[k], v...); localFolderIndex[k] = append(localFolderIndex[k], v...) }
+		if !a.registeredRoots[rootPath] {
+			a.mu.Unlock()
+			return
+		}
+		for k, v := range batchImages {
+			a.images[k] = v
+			localImages[k] = v
+		}
+		for k, v := range batchFolderIndex {
+			a.folderIndex[k] = append(a.folderIndex[k], v...)
+			localFolderIndex[k] = append(localFolderIndex[k], v...)
+		}
 		a.incrementFolderCounts(batchImages)
 		a.mu.Unlock()
 
 		totalCount += batchCount
 		if a.ctx != nil && batchCount > 0 {
+			thumbCount := 0
+			if thumbCounts := a.getCachedThumbCounts(); thumbCounts != nil {
+				thumbCount = thumbCounts[strings.ReplaceAll(rootPath, "\\", "/")]
+			}
 			wailsruntime.EventsEmit(a.ctx, "scan:batch", map[string]interface{}{
 				"rootPath":   rootPath,
 				"folder":     folderRel,
 				"count":      batchCount,
 				"totalSoFar": totalCount,
+				"thumbCount": thumbCount,
 			})
 		}
 	})
 
 	a.mu.Lock()
-	if !a.registeredRoots[rootPath] { a.mu.Unlock(); fmt.Printf("[后台扫描] 根目录已被移除，丢弃扫描结果: %s\n", rootPath); return }
+	if !a.registeredRoots[rootPath] {
+		a.mu.Unlock()
+		fmt.Printf("[后台扫描] 根目录已被移除，丢弃扫描结果: %s\n", rootPath)
+		return
+	}
 	a.removeByRootFromMemory(rootPath)
-	for k, v := range localImages { a.images[k] = v }
+	for k, v := range localImages {
+		a.images[k] = v
+	}
 	for k, v := range localFolderIndex {
 		a.folderIndex[k] = append(a.folderIndex[k], v...)
 		if !a.folderLoaded[k] {
@@ -716,12 +747,22 @@ func (a *App) scanRootAsync(rootPath string) {
 	fmt.Printf("[后台扫描] 验证: rootPath=%s, folderCount=%d, folderIndexKeys=%d\n", rootPath, folderCount, len(localFolderIndex))
 
 	ft := a.folderTypes[rootPath]
-	if ft == "" { ft = "ai" }
-	if ft != "photo" { go a.batchIndexImages(localImages, ft) }
+	if ft == "" {
+		ft = "ai"
+	}
+	if ft != "photo" {
+		go a.batchIndexImages(localImages, ft)
+	}
 	fmt.Printf("[后台扫描] 完成: %s，共 %d ���图片\n", rootPath, totalCount)
 	if a.ctx != nil {
+		thumbCount := 0
+		if thumbCounts := a.getCachedThumbCounts(); thumbCounts != nil {
+			thumbCount = thumbCounts[strings.ReplaceAll(rootPath, "\\", "/")]
+		}
 		wailsruntime.EventsEmit(a.ctx, "scan:complete", map[string]interface{}{
-			"rootPath": rootPath, "count": totalCount,
+			"rootPath":   rootPath,
+			"count":      totalCount,
+			"thumbCount": thumbCount,
 		})
 	}
 }
@@ -897,11 +938,17 @@ func (a *App) startupIncrementalRefresh() {
 
 		// 每个根目录刷新完成后通知前端
 		if a.ctx != nil {
+			rootNorm := strings.ReplaceAll(root, "\\", "/")
+			thumbCount := 0
+			if thumbCounts := a.getCachedThumbCounts(); thumbCounts != nil {
+				thumbCount = thumbCounts[rootNorm]
+			}
 			wailsruntime.EventsEmit(a.ctx, "scan:complete", map[string]interface{}{
-				"rootPath": root,
-				"count":    len(result.Added) + result.Unchanged,
-				"added":    len(result.Added),
-				"removed":  len(result.Removed),
+				"rootPath":   root,
+				"count":      len(result.Added) + result.Unchanged,
+				"added":      len(result.Added),
+				"removed":    len(result.Removed),
+				"thumbCount": thumbCount,
 			})
 		}
 	}
@@ -931,10 +978,11 @@ func (a *App) RefreshAll() map[string]interface{} {
 // folderPath 是文件系统路径（如 D:\AIImages\sub）。
 //
 // 锁策略：
-//   Phase 1 — IO（Walk + getImageDimensions），无锁
-//   Phase 2 — SQLite 写入（a.imageDB）
-//   Phase 3 — 内存更新（a.mu.Lock）
-//   Phase 4 — JSON 持久化（a.saveImageIndex）
+//
+//	Phase 1 — IO（Walk + getImageDimensions），无锁
+//	Phase 2 — SQLite 写入（a.imageDB）
+//	Phase 3 — 内存更新（a.mu.Lock）
+//	Phase 4 — JSON 持久化（a.saveImageIndex）
 //
 // stableID 基于 filePath+fileSize+fileModified 的 MD5。
 // 已知限制：文件被移动/重命名会判定为删除+新增，丢失已有 metadata。

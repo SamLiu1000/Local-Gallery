@@ -575,5 +575,7 @@
   "viewer.rotate_btn": "Pivoter",
   "viewer.slideshow": "Diaporama",
   "viewer.slideshow_btn": "Diaporama",
-  "viewer.wheel_zoom": "Molette pour zoomer"
+  "viewer.wheel_zoom": "Molette pour zoomer",
+  "gallery.loading_more": "Chargement d'autres images...",
+  "gallery.all_loaded": "Toutes les images sont chargées"
 }

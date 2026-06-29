@@ -575,5 +575,7 @@
   "viewer.rotate_btn": "تدوير",
   "viewer.slideshow": "عرض شرائح",
   "viewer.slideshow_btn": "عرض شرائح",
-  "viewer.wheel_zoom": "التمرير للتكبير"
+  "viewer.wheel_zoom": "التمرير للتكبير",
+  "gallery.loading_more": "جارٍ تحميل المزيد من الصور...",
+  "gallery.all_loaded": "تم تحميل جميع الصور"
 }

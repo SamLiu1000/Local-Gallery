@@ -116,6 +116,8 @@
   "gallery.folder_empty_hint": "Large folders or slow drives may take longer",
   "gallery.load_failed": "Load failed",
   "gallery.loading": "Loading...",
+  "gallery.loading_more": "Loading more images...",
+  "gallery.all_loaded": "All images loaded",
   "gallery.no_images": "No images found. Click \"Select Folder\" to add image directories",
   "gallery.placeholder": "Select a folder on the left to browse images",
   "inertia.accel": "Acceleration (ACCELERATION)",

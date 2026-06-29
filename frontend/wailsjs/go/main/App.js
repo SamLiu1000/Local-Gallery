@@ -86,6 +86,10 @@ export function GetFolderIndexStatus() {
   return window['go']['main']['App']['GetFolderIndexStatus']();
 }
 
+export function GetFolderProgress(arg1) {
+  return window['go']['main']['App']['GetFolderProgress'](arg1);
+}
+
 export function GetFolders() {
   return window['go']['main']['App']['GetFolders']();
 }

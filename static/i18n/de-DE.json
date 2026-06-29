@@ -575,5 +575,7 @@
   "viewer.rotate_btn": "Drehen",
   "viewer.slideshow": "Diashow",
   "viewer.slideshow_btn": "Diashow",
-  "viewer.wheel_zoom": "Scrollen zum Zoomen"
+  "viewer.wheel_zoom": "Scrollen zum Zoomen",
+  "gallery.loading_more": "Weitere Bilder werden geladen...",
+  "gallery.all_loaded": "Alle Bilder geladen"
 }

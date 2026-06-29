@@ -215,10 +215,17 @@ func (a *App) getThumbDir() string {
 	return a.getThumbDBPath()
 }
 
+// ensureThumbDB 打开缩略图数据库；用于热切换失败或启动锁短暂残留后的懒恢复
+func (a *App) ensureThumbDB() error {
+	a.thumbDBMu.Lock()
+	defer a.thumbDBMu.Unlock()
+	return a.openThumbDBLocked()
+}
+
 // generateThumbnail 用 libvips thumbnail API 生成 JPEG 缩略图（shrink-on-load），写入 BoltDB
 func (a *App) generateThumbnail(srcPath string, imageID string) error {
-	if a.thumbDB == nil {
-		return fmt.Errorf("BoltDB 未初始化")
+	if err := a.ensureThumbDB(); err != nil {
+		return err
 	}
 
 	// 跳过空路径
@@ -301,9 +308,15 @@ func isImageByMagic(filePath string) bool {
 	}
 
 	// 已知图片魔数 → 放行
-	if header[0] == 0xFF && header[1] == 0xD8 && header[2] == 0xFF { return true } // JPEG
-	if header[0] == 0x89 && header[1] == 0x50 && header[2] == 0x4E && header[3] == 0x47 { return true } // PNG
-	if header[0] == 0x47 && header[1] == 0x49 && header[2] == 0x46 && header[3] == 0x38 { return true } // GIF
+	if header[0] == 0xFF && header[1] == 0xD8 && header[2] == 0xFF {
+		return true
+	} // JPEG
+	if header[0] == 0x89 && header[1] == 0x50 && header[2] == 0x4E && header[3] == 0x47 {
+		return true
+	} // PNG
+	if header[0] == 0x47 && header[1] == 0x49 && header[2] == 0x46 && header[3] == 0x38 {
+		return true
+	} // GIF
 	if header[0] == 0x42 && header[1] == 0x4D && n >= 6 { // BMP
 		// BMP 文件头 14B: 2B魔数(BM) + 4B文件大小 + 4B保留(必须为0) + 4B偏移
 		// 保留字段必须为 0，防止非 BMP 文件误入导致 libvips C 层崩溃
@@ -311,29 +324,55 @@ func isImageByMagic(filePath string) bool {
 		return reserved == 0
 	}
 	if header[0] == 0x52 && header[1] == 0x49 && header[2] == 0x46 && header[3] == 0x46 &&
-		n >= 12 && header[8] == 0x57 && header[9] == 0x45 && header[10] == 0x42 && header[11] == 0x50 { return true } // WebP
-	if header[0] == 0x49 && header[1] == 0x49 && header[2] == 0x2A && header[3] == 0x00 { return true } // TIFF LE
-	if header[0] == 0x4D && header[1] == 0x4D && header[2] == 0x00 && header[3] == 0x2A { return true } // TIFF BE
-	if header[0] == 0x00 && header[1] == 0x00 && header[2] == 0x01 && header[3] == 0x00 { return true } // ICO
-	if header[0] == '<' { return true } // SVG/XML
-	if n >= 8 && header[4] == 0x66 && header[5] == 0x74 && header[6] == 0x79 && header[7] == 0x70 { return true } // HEIC/AVIF
+		n >= 12 && header[8] == 0x57 && header[9] == 0x45 && header[10] == 0x42 && header[11] == 0x50 {
+		return true
+	} // WebP
+	if header[0] == 0x49 && header[1] == 0x49 && header[2] == 0x2A && header[3] == 0x00 {
+		return true
+	} // TIFF LE
+	if header[0] == 0x4D && header[1] == 0x4D && header[2] == 0x00 && header[3] == 0x2A {
+		return true
+	} // TIFF BE
+	if header[0] == 0x00 && header[1] == 0x00 && header[2] == 0x01 && header[3] == 0x00 {
+		return true
+	} // ICO
+	if header[0] == '<' {
+		return true
+	} // SVG/XML
+	if n >= 8 && header[4] == 0x66 && header[5] == 0x74 && header[6] == 0x79 && header[7] == 0x70 {
+		return true
+	} // HEIC/AVIF
 
 	// 已知非图片魔数 → 拦截（伪装扩展名的损坏文件）
 	// TGA: 文件尾有 TRUEVISION 或开头并非 JPEG
 	// RIFF 非 WebP: AVI/WAV 等
-	if header[0] == 0x52 && header[1] == 0x49 && header[2] == 0x46 && header[3] == 0x46 { return false } // RIFF 但非 WebP
+	if header[0] == 0x52 && header[1] == 0x49 && header[2] == 0x46 && header[3] == 0x46 {
+		return false
+	} // RIFF 但非 WebP
 	// EXE/DLL: MZ
-	if header[0] == 0x4D && header[1] == 0x5A { return false }
+	if header[0] == 0x4D && header[1] == 0x5A {
+		return false
+	}
 	// ZIP/DOCX/XLSX: PK
-	if header[0] == 0x50 && header[1] == 0x4B { return false }
+	if header[0] == 0x50 && header[1] == 0x4B {
+		return false
+	}
 	// PDF
-	if header[0] == 0x25 && header[1] == 0x50 && header[2] == 0x44 && header[3] == 0x46 { return false }
+	if header[0] == 0x25 && header[1] == 0x50 && header[2] == 0x44 && header[3] == 0x46 {
+		return false
+	}
 	// RAR
-	if header[0] == 0x52 && header[1] == 0x61 && header[2] == 0x72 && header[3] == 0x21 { return false }
+	if header[0] == 0x52 && header[1] == 0x61 && header[2] == 0x72 && header[3] == 0x21 {
+		return false
+	}
 	// 7z
-	if header[0] == 0x37 && header[1] == 0x7A && header[2] == 0xBC && header[3] == 0xAF { return false }
+	if header[0] == 0x37 && header[1] == 0x7A && header[2] == 0xBC && header[3] == 0xAF {
+		return false
+	}
 	// GZIP
-	if header[0] == 0x1F && header[1] == 0x8B { return false }
+	if header[0] == 0x1F && header[1] == 0x8B {
+		return false
+	}
 
 	// 无法确认 → 信任扩展名放行（相机 RAW/CR2/NEF/ORF 等无法通过魔数确认）
 	return true
@@ -345,6 +384,10 @@ func (a *App) serveThumbnail(imageID string) ([]byte, error) {
 	if imagePath == "" {
 		a.markThumbFailed(imageID)
 		return nil, fmt.Errorf("图片未找到: %s", imageID)
+	}
+
+	if err := a.ensureThumbDB(); err != nil {
+		return nil, err
 	}
 
 	// 先从 BoltDB 读取
@@ -747,38 +790,44 @@ func (a *App) computeThumbCounts() map[string]int {
 		return copyCounts(cachedThumbCounts)
 	}
 
-	result := make(map[string]int)
-	if a.thumbDB != nil && a.imageDB != nil {
-		// 1. 从 bbolt 读取所有已缓存缩略图的 ID
-		thumbSet := make(map[string]bool)
-		a.thumbDB.View(func(tx *bbolt.Tx) error {
-			b := tx.Bucket(thumbBucket)
-			if b == nil {
-				return nil
-			}
-			c := b.Cursor()
-			for k, _ := c.First(); k != nil; k, _ = c.Next() {
-				thumbSet[string(k)] = true
-			}
-			return nil
-		})
+	if err := a.ensureThumbDB(); err != nil {
+		fmt.Printf("[缩略图] thumbCounts 缓存预热跳过: %v\n", err)
+		return nil
+	}
+	if a.imageDB == nil {
+		return nil
+	}
 
-		// 2. 从 SQLite 读取轻量元数据（id/root_path/folder/is_video），与 thumbSet 做集合运算
-		// 不再遍历 a.images（LRU 缓存可能未加载全部）
-		metas, err := a.imageDB.LoadImageCacheMetaForThumbCounts()
-		if err == nil {
-			for _, m := range metas {
-				rootPath := strings.ReplaceAll(m.RootPath, "\\", "/")
-				folder := strings.ReplaceAll(m.Folder, "\\", "/")
-				// 视频直接算作已完成，有缩略图的图片也算
-				if m.IsVideo || thumbSet[m.ID] {
-					result[rootPath]++
-					if folder != "" {
-						parts := strings.Split(folder, "/")
-						for i := 1; i <= len(parts); i++ {
-							subPath := rootPath + "/" + strings.Join(parts[:i], "/")
-							result[subPath]++
-						}
+	result := make(map[string]int)
+	// 1. 从 bbolt 读取所有已缓存缩略图的 ID
+	thumbSet := make(map[string]bool)
+	a.thumbDB.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(thumbBucket)
+		if b == nil {
+			return nil
+		}
+		c := b.Cursor()
+		for k, _ := c.First(); k != nil; k, _ = c.Next() {
+			thumbSet[string(k)] = true
+		}
+		return nil
+	})
+
+	// 2. 从 SQLite 读取轻量元数据（id/root_path/folder/is_video），与 thumbSet 做集合运算
+	// 不再遍历 a.images（LRU 缓存可能未加载全部）
+	metas, err := a.imageDB.LoadImageCacheMetaForThumbCounts()
+	if err == nil {
+		for _, m := range metas {
+			rootPath := strings.ReplaceAll(m.RootPath, "\\", "/")
+			folder := strings.ReplaceAll(m.Folder, "\\", "/")
+			// 视频直接算作已完成，有缩略图的图片也算
+			if m.IsVideo || thumbSet[m.ID] {
+				result[rootPath]++
+				if folder != "" {
+					parts := strings.Split(folder, "/")
+					for i := 1; i <= len(parts); i++ {
+						subPath := rootPath + "/" + strings.Join(parts[:i], "/")
+						result[subPath]++
 					}
 				}
 			}
@@ -810,8 +859,13 @@ func (a *App) getCachedThumbCounts() map[string]int {
 
 // PreloadThumbCounts 预热 thumbCounts 缓存（启动时异步调用，避免 GetFolders 首次阻塞）
 func (a *App) PreloadThumbCounts() {
-	a.computeThumbCounts()
+	if a.computeThumbCounts() == nil {
+		return
+	}
 	fmt.Println("[启动] thumbCounts 缓存预热完成")
+	if a.ctx != nil {
+		a.emitThumbProgress()
+	}
 }
 
 // invalidateThumbCounts 标记缓存失效并通知前端（仅在删除缩略图时使用）
@@ -1096,23 +1150,8 @@ func (a *App) RestartWithNewPaths() map[string]interface{} {
 	}
 	a.scanMu.Unlock()
 
-	// 1. 关闭旧数据库
-	if a.thumbDB != nil {
-		a.thumbDB.Close()
-		a.thumbDB = nil
-	}
-	a.mu.Lock()
-	oldDB := a.imageDB
-	a.imageDB = nil
-	oldUserDataDB := a.userDataDB
-	a.userDataDB = nil
-	a.mu.Unlock()
-	if oldDB != nil {
-		oldDB.Close()
-	}
-	if oldUserDataDB != nil {
-		oldUserDataDB.Close()
-	}
+	// 1. thumbDB 延迟到新库打开成功后再原子替换，避免失败时进入半切换状态
+	a.thumbDBMu.Lock()
 
 	// 2. 后台 goroutine：打开新 SQLite + 加载图片缓存（最耗时操作）
 	type loadResult struct {
@@ -1162,7 +1201,7 @@ func (a *App) RestartWithNewPaths() map[string]interface{} {
 	r := <-ch
 	if r.dbErr != nil {
 		fmt.Printf("[热切换] 打开新 SQLite 失败: %v\n", r.dbErr)
-		a.openThumbDB()
+		a.thumbDBMu.Unlock()
 		return map[string]interface{}{"success": false, "error": fmt.Sprintf("无法打开新数据库: %v", r.dbErr)}
 	}
 
@@ -1205,19 +1244,23 @@ func (a *App) RestartWithNewPaths() map[string]interface{} {
 		}
 	}
 
-	os.MkdirAll(filepath.Dir(newThumbDBPath), 0755)
+	if err := os.MkdirAll(filepath.Dir(newThumbDBPath), 0755); err != nil {
+		a.thumbDBMu.Unlock()
+		return map[string]interface{}{"success": false, "error": fmt.Sprintf("无法创建缩略图目录: %v", err)}
+	}
 	time.Sleep(50 * time.Millisecond)
-	var newThumb *bbolt.DB
-	if newThumbDBPath != "" {
-		newThumb, err := bbolt.Open(newThumbDBPath, 0644, &bbolt.Options{Timeout: 3 * time.Second})
-		if err != nil {
-			fmt.Printf("[热切换] 打开新 BoltDB 失败: %v\n", err)
-		} else {
-			newThumb.Update(func(tx *bbolt.Tx) error {
-				_, err := tx.CreateBucketIfNotExists([]byte("thumbs"))
-				return err
-			})
-		}
+	newThumb, err := bbolt.Open(newThumbDBPath, 0644, &bbolt.Options{Timeout: 3 * time.Second})
+	if err != nil {
+		a.thumbDBMu.Unlock()
+		return map[string]interface{}{"success": false, "error": fmt.Sprintf("无法打开缩略图数据库: %v", err)}
+	}
+	if err := newThumb.Update(func(tx *bbolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists(thumbBucket)
+		return err
+	}); err != nil {
+		newThumb.Close()
+		a.thumbDBMu.Unlock()
+		return map[string]interface{}{"success": false, "error": fmt.Sprintf("无法初始化缩略图数据库: %v", err)}
 	}
 
 	fmt.Printf("[热切换] 已加载: images=%d, folders=%d, roots=%d\n",
@@ -1225,6 +1268,9 @@ func (a *App) RestartWithNewPaths() map[string]interface{} {
 
 	// 4. 原子替换
 	a.mu.Lock()
+	oldDB := a.imageDB
+	oldUserDataDB := a.userDataDB
+	oldThumb := a.thumbDB
 	a.userDataDir = newUserDir
 	a.userDataFile = userDataFile
 	a.windowStateFile = filepath.Join(newUserDir, "window-state.json")
@@ -1239,6 +1285,16 @@ func (a *App) RestartWithNewPaths() map[string]interface{} {
 	a.registeredRoots = newRegisteredRoots
 	a.folderTypes = newFolderTypes
 	a.mu.Unlock()
+	if oldDB != nil {
+		oldDB.Close()
+	}
+	if oldUserDataDB != nil {
+		oldUserDataDB.Close()
+	}
+	if oldThumb != nil {
+		oldThumb.Close()
+	}
+	a.thumbDBMu.Unlock()
 
 	// 清理旧数据的缓存，避免前端短暂看到旧数据
 	a.cleanThumbGenLocks()
