@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // ImportedRoot 导入的根目录记录
@@ -192,6 +193,8 @@ func (udb *UserDataDB) MergeRoots(roots []ImportedRoot) error {
 		hn := r.HandleName
 		aa := r.AddedAt
 		if m, ok := meta[r.Path]; ok {
+			// 已存在记录：保留旧的 display_name / handle_name / added_at，
+			// 仅当新值非空时覆盖（避免每次保存都用当前时间重置添加日期）。
 			if dn == "" {
 				dn = m.displayName
 			}
@@ -200,6 +203,11 @@ func (udb *UserDataDB) MergeRoots(roots []ImportedRoot) error {
 			}
 			if aa == "" {
 				aa = m.addedAt
+			}
+		} else {
+			// 新建记录：added_at 为空则用当前时间（标记首次导入时间）
+			if aa == "" {
+				aa = time.Now().Format(time.RFC3339)
 			}
 		}
 		if _, err := stmt.Exec(r.Path, r.Name, dn, r.FolderType, hn, aa); err != nil {

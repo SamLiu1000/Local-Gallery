@@ -60,6 +60,9 @@ const I18n = (() => {
         _lang = newLang;
         scanDOM();
         _listeners.forEach(fn => fn(_lang));
+        // ★ 派发语言变更事件：通知各 UI 模块重新渲染动态翻译文本。
+        //   不依赖 location.reload()（Wails WebView 中 reload 可能不可靠）。
+        window.dispatchEvent(new CustomEvent('i18n:changed', { detail: { lang: newLang } }));
     }
 
     /** 扫描 DOM 中所有 data-i18n 属性并替换文本 */

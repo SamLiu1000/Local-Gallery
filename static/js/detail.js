@@ -25,15 +25,55 @@ const PHOTO_EXIF_KEYSET = PHOTO_EXIF_FIELDS.map(f => f.key);
 
 const ImageContextMenu = (() => {
     const t = (typeof I18n !== "undefined" ? I18n.t : (s) => s);
-    let menu, btnOpen, btnTrack;
+    let menu, btnOpen, btnTrack, btnCopyLink;
+
+    // ★ 复制文本到剪贴板（clipboard API + 兼容回退）
+    async function copyTextToClipboard(text) {
+        try {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                await navigator.clipboard.writeText(text);
+                return;
+            }
+        } catch (e) { /* 尝试回退 */ }
+        try {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            document.body.removeChild(ta);
+        } catch (e) {
+            console.warn('[ImageContextMenu] 复制失败:', e);
+        }
+    }
 
     function init() {
         const _t = (typeof I18n !== "undefined" ? I18n.t : (s) => s);
         menu = document.getElementById('imageContextMenu');
         btnOpen = document.getElementById('ctxOpenInFolder');
         btnTrack = document.getElementById('ctxTrackFolder');
+        btnCopyLink = document.getElementById('ctxCopyImageLink');
         if (!menu || !btnOpen || menu._initialized) return;
         menu._initialized = true;
+
+        if (btnCopyLink) {
+            btnCopyLink.addEventListener('click', async () => {
+                const url = menu._currentImageUrl;
+                hide();
+                if (!url) {
+                    App.showToast(_t('detail.no_image_link'), 'warning');
+                    return;
+                }
+                // ★ 复制相对路径（去掉主机和端口）：程序的图片服务器端口每次启动都会变，
+                //   完整链接保存进标签后重启即失效；相对路径 /image/{id} 是稳定的，
+                //   渲染时 fixRelativeUrls 会自动补上当前端口
+                const refLink = url.replace(/^https?:\/\/[^/]+/, '');
+                await copyTextToClipboard(refLink);
+                App.showToast(_t('detail.link_copied'), 'success');
+            });
+        }
 
         btnOpen.addEventListener('click', async () => {
             if (btnOpen._action === 'refresh') {
@@ -104,13 +144,18 @@ const ImageContextMenu = (() => {
         }
     }
 
-    function show(x, y, filePath, rootPath, folder) {
+    function show(x, y, filePath, rootPath, folder, imageUrl) {
         if (!menu) { init(); menu = document.getElementById('imageContextMenu'); }
         if (!menu) return;
         setImageMode();
         menu._currentFilePath = filePath;
         menu._currentRootPath = rootPath || null;
         menu._currentFolder = folder || null;
+        // ★ 记录图片链接（用于"复制引用图片链接"；本地图无链接时隐藏该项）
+        menu._currentImageUrl = imageUrl || null;
+        if (btnCopyLink) {
+            btnCopyLink.style.display = imageUrl ? '' : 'none';
+        }
         menu.style.display = 'block';
         menu.style.left = x + 'px';
         menu.style.top = y + 'px';
@@ -150,6 +195,7 @@ const ImageContextMenu = (() => {
             menu._currentFilePath = null;
             menu._currentRootPath = null;
             menu._currentFolder = null;
+            menu._currentImageUrl = null;
         }
     }
 
@@ -202,6 +248,7 @@ const DetailPanel = (() => {
 
     // 状态
     let currentImage = null;
+    let currentSearchKeywords = []; // 搜索命中词（搜索模式打开详情时用于高亮）
     let generateAbortController = null;
     let currentPromptVersions = [];
     let currentPromptIndex = 0;
@@ -299,7 +346,7 @@ const DetailPanel = (() => {
         detailImage.addEventListener('contextmenu', (e) => {
             e.preventDefault();
             if (currentImage) {
-                ImageContextMenu.show(e.clientX, e.clientY, currentImage.path, currentImage.rootPath, currentImage.folder);
+                ImageContextMenu.show(e.clientX, e.clientY, currentImage.path, currentImage.rootPath, currentImage.folder, currentImage.url);
             }
         });
 
@@ -333,14 +380,12 @@ const DetailPanel = (() => {
         if (detailApiConfigSelect) {
             detailApiConfigSelect.addEventListener('change', async () => {
                 const id = detailApiConfigSelect.value;
-                if (id) {
-                    if (typeof Storage !== 'undefined' && Storage.setSetting) {
-                        await Storage.setSetting('activeApiConfigId', id);
-                    }
-                } else {
-                    if (typeof Storage !== 'undefined' && Storage.setSetting) {
-                        await Storage.setSetting('activeApiConfigId', null);
-                    }
+                if (typeof Storage !== 'undefined' && Storage.setSetting) {
+                    await Storage.setSetting('activeApiConfigId', id || null);
+                }
+                // ★ 同步左侧 sidebar 的下拉选中，避免两侧显示不一致
+                if (typeof Sidebar !== 'undefined' && Sidebar.syncApiConfigSelection) {
+                    Sidebar.syncApiConfigSelection(id || null);
                 }
             });
         }
@@ -455,14 +500,21 @@ const DetailPanel = (() => {
 
     // ==================== 显示图片详情 ====================
 
-    async function showImage(imgData) {
+    async function showImage(imgData, opts = {}) {
         const _t = (typeof I18n !== "undefined" ? I18n.t : (s) => s);
-        // 锁定模式下不加载详情，由 Gallery 的单击放大替代
-        if (isLocked) return;
+        // 锁定模式下不加载详情，由 Gallery 的单击放大替代。
+        // ★ noExpand=true（移动端查看器静默填充）不受锁定限制——抽屉是用户主动点开的
+        if (isLocked && !opts.noExpand) return;
         if (isPromptEditing) cancelPromptEdit();
         currentImage = imgData;
-        expand();
+        // ★ noExpand=true：只填充面板内容不自动展开（移动端查看器打开时用，
+        //   等用户点"信息"按钮再弹出抽屉）
+        if (!opts.noExpand) expand();
         refreshDetailApiConfigSelect();
+
+        // 搜索模式：记录命中词，供提示词/参数/文件名高亮
+        currentSearchKeywords = (imgData._searchResult && typeof SearchModule !== 'undefined' && SearchModule.getCurrentKeywords)
+            ? SearchModule.getCurrentKeywords() : [];
 
         console.log('[Detail] showImage:', imgData.name,
             'hasMetadata:', !!imgData.metadata,
@@ -515,6 +567,14 @@ const DetailPanel = (() => {
                     'prompt:', meta?.prompt ? meta.prompt.substring(0, 50) + '...' : '(空)',
                     'params:', Object.keys(meta?.params || {}).length,
                     'raw:', Object.keys(meta?.raw || {}).length);
+                // ★ 修复：解析完成后立即刷新参数与原始元数据面板。
+                //   若此处不刷新，toggleRawMetadata 只切显隐不重渲染，
+                //   而此前 renderRawMetadata 可能已在 metadata 就绪前调用过，
+                //   导致"元数据"面板始终为空。
+                if (imgData.metadata) {
+                    renderParams(imgData);
+                    renderRawMetadata(imgData);
+                }
             } catch (err) {
                 console.warn('[Detail] 按需解析元数据失败:', err);
             }
@@ -547,6 +607,7 @@ const DetailPanel = (() => {
 
     function hideImage() {
         currentImage = null;
+        currentSearchKeywords = [];
         detailPlaceholder.style.display = 'block';
         detailInfo.style.display = 'none';
         detailImage.src = '';
@@ -579,8 +640,13 @@ const DetailPanel = (() => {
 
         const ext = imgData.name.split('.').pop().toUpperCase();
 
+        // 搜索模式：文件名命中词高亮
+        const nameHtml = currentSearchKeywords.length > 0
+            ? highlightSearchTerms(escapeHtml(imgData.name), currentSearchKeywords)
+            : escapeHtml(imgData.name);
+
         fileInfo.innerHTML = `
-            <div class="info-item"><span class="info-key">${_t('detail.file_name')}</span><br><span class="info-val">${escapeHtml(imgData.name)}</span></div>
+            <div class="info-item"><span class="info-key">${_t('detail.file_name')}</span><br><span class="info-val">${nameHtml}</span></div>
             <div class="info-item"><span class="info-key">${_t('detail.dimensions')}</span><br><span class="info-val">${imgData.width && imgData.height ? imgData.width + ' x ' + imgData.height : _t('detail.unknown')}</span></div>
             <div class="info-item"><span class="info-key">${_t('detail.format')}</span><br><span class="info-val">${ext}</span></div>
             <div class="info-item"><span class="info-key">${_t('detail.file_size')}</span><br><span class="info-val">${sizeDisplay}</span></div>
@@ -629,8 +695,14 @@ const DetailPanel = (() => {
 
         if (currentPromptIndex >= 0 && currentPromptIndex < currentPromptVersions.length) {
             const version = currentPromptVersions[currentPromptIndex];
-            positivePrompt.textContent = version.positivePrompt || _t('detail.none');
-            negativePrompt.textContent = version.negativePrompt || _t('detail.none');
+            if (currentSearchKeywords.length > 0) {
+                // 搜索模式：高亮命中词
+                positivePrompt.innerHTML = highlightSearchTerms(escapeHtml(version.positivePrompt || _t('detail.none')), currentSearchKeywords);
+                negativePrompt.innerHTML = highlightSearchTerms(escapeHtml(version.negativePrompt || _t('detail.none')), currentSearchKeywords);
+            } else {
+                positivePrompt.textContent = version.positivePrompt || _t('detail.none');
+                negativePrompt.textContent = version.negativePrompt || _t('detail.none');
+            }
             promptVersionLabel.textContent = `${currentPromptIndex + 1}/${currentPromptVersions.length}`;
 
             const sourceLabel = version.source === 'original' ? _t('detail.prompt_original') :
@@ -1209,7 +1281,11 @@ const DetailPanel = (() => {
             if (displayValue.includes('\n')) {
                 valSpan.style.whiteSpace = 'pre-line';
             }
-            valSpan.textContent = displayValue;
+            if (currentSearchKeywords.length > 0) {
+                valSpan.innerHTML = highlightSearchTerms(escapeHtml(displayValue), currentSearchKeywords);
+            } else {
+                valSpan.textContent = displayValue;
+            }
 
             item.appendChild(keySpan);
             item.appendChild(valSpan);
@@ -1239,6 +1315,12 @@ const DetailPanel = (() => {
         isRawMetadataVisible = !isRawMetadataVisible;
         rawMetadataPanel.classList.toggle('hidden', !isRawMetadataVisible);
         btnToggleRawMetadata.textContent = isRawMetadataVisible ? _t('detail.close_metadata') : _t('detail.metadata');
+        // ★ 修复：打开面板时若当前图片已有元数据，强制重新渲染列表。
+        //   否则若元数据是异步解析完成的（晚于图片切换时的首次渲染），
+        //   面板会一直停留在空状态。
+        if (isRawMetadataVisible && currentImage && currentImage.metadata) {
+            renderRawMetadata(currentImage);
+        }
     }
 
     function closeRawMetadata() {
@@ -1307,7 +1389,7 @@ const DetailPanel = (() => {
             body.className = 'raw-meta-value';
             body.textContent = formatRawValue(value);
             // 相机 EXIF 字段默认展开，其他默认折叠
-            const isExifField = cameraExifKeys.includes(key);
+            const isExifField = PHOTO_EXIF_KEYSET.includes(key);
             body.style.display = isExifField ? 'block' : 'none';
             toggleArrow.textContent = isExifField ? '▼' : '▶';
 
@@ -1426,16 +1508,19 @@ const DetailPanel = (() => {
                 // 外层容器：固定宽高，overflow:hidden
                 const htmlBox = document.createElement('span');
                 htmlBox.style.cssText = `display:inline-block;width:${w}px;height:${h}px;overflow:hidden;vertical-align:middle;border:1px solid var(--border-color);border-radius:2px;`;
-                // 内层：绝对定位，用于缩放
+                const isFill = !!tag.htmlFill;
+                // 内层：绝对定位，用于缩放（fill 模式填满容器）
                 const inner = document.createElement('div');
-                inner.style.cssText = 'position:absolute;top:0;left:0;transform-origin:0 0;';
+                inner.style.cssText = isFill
+                    ? 'position:absolute;top:0;left:0;width:100%;height:100%;transform-origin:0 0;'
+                    : 'position:absolute;top:0;left:0;transform-origin:0 0;';
                 htmlBox.style.position = 'relative';
                 htmlBox.appendChild(inner);
                 // scope
                 const scopeId = 'dt-tag-scope-' + tag.id;
                 htmlBox.setAttribute('data-tag-scope', scopeId);
-                let processedCode = (typeof WailsBridge !== 'undefined' && WailsBridge.fixRelativeUrls)
-                    ? WailsBridge.fixRelativeUrls(tag.htmlCode || '') : (tag.htmlCode || '');
+                    let processedCode = (typeof WailsBridge !== 'undefined' && WailsBridge.prepareHtmlTagCode)
+                        ? WailsBridge.prepareHtmlTagCode(tag.htmlCode || '', tag.htmlImageUrls) : (tag.htmlCode || '');
                 let scopedHtml = processedCode.replace(/<style([^>]*)>/g, (_, attrs) => {
                     return '<style' + attrs + ' data-scope="' + scopeId + '">';
                 });
@@ -1443,22 +1528,23 @@ const DetailPanel = (() => {
                 inner.querySelectorAll('style[data-scope]').forEach(styleEl => {
                     const raw = styleEl.textContent;
                     if (!raw) return;
-                    const scoped = raw.replace(/([^{}]*\{)/g, (rule) => {
-                        const trimmed = rule.trim();
-                        if (/^@|^\d+(\.\d+)?%|^(from|to)\b/i.test(trimmed)) return rule;
-                        if (/\b(html|body|:root)\b|\*/.test(trimmed)) return '';
-                        return rule.replace(/(^|,)\s*/g, (sep) => {
-                            return sep + '[data-tag-scope="' + scopeId + '"] ';
-                        });
-                    });
+                    let scoped = (typeof WailsBridge !== 'undefined' && WailsBridge.scopeHtmlTagCss)
+                        ? WailsBridge.scopeHtmlTagCss(raw, scopeId, isFill) : raw;
                     styleEl.textContent = (typeof WailsBridge !== 'undefined' && WailsBridge.fixRelativeUrls) ? WailsBridge.fixRelativeUrls(scoped) : scoped;
                     styleEl.removeAttribute('data-scope');
                 });
                 inner.querySelectorAll('script').forEach(s => {
                     try { eval(s.textContent); } catch(e) {}
                 });
-                // 等比缩放
                 requestAnimationFrame(() => {
+                    if (isFill) {
+                        // ★ 填满容器模式：自适应缩放内容到容器内（图片加载后自动重算）
+                        if (typeof WailsBridge !== 'undefined' && WailsBridge.fitHtmlTagContentAfterImages) {
+                            WailsBridge.fitHtmlTagContentAfterImages(inner, w, h);
+                        }
+                        return;
+                    }
+                    // 等比缩放
                     const rect = inner.getBoundingClientRect();
                     const nw = rect.width || w;
                     const nh = rect.height || h;
@@ -1643,6 +1729,22 @@ const DetailPanel = (() => {
         return div.innerHTML;
     }
 
+    /** 在已转义的 HTML 上对搜索命中词做大小写不敏感高亮（返回 HTML 字符串） */
+    function highlightSearchTerms(escapedHtml, keywords) {
+        if (!keywords || keywords.length === 0) return escapedHtml;
+        let result = escapedHtml;
+        for (const kw of keywords) {
+            if (!kw) continue;
+            const esc = escapeHtml(kw);
+            if (!esc) continue;
+            try {
+                const re = new RegExp('(' + esc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi');
+                result = result.replace(re, '<mark class="search-highlight">$1</mark>');
+            } catch (e) { /* 非法正则忽略 */ }
+        }
+        return result;
+    }
+
     // ==================== 公开 API ====================
 
     // 监听标签变更事件，刷新信息栏中的标签显示
@@ -1660,7 +1762,16 @@ const DetailPanel = (() => {
         setLocked,
         getLocked,
         getCurrentImage: () => currentImage,
-        refreshDetailApiConfigSelect
+        refreshDetailApiConfigSelect,
+        // ★ 语言切换：刷新当前图片的详情（参数/元数据）+ 静态翻译由全局 scanDOM 处理
+        refreshI18n: () => {
+            if (currentImage) {
+                renderParams(currentImage);
+                renderRawMetadata(currentImage);
+                renderFileInfo(currentImage);
+            }
+            if (btnToggleRawMetadata) btnToggleRawMetadata.textContent = _t('detail.metadata');
+        }
     };
 })();
 
@@ -1781,7 +1892,7 @@ const ImageViewer = (() => {
         img.addEventListener('contextmenu', (e) => {
             e.preventDefault();
             if (currentImgData) {
-                ImageContextMenu.show(e.clientX, e.clientY, currentImgData.path, currentImgData.rootPath, currentImgData.folder);
+                ImageContextMenu.show(e.clientX, e.clientY, currentImgData.path, currentImgData.rootPath, currentImgData.folder, currentImgData.url);
             }
         });
 
@@ -1948,6 +2059,11 @@ const ImageViewer = (() => {
         const SWIPE_DIRECTION_RATIO = 1.5;
 
         wrapper.addEventListener('touchstart', (e) => {
+            // ★ 移动端：触摸交互期间立即隐藏左侧快捷菜单栏（不依赖 1.5s idle 定时器）
+            if (document.body.classList.contains('mobile')) {
+                const vc = document.getElementById('imageViewerContainer');
+                if (vc) vc.classList.add('touching');
+            }
             if (e.touches.length === 2) {
                 touchPinch = true;
                 touchIsSwipe = false;
@@ -2013,7 +2129,10 @@ const ImageViewer = (() => {
                         const absDx = Math.abs(dx);
                         const absDy = Math.abs(dy);
 
-                        if (absDx > absDy * SWIPE_DIRECTION_RATIO) {
+                        // ★ 放大时（scale > 适配比例）不判横滑：横滑用于平移图片，
+                        //   避免在放大查看细节时误切到上一张/下一张
+                        const zoomedIn = naturalWidth > 0 && naturalHeight > 0 && scale > calculateFitScale() * 1.05;
+                        if (!zoomedIn && absDx > absDy * SWIPE_DIRECTION_RATIO) {
                             touchIsSwipe = true;
                         }
                     }
@@ -2037,6 +2156,11 @@ const ImageViewer = (() => {
         }, { passive: false });
 
         wrapper.addEventListener('touchend', (e) => {
+            // ★ 移动端：松手后恢复（若仍在放大状态，CSS 的 .zoomed 规则继续隐藏）
+            if (document.body.classList.contains('mobile')) {
+                const vc = document.getElementById('imageViewerContainer');
+                if (vc) vc.classList.remove('touching');
+            }
             if (touchPinch) {
                 if (e.touches.length === 0) {
                     touchPinch = false;
@@ -2058,7 +2182,9 @@ const ImageViewer = (() => {
                 const elapsed = Date.now() - touchStartTime;
                 const velocity = elapsed > 0 ? Math.abs(dx) / elapsed : 0;
 
-                if (Math.abs(dx) >= SWIPE_THRESHOLD || velocity >= SWIPE_VELOCITY) {
+                // ★ 双重防护：放大状态下即使已判为横滑也不切换上下张
+                const zoomedIn = naturalWidth > 0 && naturalHeight > 0 && scale > calculateFitScale() * 1.05;
+                if (!zoomedIn && (Math.abs(dx) >= SWIPE_THRESHOLD || velocity >= SWIPE_VELOCITY)) {
                     navigate(dx > 0 ? 1 : -1);
                 }
             }
@@ -2082,6 +2208,11 @@ const ImageViewer = (() => {
         currentImgData = imageList[currentIndex];
         loadImage(currentImgData);
         if (filmstripVisible) updateFilmstripCurrent();
+
+        // ★ 移动端：切换图片时同步填充右侧信息面板
+        if (document.body.classList.contains('mobile') && typeof DetailPanel !== 'undefined') {
+            DetailPanel.showImage(currentImgData, { noExpand: true });
+        }
 
         // 预解析元数据并刷新浮动面板
         // ★ 等图片加载完成（naturalWidth/naturalHeight 就绪）后再渲染
@@ -2236,8 +2367,17 @@ async function toggleFullscreen() {
             if (!hasMore) return;
             if (typeof Gallery !== 'undefined' && Gallery.triggerLoadMore) {
                 Gallery.triggerLoadMore().then(() => {
-                    if (imageList.length > prevLen) {
-                        appendFilmstripItems(prevLen);
+                    // ★ 修复：图廊 applyCurrentFilter 会重建 filteredImages 数组，
+                    //   查看器的 imageList 仍指向旧数组导致永远追加不上。
+                    //   重新从图廊同步最新列表，再追加新增部分。
+                    //   注意：不要在这里调用 updateFilmstripCurrent()——
+                    //   scrollIntoView 会把滚动位置拉回当前图片，加载更多时位置会跳回前面。
+                    if (typeof Gallery !== 'undefined' && Gallery.getImages) {
+                        const fresh = Gallery.getImages();
+                        if (fresh && fresh.length > prevLen) {
+                            imageList = fresh;
+                            appendFilmstripItems(prevLen);
+                        }
                     }
                 }).catch(() => {});
             }
@@ -2397,6 +2537,11 @@ async function toggleFullscreen() {
 
         overlay.style.display = 'flex';
         loadImage(imgData);
+
+        // ★ 移动端：查看器打开时同步填充右侧信息面板（不自动展开抽屉，等用户点"信息"）
+        if (document.body.classList.contains('mobile') && typeof DetailPanel !== 'undefined') {
+            DetailPanel.showImage(imgData, { noExpand: true });
+        }
 
         // 预解析元数据（用于 P 键参数面板）
         if (!imgData.metadata && typeof Gallery !== 'undefined' && Gallery.resolveMetadataOnDemand) {
@@ -2616,6 +2761,12 @@ async function toggleFullscreen() {
     function applyTransform() {
         img.style.transform = `translate(${offsetX}px, ${offsetY}px) scale(${scale}) rotate(${rotation}deg)`;
         zoomLevelEl.textContent = Math.round(scale * 100) + '%';
+        // ★ 移动端：放大时隐藏左侧快捷菜单栏（避免遮挡图片），CSS 用 .zoomed 控制
+        if (document.body.classList.contains('mobile')) {
+            const zoomed = naturalWidth > 0 && naturalHeight > 0 && scale > calculateFitScale() * 1.05;
+            const viewerContainer = document.getElementById('imageViewerContainer');
+            if (viewerContainer) viewerContainer.classList.toggle('zoomed', zoomed);
+        }
     }
 
     // 初始化

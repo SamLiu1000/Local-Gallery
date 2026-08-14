@@ -162,6 +162,7 @@ export namespace main {
 	    offset: number;
 	    limit: number;
 	    message?: string;
+	    code?: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new AdvancedSearchResponse(source);
@@ -175,6 +176,7 @@ export namespace main {
 	        this.offset = source["offset"];
 	        this.limit = source["limit"];
 	        this.message = source["message"];
+	        this.code = source["code"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -313,12 +315,29 @@ export namespace main {
 		    return a;
 		}
 	}
+	export class FolderPreview {
+	    id: string;
+	    lastModified: number;
+	    path?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new FolderPreview(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.lastModified = source["lastModified"];
+	        this.path = source["path"];
+	    }
+	}
 	export class FolderNode {
 	    name: string;
 	    path: string;
 	    imageCount: number;
 	    thumbCount: number;
 	    folderType?: string;
+	    previews?: FolderPreview[];
 	    children: FolderNode[];
 	
 	    static createFrom(source: any = {}) {
@@ -332,6 +351,7 @@ export namespace main {
 	        this.imageCount = source["imageCount"];
 	        this.thumbCount = source["thumbCount"];
 	        this.folderType = source["folderType"];
+	        this.previews = this.convertValues(source["previews"], FolderPreview);
 	        this.children = this.convertValues(source["children"], FolderNode);
 	    }
 	
@@ -353,6 +373,7 @@ export namespace main {
 		    return a;
 		}
 	}
+	
 	export class ImageListResult {
 	    items: SafeImage[];
 	    total: number;
@@ -409,6 +430,93 @@ export namespace main {
 	        this.indexing = source["indexing"];
 	    }
 	}
+	export class ParamTagItem {
+	    value: string;
+	    count: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new ParamTagItem(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.value = source["value"];
+	        this.count = source["count"];
+	    }
+	}
+	export class ParamTagGroup {
+	    key: string;
+	    field: string;
+	    mode: string;
+	    tags: ParamTagItem[];
+	
+	    static createFrom(source: any = {}) {
+	        return new ParamTagGroup(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.key = source["key"];
+	        this.field = source["field"];
+	        this.mode = source["mode"];
+	        this.tags = this.convertValues(source["tags"], ParamTagItem);
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	
+	export class ParamTagsResponse {
+	    success: boolean;
+	    groups: ParamTagGroup[];
+	    message?: string;
+	    code?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new ParamTagsResponse(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.success = source["success"];
+	        this.groups = this.convertValues(source["groups"], ParamTagGroup);
+	        this.message = source["message"];
+	        this.code = source["code"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
 	export class PreGenStatus {
 	    running: boolean;
 	    paused: boolean;
@@ -441,6 +549,8 @@ export namespace main {
 	    body: string;
 	    proxyHost: string;
 	    proxyPort: number;
+	    proxyProtocol?: string;
+	    timeout?: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new ProxyRequestArgs(source);
@@ -455,6 +565,8 @@ export namespace main {
 	        this.body = source["body"];
 	        this.proxyHost = source["proxyHost"];
 	        this.proxyPort = source["proxyPort"];
+	        this.proxyProtocol = source["proxyProtocol"];
+	        this.timeout = source["timeout"];
 	    }
 	}
 	
@@ -506,6 +618,7 @@ export namespace main {
 	    offset: number;
 	    limit: number;
 	    message?: string;
+	    code?: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new SearchResponse(source);
@@ -519,6 +632,7 @@ export namespace main {
 	        this.offset = source["offset"];
 	        this.limit = source["limit"];
 	        this.message = source["message"];
+	        this.code = source["code"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {

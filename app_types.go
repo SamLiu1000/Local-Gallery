@@ -122,6 +122,7 @@ type ImageEntry struct {
 	Width        int    `json:"width"`
 	Height       int    `json:"height"`
 	IsVideo      bool   `json:"isVideo"`
+	ContentHash  string `json:"-"`
 }
 
 // SearchRequest 搜索请求
@@ -140,6 +141,7 @@ type SearchResponse struct {
 	Offset  int                     `json:"offset"`
 	Limit   int                     `json:"limit"`
 	Message string                  `json:"message,omitempty"`
+	Code    string                  `json:"code,omitempty"` // 错误码，前端映射 i18n
 }
 
 // SearchCondition 高级搜索的单个条件
@@ -168,16 +170,47 @@ type AdvancedSearchResponse struct {
 	Offset  int                     `json:"offset"`
 	Limit   int                     `json:"limit"`
 	Message string                  `json:"message,omitempty"`
+	Code    string                  `json:"code,omitempty"` // 错误码，前端映射 i18n
+}
+
+// ParamTagItem 生成参数标签面板的单个标签（参数值 + 出现次数）
+type ParamTagItem struct {
+	Value string `json:"value"`
+	Count int    `json:"count"`
+}
+
+// ParamTagGroup 生成参数标签面板的单个类别分组（如"模型"类别下的所有模型标签）
+type ParamTagGroup struct {
+	Key   string         `json:"key"`   // params_json 中的参数键，如 "Model" / "CFG Scale"
+	Field string         `json:"field"` // 高级搜索字段名，如 "json:Model"，点击标签时直接作为条件 field
+	Mode  string         `json:"mode"`  // 点击标签时的匹配模式："contains" / "exact"
+	Tags  []ParamTagItem `json:"tags"`
+}
+
+// ParamTagsResponse 生成参数标签面板响应
+type ParamTagsResponse struct {
+	Success bool            `json:"success"`
+	Groups  []ParamTagGroup `json:"groups"`
+	Message string          `json:"message,omitempty"`
+	Code    string          `json:"code,omitempty"`
+}
+
+// FolderPreview 子文件夹缩略图预览条目（含 lastModified 与 path，供前端复用图廊缩略图 URL、点击定位图片）
+type FolderPreview struct {
+	ID           string `json:"id"`
+	LastModified int64  `json:"lastModified"`
+	Path         string `json:"path,omitempty"`
 }
 
 // FolderNode 文件夹树节点
 type FolderNode struct {
-	Name       string        `json:"name"`
-	Path       string        `json:"path"`
-	ImageCount int           `json:"imageCount"`
-	ThumbCount int           `json:"thumbCount"`
-	FolderType string        `json:"folderType,omitempty"`
-	Children   []*FolderNode `json:"children"`
+	Name       string          `json:"name"`
+	Path       string          `json:"path"`
+	ImageCount int             `json:"imageCount"`
+	ThumbCount int             `json:"thumbCount"`
+	FolderType string          `json:"folderType,omitempty"`
+	Previews   []FolderPreview `json:"previews,omitempty"` // 缩略图预览：该文件夹直接包含的图片（确定性随机 ≤4）
+	Children   []*FolderNode   `json:"children"`
 }
 
 // IndexResult 索引操作结果

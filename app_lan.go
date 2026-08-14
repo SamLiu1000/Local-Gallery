@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"syscall"
 	"path/filepath"
@@ -46,6 +47,10 @@ func (a *App) startLANServerWithPort(port int) {
 	mux.HandleFunc("/api/roots", a.handleLANGetRoots)
 	mux.HandleFunc("/api/full-rescan", a.handleLANFullRescanFolder)
 	mux.HandleFunc("/api/user-data/", a.handleLANUserData)
+
+	// ★ 元数据解析（手机端信息面板需要：prompt/参数/原始元数据）
+	//   Go 端本地读文件头部，不需要下载整图
+	mux.HandleFunc("/api/metadata", a.handleLANMetadata)
 
 	// 缩略图
 	mux.HandleFunc("/thumb/", func(w http.ResponseWriter, r *http.Request) {
@@ -110,13 +115,27 @@ func (a *App) startLANServerWithPort(port int) {
 			http.NotFound(w, r)
 			return
 		}
-		data, err := fs.ReadFile(assets, "static/"+cleanPath)
+		// ★ 开发模式热更新：static 目录存在（源码目录）时优先读磁盘，
+		//   手机端能即时拿到最新前端；发布版回退到编译时嵌入的资源。
+		var data []byte
+		var err error
+		if _, statErr := os.Stat("static/index.html"); statErr == nil {
+			data, err = os.ReadFile("static/" + cleanPath)
+		} else {
+			data, err = fs.ReadFile(assets, "static/"+cleanPath)
+		}
 		if err != nil {
-			data, err = fs.ReadFile(assets, "static/index.html")
+			// SPA 回退：未命中的路径返回 index.html
+			if _, statErr := os.Stat("static/index.html"); statErr == nil {
+				data, err = os.ReadFile("static/index.html")
+			} else {
+				data, err = fs.ReadFile(assets, "static/index.html")
+			}
 			if err != nil {
 				http.NotFound(w, r)
 				return
 			}
+			cleanPath = "index.html"
 		}
 		contentType := getContentType(cleanPath)
 		w.Header().Set("Content-Type", contentType)
@@ -262,6 +281,22 @@ func parseIntParam(s string, defaultVal int) int {
 	var n int
 	fmt.Sscanf(s, "%d", &n)
 	return n
+}
+
+// handleLANMetadata 按文件路径解析图片元数据（prompt/参数/原始元数据），供手机端信息面板使用
+func (a *App) handleLANMetadata(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	filePath := r.URL.Query().Get("path")
+	if filePath == "" {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "missing path"})
+		return
+	}
+	meta := a.ParseMetadata(filePath)
+	if meta == nil {
+		meta = map[string]interface{}{"success": false, "error": "no metadata"}
+	}
+	json.NewEncoder(w).Encode(meta)
 }
 
 // handleLANUserData 处理 /api/user-data/* 请求，代理到 App 的用户数据方法

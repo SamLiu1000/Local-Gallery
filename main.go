@@ -121,6 +121,12 @@ func main() {
 			return false
 		},
 		OnShutdown: func(ctx context.Context) {
+			// ★ 保存当前 thumbCounts，供下次冷启动直接恢复
+			app.persistThumbCounts()
+			// ★ 释放单实例锁
+			if app.instanceLockRelease != nil {
+				app.instanceLockRelease()
+			}
 			shutdownVips()
 		},
 		Bind: []interface{}{

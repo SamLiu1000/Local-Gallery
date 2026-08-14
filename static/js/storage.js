@@ -76,7 +76,8 @@ const Storage = (() => {
 
     // 页面关闭前保存
     window.addEventListener('beforeunload', () => {
-        if (hasUnsavedChanges && serverAvailable) {
+        // ★ 首次同步完成前禁止保存（与 saveToServer 一致，防止空缓存覆盖服务端数据）
+        if (hasUnsavedChanges && serverAvailable && hasSynced) {
             const data = JSON.stringify({
                 data: {
                     tags: serverDataCache.tags,
@@ -189,6 +190,10 @@ const Storage = (() => {
         apiConfigs: [],
         settings: {}
     };
+    // ★ 首次同步是否成功完成：完成前禁止保存。
+    //   否则启动时任何 markDirty（如恢复面板状态/同步色板设置）触发防抖保存，
+    //   会把仍是空数组的 tags/favorites/imageTags 整组覆盖到后端 → 标签被清空
+    let hasSynced = false;
 
     async function syncFromServer() {
         if (!serverAvailable) return;
@@ -203,6 +208,7 @@ const Storage = (() => {
                 result = await response.json();
             }
             if (result.success && result.data) {
+                hasSynced = true; // ★ 数据就绪后才允许保存
                 serverDataCache = {
                     tags: result.data.tags || [],
                     apiConfigs: result.data.apiConfigs || [],
@@ -215,6 +221,11 @@ const Storage = (() => {
                     'API配置:', serverDataCache.apiConfigs.length,
                     '设置字段:', Object.keys(serverDataCache.settings).length
                 );
+                // ★ 修复：数据就绪后派发事件，确保标签树等 UI 在拿到数据后重新渲染。
+                //   否则若启动时 refreshTagTree 早于 sync 完成（读到空 tags），
+                //   标签栏会空白，直到用户"创建新标签"才重新渲染。
+                window.dispatchEvent(new CustomEvent('tags-changed'));
+                window.dispatchEvent(new CustomEvent('favorites-changed'));
             } else {
                 throw new Error('后端返回数据格式错误');
             }

@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="64" height="64">
+  <defs>
+    <linearGradient id="sortUp" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#F0A030"/>
+      <stop offset="100%" stop-color="#C07000"/>
+    </linearGradient>
+    <linearGradient id="sortDown" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#909090"/>
+      <stop offset="100%" stop-color="#606060"/>
+    </linearGradient>
+    <filter id="sortShadow">
+      <feDropShadow dx="0" dy="1" stdDeviation="1.5" flood-color="#000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <!-- 升序箭头（上） -->
+  <path d="M24 8 L31 20 L17 20 Z" fill="url(#sortUp)" filter="url(#sortShadow)"/>
+  <path d="M24 11 L27.5 17.5 L20.5 17.5 Z" fill="#fff" opacity="0.25"/>
+
+  <!-- 降序箭头（下） -->
+  <path d="M24 40 L31 28 L17 28 Z" fill="url(#sortDown)" filter="url(#sortShadow)"/>
+  <path d="M24 37 L27.5 30.5 L20.5 30.5 Z" fill="#fff" opacity="0.15"/>
+</svg>

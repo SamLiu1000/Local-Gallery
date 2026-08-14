@@ -8,7 +8,7 @@ const Gallery = (() => {
     const t = (typeof I18n !== 'undefined' ? I18n.t : (s) => s);
 
     // DOM
-    let galleryScroll, galleryGrid, loadingIndicator;
+    let galleryScroll, galleryGrid, loadingIndicator, loadMoreIndicator;
     let layoutBtns, thumbnailSlider, thumbnailSizeValue, sortSelect;
     let imageCountEl, btnShowPromptCount, btnInertiaToggle;
 
@@ -44,7 +44,16 @@ const Gallery = (() => {
     let isLoadingMoreFolder = false;  // 防止重复触发增量加载
     let _loadMoreFollowupTimer = null; // 增量加载后继续检查，避免停在批次边界
     let folderCacheMeta = {};         // { [normalizedFolderPath]: { total: number } }  切换文件夹时优先使用缓存，避免重复请求后端
+    // ★ 标签视图增量加载状态（标签结果超过 FOLDER_LOOKAHEAD 时按路径分批拉取）
+    let tagPaths = [];                // 当前标签的全部图片路径
+    let tagLoadTotal = 0;             // 标签图片总数
+    let tagLoadOffset = 0;            // 已加载偏移量
+    // ★ 收藏视图增量加载状态（同标签，收藏超过首屏数量时分批拉取）
+    let favPaths = [];                // 当前收藏的全部图片路径
+    let favLoadTotal = 0;             // 收藏图片总数
+    let favLoadOffset = 0;            // 已加载偏移量
     let importedRoots = [];         // [{ rootId, path, name, handleName, displayName }]
+    let importedRootsLoaded = false; // ★ 启动时 importedRoots 是否已从后端恢复（防止未就绪时保存不完整列表）
     let directoryHandles = [];      // [{ id, name, handle }] 用于 File System Access API 持久化
     let isEditMode = false;         // 编辑模式：单击选择，双击预览
     let onEditModeChange = null;    // 编辑模式变化回调
@@ -159,6 +168,7 @@ const Gallery = (() => {
         galleryScroll = document.getElementById('galleryScroll');
         galleryGrid = document.getElementById('galleryGrid');
         loadingIndicator = document.getElementById('loadingIndicator');
+        loadMoreIndicator = document.getElementById('loadMoreIndicator');
         layoutBtns = document.querySelectorAll('.layout-option');
         const layoutDropdownBtn = document.getElementById('layoutDropdownBtn');
         const layoutDropdownIcon = document.getElementById('layoutDropdownIcon');
@@ -254,14 +264,13 @@ const Gallery = (() => {
                     const scanRoot = (data.rootPath || '').replace(/\\/g, '/');
                     if (currentFolderFilter && scanRoot &&
                         currentFolderFilter.replace(/\\/g, '/').startsWith(scanRoot)) {
-                        // 正在首次加载中，或已完成加载 → 跳过 forceRefresh
-                        if (pendingScanFolder === currentFolderFilter ||
-                            loadedScanFolder === currentFolderFilter) {
-                            console.log('[Gallery] 已为该 scan 加载或正在加载，跳过重复刷新');
-                        } else {
-                            console.log('[Gallery] 扫描完成，强制刷新当前文件夹');
-                            filterByFolder(currentFolderFilter, null, { forceRefresh: true });
-                        }
+                        // ★ 修复：扫描完成后必须重新拉取当前文件夹列表（forceRefresh:false，不做后端重扫）。
+                        //   旧逻辑用 pendingScanFolder/loadedScanFolder 守卫跳过刷新——但若文件夹是在
+                        //   扫描中途（image_cache 未写全）打开的，分页总数会冻结在部分数量上，
+                        //   之后滚动不再加载（表现为"导入后只加载几百张就没反应"）。
+                        //   统一重拉一次，用最终 total 校正分页状态；重复加载无害（forceRefresh:false）。
+                        console.log('[Gallery] 扫描完成，重新拉取当前文件夹:', currentFolderFilter);
+                        filterByFolder(currentFolderFilter, null, { forceRefresh: false });
                     }
                     // ★ 扫描完成后刷新整棵树，导入后的子文件夹和展开按钮需要后端完整树数据
                     if (typeof Sidebar !== 'undefined' && Sidebar.refreshFolderTree) {
@@ -321,8 +330,13 @@ const Gallery = (() => {
         }
 
         // 监听标签变更事件，刷新画廊中的标签显示
+        // ★ 修复：标签操作 + 标签树刷新会连续派发多次 tags-changed，
+        //   每次都会触发全量 render()（含全图数组去重），大图库下明显卡顿。
+        //   用防抖合并到一次渲染。
+        let _tagRenderTimer = null;
         window.addEventListener('tags-changed', () => {
-            render();
+            clearTimeout(_tagRenderTimer);
+            _tagRenderTimer = setTimeout(() => render(), 80);
         });
     }
 
@@ -855,23 +869,48 @@ const Gallery = (() => {
     }
 
     /**
-     * ★ 缩略图预温热：在当前渲染范围之外的即将进入视窗的图片，
-     *   用离屏 Image 对象提前发起 HTTP 请求，填充浏览器缓存。
-     *   当虚拟滚动创建这些卡片时，缩略图已在缓存中，瞬间显示。
+     * ★ 缩略图预温热：只在当前视窗/渲染窗口紧邻后方预加载少量图片，
+     *   让滚动进入视野前已下载好（丝滑）；视窗之外的图片不做预加载，
+     *   由虚拟滚动删除 DOM + 停止加载，节省性能。
+     *   并发控制：同时最多发起 maxConcurrency 个请求，避免预加载占满
+     *   浏览器连接池导致可见区域图片排队等待。
      */
+    let _prewarmActive = 0;
+    const _prewarmMaxConcurrent = 6; // 与单 origin 连接数持平，给可见区域留连接
+    let _prewarmPending = [];
+
     function _prewarmThumbnails(displayImages, currentStart, currentEnd) {
         if (!displayImages || displayImages.length === 0) return;
-        const prewarmCount = Math.min(OVERSCAN * getColumnCount(), 100);
-        // 预加载当前渲染窗口后方 prewarmCount 张
+        // 只预加载紧邻渲染窗口后方的一屏余量（约 1 屏列数），
+        // 而不是一次 100 张——视窗外过远的图交给滚动时再加载，省性能。
+        const perScreen = getColumnCount();
+        const prewarmCount = Math.min(perScreen, 40);
         const prewarmStart = currentEnd;
         const prewarmEnd = Math.min(displayImages.length, currentEnd + prewarmCount);
         for (let i = prewarmStart; i < prewarmEnd; i++) {
             const imgData = displayImages[i];
             if (imgData && imgData.thumbnailUrl) {
-                const preImg = new Image();
-                preImg.decoding = 'async';
-                preImg.src = imgData.thumbnailUrl;
+                _prewarmPending.push(imgData.thumbnailUrl);
             }
+        }
+        _drainPrewarm();
+    }
+
+    function _drainPrewarm() {
+        // 队列只保留最近一批，防止滚动期间无限堆积
+        if (_prewarmPending.length > 120) {
+            _prewarmPending = _prewarmPending.slice(-120);
+        }
+        while (_prewarmActive < _prewarmMaxConcurrent && _prewarmPending.length > 0) {
+            const url = _prewarmPending.shift();
+            _prewarmActive++;
+            const preImg = new Image();
+            preImg.decoding = 'async';
+            preImg.onload = preImg.onerror = () => {
+                _prewarmActive--;
+                _drainPrewarm();
+            };
+            preImg.src = url;
         }
     }
 
@@ -1898,6 +1937,8 @@ const Gallery = (() => {
 
     function applyCurrentFilter(options = {}) {
         const includeDescendants = options.includeDescendants !== false;
+        // ★ auto dedup: remove duplicate entries before filtering
+        images = _dedupImages(images);
 
         if (!currentFolderFilter) {
             // ★ 无过滤时直接引用原数组（避免复制）
@@ -1984,6 +2025,14 @@ const Gallery = (() => {
     async function isServerRegisteredPath(folderPath) {
         if (!folderPath) return false;
         const normalized = folderPath.replace(/\\/g, '/');
+        // ★ 先用内存中的 importedRoots 快速判断，避免每次异步查 Storage
+        for (const root of importedRoots) {
+            const rootId = (root.rootId || '').replace(/\\/g, '/');
+            if (rootId === normalized || normalized.startsWith(rootId + '/')) {
+                return true;
+            }
+        }
+        // 内存未命中，回退到 Storage 查询（首次或 importedRoots 未加载时）
         try {
             const roots = await Storage.getRegisteredRoots();
             return (roots || []).some(r => {
@@ -2048,15 +2097,57 @@ const Gallery = (() => {
 
     function shouldLoadMoreFolderImages(imagesAheadOfViewport) {
         if (!galleryScroll) return imagesAheadOfViewport <= FOLDER_LOOKAHEAD;
-        const bottomBuffer = Math.max(galleryScroll.clientHeight * 8, thumbnailSize * 24);
+        // ★ 修复：底部预加载余量设为约 3 个视口高度。
+        //   loadMoreFolderImages 是异步的（RPC + 渲染），若余量太小用户滚到底
+        //   时才触发，加载期间底部是空白 → 不够丝滑。
+        //   提前到 3 屏发起，滚到底时数据通常已就绪；配合 scheduleLoadMoreFollowup
+        //   只在停止滚动后继续加载，不会一次连锁拉满整个文件夹造成上拉跳动。
+        const bottomBuffer = Math.max(Math.round(galleryScroll.clientHeight * 3), thumbnailSize * 6);
         return imagesAheadOfViewport <= FOLDER_LOOKAHEAD || getLoadedBottomDistance() <= bottomBuffer;
     }
 
     function checkLoadMoreOnScroll(allowDuringScroll = false) {
-        if (!isFilteringActive || !currentFolderFilter) return;
+        if (!isFilteringActive || (!currentFolderFilter && !currentTagFilter && !currentFavoriteFilter)) return;
         if (!allowDuringScroll && _isScrolling) return;
         if (isLoadingMoreFolder) return;
-        if (folderLoadTotal > 0 && folderLoadOffset >= folderLoadTotal) return;
+
+        // ★ 标签视图：按标签路径分批加载（与文件夹分页一致）。
+        //   仅当没有文件夹过滤时（纯标签视图）走标签分支；
+        //   文件夹关联标签（linkedFolder）同时有 currentFolderFilter，走文件夹分支。
+        if (currentTagFilter && !currentFolderFilter) {
+            if (tagLoadTotal === 0 || tagLoadOffset >= tagLoadTotal) return;
+            const nowT = Date.now();
+            const throttleT = allowDuringScroll ? 80 : 200;
+            if (nowT - _lastScrollCheckTime < throttleT) return;
+            _lastScrollCheckTime = nowT;
+            const vpLastT = getViewportLastImageIndex();
+            const aheadT = filteredImages.length - vpLastT - 1;
+            if (shouldLoadMoreFolderImages(aheadT)) {
+                _abortOutOfViewportLoads();
+                loadMoreTagImages();
+            }
+            return;
+        }
+
+        // ★ 收藏视图：按收藏路径分批加载（同标签视图）
+        if (currentFavoriteFilter && !currentFolderFilter) {
+            if (favLoadTotal === 0 || favLoadOffset >= favLoadTotal) return;
+            const nowF = Date.now();
+            const throttleF = allowDuringScroll ? 80 : 200;
+            if (nowF - _lastScrollCheckTime < throttleF) return;
+            _lastScrollCheckTime = nowF;
+            const vpLastF = getViewportLastImageIndex();
+            const aheadF = filteredImages.length - vpLastF - 1;
+            if (shouldLoadMoreFolderImages(aheadF)) {
+                _abortOutOfViewportLoads();
+                loadMoreFavoritesImages();
+            }
+            return;
+        }
+
+        // ★ 首次批次加载未完成时（folderLoadTotal===0）跳过增量加载，避免
+        //    scroll 事件在 filterByFolder 等待 RPC 期间触发重复的 loadImagesFromServer
+        if (folderLoadTotal === 0 || folderLoadOffset >= folderLoadTotal) return;
 
         const now = Date.now();
         const throttleMs = allowDuringScroll ? 80 : 200;
@@ -2073,30 +2164,47 @@ const Gallery = (() => {
     }
 
     function scheduleLoadMoreFollowup() {
+        // ★ 修复：加载更多完成后不再 80ms 自动紧跟下一次加载。
+        //   旧逻辑在 folderLoadOffset < folderLoadTotal 时反复自动加载，
+        //   用户拉到底部会一次性连锁拉满整个文件夹，期间 scrollHeight 持续
+        //   变化，往上拉时滚动位置不断被扰动 → "跳来跳去"。
+        //   现在只等用户滚动到底部附近再加载，逐步增量，滚动稳定。
         if (_loadMoreFollowupTimer) return;
         _loadMoreFollowupTimer = setTimeout(() => {
             _loadMoreFollowupTimer = null;
             if (!_isScrolling) {
                 checkLoadMoreOnScroll();
             }
-        }, 80);
+        }, 120);
     }
 
     async function loadMoreFolderImages() {
         if (!currentFolderFilter || isLoadingMoreFolder) return;
         isLoadingMoreFolder = true;
+        _showLoadMoreIndicator(true);
+
+        // ★ 修复：把 folderPath 提到 try 外声明，finally 中需要用它判断文件夹是否已切换
+        const folderPath = currentFolderFilter;
 
         try {
-            const folderPath = currentFolderFilter;
-
             const viewportLastIndex = getViewportLastImageIndex();
             const imagesAheadOfViewport = Math.max(0, filteredImages.length - viewportLastIndex - 1);
             const fetchCount = Math.max(FOLDER_FETCH_BATCH, FOLDER_LOOKAHEAD - imagesAheadOfViewport);
 
             const result = await loadImagesFromServer(folderPath, folderLoadOffset, fetchCount);
 
+            // ★ 修复：等待返回时用户可能已切换到其他文件夹，
+            //   此时不能把旧文件夹的图片 push 进 images，也不能覆盖 folderLoadTotal/Offset，
+            //   否则会把上一个文件夹的内容渲染进当前文件夹（A 是 B 的子文件夹时尤其明显，
+            //   因为 B 带 descendants 会匹配 A 的图片，appendImageCards 会重建 DOM 显示 A 的图片）。
+            if (folderPath !== currentFolderFilter) {
+                console.log('[Gallery] 增量加载返回时文件夹已切换，丢弃结果:', folderPath, '->', currentFolderFilter);
+                return;
+            }
+
             if (result.images.length === 0) {
                 folderLoadTotal = folderLoadOffset;
+                _showLoadMoreIndicator(false);
                 return;
             }
 
@@ -2132,13 +2240,115 @@ const Gallery = (() => {
 
         } catch (err) {
             console.warn('[Gallery] 增量加载文件夹图片失败:', err.message);
+            _showLoadMoreIndicator(false);
+        } finally {
+            // ★ 修复：只有当本次加载仍属于当前文件夹时才重置 isLoadingMoreFolder 和调度后续，
+            //   否则会错误地重置新文件夹正在进行的 loadMore 状态，或为新文件夹误调度 followup。
+            if (folderPath === currentFolderFilter) {
+                isLoadingMoreFolder = false;
+                // 重置节流时间戳，允许下次合法触发
+                _lastScrollCheckTime = 0;
+                if (folderLoadTotal <= 0 || folderLoadOffset < folderLoadTotal) {
+                    // 还有更多：保持底部提示显示，等用户继续滚动/自动加载下一批
+                    scheduleLoadMoreFollowup();
+                } else {
+                    // 已全部加载完成：隐藏底部提示
+                    _showLoadMoreIndicator(false);
+                }
+            } else {
+                // 文件夹已切换，隐藏旧文件夹的底部提示
+                _showLoadMoreIndicator(false);
+            }
+        }
+    }
+
+    // 底部"加载更多"提示：显示在网格末尾，提示用户下方还在加载
+    function _showLoadMoreIndicator(show) {
+        if (!loadMoreIndicator) return;
+        loadMoreIndicator.style.display = show ? 'flex' : 'none';
+    }
+
+    /**
+     * ★ 标签视图增量加载：按标签的图片路径分批拉取后续批次
+     *   （标签结果超过首屏 FOLDER_LOOKAHEAD 时滚动触发，与文件夹分页一致）
+     */
+    async function loadMoreTagImages() {
+        if (!currentTagFilter || isLoadingMoreFolder) return;
+        if (tagLoadOffset >= tagLoadTotal) return;
+        isLoadingMoreFolder = true;
+        _showLoadMoreIndicator(true);
+        const tagId = currentTagFilter;
+        try {
+            const result = await loadImagesByPaths(tagPaths, tagLoadOffset, FOLDER_FETCH_BATCH);
+            if (tagId !== currentTagFilter) return; // 已切换视图，丢弃
+            if (result.images.length === 0) {
+                tagLoadOffset = tagLoadTotal;
+                _showLoadMoreIndicator(false);
+                return;
+            }
+            const prevFilteredLength = filteredImages.length;
+            const pathSet = new Set(tagPaths);
+            images.push(...result.images);
+            tagLoadOffset += result.images.length;
+            invalidatePathIndex();
+            filteredImages = images.filter(img => pathSet.has(img.path));
+            updateImageCount();
+
+            const newFiltered = filteredImages.slice(prevFilteredLength);
+            if (newFiltered.length > 0) appendImageCards(newFiltered);
+
+            // 还有更多：保持底部提示，等用户继续滚动
+            if (tagLoadOffset < tagLoadTotal) {
+                scheduleLoadMoreFollowup();
+            } else {
+                _showLoadMoreIndicator(false);
+            }
+        } catch (err) {
+            console.warn('[Gallery] 标签增量加载失败:', err.message);
+            _showLoadMoreIndicator(false);
         } finally {
             isLoadingMoreFolder = false;
-            // 重置节流时间戳，允许下次合法触发
-            _lastScrollCheckTime = 0;
-            if (folderLoadTotal <= 0 || folderLoadOffset < folderLoadTotal) {
-                scheduleLoadMoreFollowup();
+        }
+    }
+
+    /**
+     * ★ 收藏视图增量加载：按收藏路径分批拉取后续批次（同标签视图）
+     */
+    async function loadMoreFavoritesImages() {
+        if (!currentFavoriteFilter || isLoadingMoreFolder) return;
+        if (favLoadOffset >= favLoadTotal) return;
+        isLoadingMoreFolder = true;
+        _showLoadMoreIndicator(true);
+        const inFavView = currentFavoriteFilter;
+        try {
+            const result = await loadImagesByPaths(favPaths, favLoadOffset, FOLDER_FETCH_BATCH);
+            if (!currentFavoriteFilter) return; // 已退出收藏视图，丢弃
+            if (result.images.length === 0) {
+                favLoadOffset = favLoadTotal;
+                _showLoadMoreIndicator(false);
+                return;
             }
+            const prevFilteredLength = filteredImages.length;
+            const pathSet = new Set(favPaths);
+            images.push(...result.images);
+            favLoadOffset += result.images.length;
+            invalidatePathIndex();
+            filteredImages = images.filter(img => pathSet.has(img.path));
+            updateImageCount();
+
+            const newFiltered = filteredImages.slice(prevFilteredLength);
+            if (newFiltered.length > 0) appendImageCards(newFiltered);
+
+            if (favLoadOffset < favLoadTotal) {
+                scheduleLoadMoreFollowup();
+            } else {
+                _showLoadMoreIndicator(false);
+            }
+        } catch (err) {
+            console.warn('[Gallery] 收藏增量加载失败:', err.message);
+            _showLoadMoreIndicator(false);
+        } finally {
+            isLoadingMoreFolder = false;
         }
     }
 
@@ -2146,6 +2356,89 @@ const Gallery = (() => {
         if (folderAbortController) {
             folderAbortController.abort();
             folderAbortController = null;
+        }
+    }
+
+    /**
+     * ★ 后台异步刷新文件夹缓存：在缓存命中并渲染后，静默检查服务端是否有更新。
+     *   不阻塞用户交互，刷新完成后自动替换 images 数组并重渲染画廊。
+     */
+    async function _refreshFolderCacheAsync(folderPath, normalizedFolder, signal, currentController) {
+        try {
+            const freshResult = await loadImagesFromServer(folderPath, 0, FOLDER_FETCH_BATCH);
+            if (signal.aborted || folderAbortController !== currentController) return;
+
+            const freshImages = freshResult.images;
+            const freshTotal = freshResult.total;
+            if (freshImages.length === 0) return;
+
+            // 检查数据是否有变化（数量或内容）
+            const currentTotal = folderCacheMeta[normalizedFolder]?.total || 0;
+            let hasChanges = freshTotal !== currentTotal;
+            if (!hasChanges) {
+                // 进一步检查：对比第一张图片的 ID
+                const cachedFirst = images.find(img => {
+                    if (!img._fromServer) return false;
+                    const imgRoot = (img.rootPath || '').replace(/\\/g, '/');
+                    const imgFolder = (img.folder || '').replace(/\\/g, '/');
+                    const imageFolderPath = imgFolder ? `${imgRoot}/${imgFolder}` : imgRoot;
+                    return imageFolderPath === normalizedFolder;
+                });
+                hasChanges = cachedFirst && freshImages[0] && cachedFirst.id !== freshImages[0].id;
+            }
+
+            if (!hasChanges) return; // 无变化，保留当前缓存
+
+            console.log(`[Gallery] 后台刷新: ${normalizedFolder} 有更新 (${freshTotal}张)，替换缓存`);
+
+            // ★ 替换前再次检查是否已中断（替换 images 是破坏性操作）
+            if (signal.aborted || folderAbortController !== currentController) return;
+
+            // 替换 images 中的旧数据
+            images = images.filter(img => {
+                if (!img._fromServer) return true;
+                const imgRoot = (img.rootPath || '').replace(/\\/g, '/');
+                const imgFolder = (img.folder || '').replace(/\\/g, '/');
+                const imageFolderPath = imgFolder ? `${imgRoot}/${imgFolder}` : imgRoot;
+                return !(imageFolderPath === normalizedFolder || imageFolderPath.startsWith(normalizedFolder + '/'));
+            });
+            // ★ dedup
+                    const existIDs2 = new Set(); for (const im of images) { if (im.id) existIDs2.add(im.id); }
+                    for (const im of freshImages) { if (im.id && !existIDs2.has(im.id)) { images.push(im); existIDs2.add(im.id); } };
+
+            folderCacheMeta[normalizedFolder] = { total: freshTotal };
+            folderLoadTotal = freshTotal;
+            folderLoadOffset = freshImages.length;
+            invalidatePathIndex();
+
+            if (signal.aborted || folderAbortController !== currentController) return;
+
+            // 如果当前仍然显示这个文件夹，重渲染
+            const currentFilter = currentFolderFilter ? currentFolderFilter.replace(/\\/g, '/') : '';
+            if (currentFilter === normalizedFolder || currentFilter.startsWith(normalizedFolder + '/')) {
+                applyCurrentFilter({ includeDescendants: true });
+                sortImages();
+                images = _dedupImages(images);
+                const displayImages = isFilteringActive ? filteredImages : images;
+                if (displayImages.length > 100) {
+                    if (currentLayout === 'masonry') {
+                        renderMasonry(displayImages);
+                    } else if (currentLayout === 'pinterest') {
+                        renderPinterest(displayImages);
+                    } else if (currentLayout === 'list') {
+                        renderList(displayImages);
+                    } else {
+                        progressiveRender(displayImages);
+                    }
+                } else {
+                    render();
+                }
+            }
+        } catch (err) {
+            // 静默失败：后台刷新不影响用户当前看到的缓存内容
+            if (err.message && !err.message.includes('abort') && !err.message.includes('中断')) {
+                console.log('[Gallery] 后台刷新失败（保留缓存显示）:', err.message);
+            }
         }
     }
 
@@ -2174,10 +2467,21 @@ const Gallery = (() => {
         currentFavoriteFilter = false;
         isFilteringActive = !!currentFolderFilter;
 
+        // ★ 修复：切换文件夹时退出搜索模式。否则 isSearchMode/searchResults 残留，
+        //   配合异步续体可能把搜索结果数组渲染进文件夹视图（显示成其它文件夹的内容）。
+        if (isSearchMode || searchResults.length > 0) {
+            isSearchMode = false;
+            searchResults = [];
+            if (typeof SearchModule !== 'undefined' && SearchModule.isSearchActive && SearchModule.isSearchActive()) {
+                try { SearchModule.exitSearch(); } catch (e) { /* 搜索模块未初始化则忽略 */ }
+            }
+        }
+
         // 重置分页加载状态
         folderLoadTotal = 0;
         folderLoadOffset = 0;
         isLoadingMoreFolder = false;
+        _showLoadMoreIndicator(false);
 
         // ★ 问题一修复：创建新的中断控制器
         folderAbortController = new AbortController();
@@ -2189,13 +2493,70 @@ const Gallery = (() => {
         console.log('[filterByFolder] folderPath:', folderPath, 'importedRoots:', importedRoots.map(r => r.rootId));
         if (folderPath && await isServerRegisteredPath(folderPath)) {
             console.log('[filterByFolder] 进入服务端路径分支:', folderPath);
+
+            // ★ 修复：await isServerRegisteredPath 期间用户可能已切换文件夹 / 进入搜索/标签视图。
+            //   旧 filterByFolder 续体此时必须放弃——否则它会清空新文件夹的图廊、按"当前"
+            //   currentFolderFilter 重新过滤渲染（显示成其它文件夹/全库混合内容），并覆盖分页状态。
+            if (signal.aborted || folderAbortController !== currentController) {
+                console.log('[filterByFolder] 已切换视图，放弃过期续体:', folderPath);
+                return;
+            }
+
+            const normalizedFolder = folderPath.replace(/\\/g, '/');
+
+            // ★ 缓存加速：在清空画廊和显示 loading 之前，先检查内存缓存
+            //   如果 images 数组中已有该文件夹数据，立即渲染，避免用户等待 RPC
+            const cachedImages = !forceRefresh ? images.filter(img => {
+                if (!img._fromServer) return false;
+                const imgRoot = (img.rootPath || '').replace(/\\/g, '/');
+                const imgFolder = (img.folder || '').replace(/\\/g, '/');
+                const imageFolderPath = imgFolder ? `${imgRoot}/${imgFolder}` : imgRoot;
+                return imageFolderPath === normalizedFolder || imageFolderPath.startsWith(normalizedFolder + '/');
+            }) : [];
+
+            if (cachedImages.length > 0 && folderCacheMeta[normalizedFolder]) {
+                // ★ 缓存命中：立即用缓存数据渲染，不显示 loading
+                folderLoadTotal = folderCacheMeta[normalizedFolder].total;
+                folderLoadOffset = cachedImages.length;
+                isLoadingMoreFolder = false;
+                console.log(`[Gallery] 缓存命中: ${normalizedFolder}，${cachedImages.length}/${folderLoadTotal} 张，立即渲染`);
+
+                applyCurrentFilter({ includeDescendants });
+                sortImages();
+                if (Gallery._finishScanLoad) Gallery._finishScanLoad(currentFolderFilter);
+                // ★ dedup before render
+                images = _dedupImages(images);
+
+                const displayImages = isFilteringActive ? filteredImages : images;
+                if (displayImages.length > 100) {
+                    if (currentLayout === 'masonry') {
+                        renderMasonry(displayImages);
+                    } else if (currentLayout === 'pinterest') {
+                        renderPinterest(displayImages);
+                    } else if (currentLayout === 'list') {
+                        renderList(displayImages);
+                    } else {
+                        progressiveRender(displayImages);
+                    }
+                } else {
+                    render();
+                }
+                clearSelection();
+                showLoading(false);
+
+                // ★ 异步后台刷新：不阻塞用户，检查服务端是否有更新
+                if (!forceRefresh) {
+                    _refreshFolderCacheAsync(folderPath, normalizedFolder, signal, currentController);
+                }
+                return;
+            }
+
+            // ★ 缓存未命中：显示 loading 并从服务端加载
             showLoading(true);
             try {
                 // ★ 问题一修复：先清空图廊，避免显示旧内容
                 galleryGrid.innerHTML = '';
                 galleryGrid.className = 'gallery-grid';
-
-                const normalizedFolder = folderPath.replace(/\\/g, '/');
 
                 // ★ 问题三修复：如果 forceRefresh，先调用后端重新扫描
                 if (forceRefresh) {
@@ -2212,117 +2573,123 @@ const Gallery = (() => {
                             }
                             await WailsBridge.rescanFolder(rootPath);
                             console.log('[Gallery] 强制重新扫描完成:', rootPath);
+                            delete folderCacheMeta[normalizedFolder];
                         }
                     } catch (err) {
                         console.warn('[Gallery] 强制重新扫描失败:', err.message);
                     }
                 }
 
-                // ★ 缓存优化：如果 images 中已有该文件夹的图片且非强制刷新，直接使用缓存
-                const cachedImages = !forceRefresh ? images.filter(img => {
-                    if (!img._fromServer) return false;
+                console.log('[filterByFolder] 缓存未命中，调用 loadImagesFromServer:', normalizedFolder);
+                const firstResult = await loadImagesFromServer(folderPath, 0, FOLDER_FETCH_BATCH);
+
+                // ★ 修复：await 返回后立即检查中断，避免被中断的旧文件夹请求
+                //   覆盖新文件夹的 folderLoadTotal/folderLoadOffset/folderCacheMeta，
+                //   导致新文件夹分页状态错乱、触发错误的增量加载。
+                if (signal.aborted) {
+                    console.log('[Gallery] 文件夹切换已中断（首次加载后）');
+                    return;
+                }
+
+                let serverImages = firstResult.images;
+                folderLoadTotal = firstResult.total;
+                console.log('[filterByFolder] loadImagesFromServer 返回:', serverImages.length, '张, total:', folderLoadTotal);
+                console.log('[filterByFolder] 第一张图片数据:', serverImages[0] ? JSON.stringify(serverImages[0]) : '无');
+                // ★ 使用实际返回数量，而非固定批次大小，避免跳过数据
+                folderLoadOffset = serverImages.length;
+                isLoadingMoreFolder = false;
+
+                // ★ 保存缓存元数据
+                folderCacheMeta[normalizedFolder] = { total: firstResult.total };
+
+                // ★ 后端返回 0 张图片时
+                if (serverImages.length === 0 && await isServerRegisteredPath(folderPath)) {
+                    // ★ 修复：isServerRegisteredPath 也是 await，返回后需再次检查中断
+                    if (signal.aborted) {
+                        console.log('[Gallery] 文件夹切换已中断（isServerRegisteredPath 后）');
+                        return;
+                    }
+                    if (folderLoadTotal > 0) {
+                        // total > 0 说明后端知道有图但暂未返回 → 监听 scan:complete 事件而非轮询
+                        showScanningPlaceholder();
+                        await new Promise(resolve => {
+                            let resolved = false;
+                            const finish = () => {
+                                if (resolved) return;
+                                resolved = true;
+                                resolve();
+                            };
+                            // ★ 修复：不能在 finish 里调用 EventsOff('scan:complete')——
+                            //   它会连同初始化时注册的主处理器（252 行，负责扫描后自动刷新
+                            //   当前文件夹）一起移除，导致此后扫描完成不再自动刷新，只能手动刷新。
+                            //   这里靠 resolved 标志去重即可，残留监听器是无害的空操作。
+                            if (window.runtime && window.runtime.EventsOn) {
+                                window.runtime.EventsOn('scan:complete', (data) => {
+                                    const scanRoot = ((data && data.rootPath) || '').replace(/\\/g, '/');
+                                    const fp = (folderPath || '').replace(/\\/g, '/');
+                                    if (scanRoot === '' || fp === scanRoot || fp.startsWith(scanRoot + '/')) {
+                                        finish();
+                                    }
+                                });
+                            }
+                            // 兜底超时
+                            setTimeout(finish, 20000);
+                        });
+                        if (signal.aborted) return;
+                        const retryResult = await loadImagesFromServer(folderPath, 0, FOLDER_FETCH_BATCH);
+
+                        // ★ 修复：重试加载返回后也需检查中断
+                        if (signal.aborted) {
+                            console.log('[Gallery] 文件夹切换已中断（重试加载后）');
+                            return;
+                        }
+
+                        serverImages = retryResult.images;
+                        folderLoadTotal = retryResult.total;
+                        folderLoadOffset = serverImages.length;
+                        folderCacheMeta[normalizedFolder] = { total: retryResult.total };
+                        if (serverImages.length === 0) {
+                            showLoading(false);
+                            galleryGrid.innerHTML = `
+                                <div class="folder-empty">
+                                    <div class="folder-empty-icon"><span class="icon icon-warning"></span></div>
+                                    <p class="folder-empty-text">图片加载超时</p>
+                                    <p class="folder-empty-hint">请点击 <span class="icon icon-refresh"></span> 刷新按钮重试</p>
+                                </div>`;
+                            galleryGrid.className = 'gallery-grid';
+                            updateImageCount();
+                            return;
+                        }
+                    }
+                    // total === 0：后端无数据，不轮询；后台扫描完成后 scan:complete 事件会自动刷新
+                }
+
+                // ★ 问题一修复：检查是否已被中断
+                if (signal.aborted) {
+                    console.log('[Gallery] 文件夹切换已中断');
+                    return;
+                }
+
+                // 移除该 rootPath 旧的后端图片，避免重复
+                images = images.filter(img => {
+                    if (!img._fromServer) return true;
                     const imgRoot = (img.rootPath || '').replace(/\\/g, '/');
                     const imgFolder = (img.folder || '').replace(/\\/g, '/');
                     const imageFolderPath = imgFolder ? `${imgRoot}/${imgFolder}` : imgRoot;
-                    return imageFolderPath === normalizedFolder || imageFolderPath.startsWith(normalizedFolder + '/');
-                }) : [];
+                    return !(imageFolderPath === normalizedFolder || imageFolderPath.startsWith(normalizedFolder + '/'));
+                });
 
-                if (cachedImages.length > 0 && folderCacheMeta[normalizedFolder]) {
-                    // ★ 缓存命中：跳过服务端请求，直接用缓存图片渲染
-                    folderLoadTotal = folderCacheMeta[normalizedFolder].total;
-                    folderLoadOffset = cachedImages.length;
-                    isLoadingMoreFolder = false;
-                    console.log(`[Gallery] 缓存命中: ${normalizedFolder}，${cachedImages.length}/${folderLoadTotal} 张`);
-                } else {
-                    // ★ 缓存未命中（或强制刷新）：从后端加载
-                    if (forceRefresh) {
-                        delete folderCacheMeta[normalizedFolder];
-                    }
-
-                    console.log('[filterByFolder] 缓存未命中，调用 loadImagesFromServer:', normalizedFolder);
-                    const firstResult = await loadImagesFromServer(folderPath, 0, FOLDER_FETCH_BATCH);
-                    let serverImages = firstResult.images;
-                    folderLoadTotal = firstResult.total;
-                    console.log('[filterByFolder] loadImagesFromServer 返回:', serverImages.length, '张, total:', folderLoadTotal);
-                    console.log('[filterByFolder] 第一张图片数据:', serverImages[0] ? JSON.stringify(serverImages[0]) : '无');
-                    // ★ 使用实际返回数量，而非固定批次大小，避免跳过数据
-                    folderLoadOffset = serverImages.length;
-                    isLoadingMoreFolder = false;
-
-                    // ★ 保存缓存元数据
-                    folderCacheMeta[normalizedFolder] = { total: firstResult.total };
-
-                    // ★ 后端返回 0 张图片时
-                    if (serverImages.length === 0 && await isServerRegisteredPath(folderPath)) {
-                        if (folderLoadTotal > 0) {
-                            // total > 0 说明后端知道有图但暂未返回 → 监听 scan:complete 事件而非轮询
-                            showScanningPlaceholder();
-                            await new Promise(resolve => {
-                                let resolved = false;
-                                const finish = () => {
-                                    if (resolved) return;
-                                    resolved = true;
-                                    if (window.runtime && window.runtime.EventsOff) {
-                                        try { window.runtime.EventsOff('scan:complete'); } catch (e) {}
-                                    }
-                                    resolve();
-                                };
-                                if (window.runtime && window.runtime.EventsOn) {
-                                    window.runtime.EventsOn('scan:complete', (data) => {
-                                        const scanRoot = ((data && data.rootPath) || '').replace(/\\/g, '/');
-                                        const fp = (folderPath || '').replace(/\\/g, '/');
-                                        if (scanRoot === '' || fp === scanRoot || fp.startsWith(scanRoot + '/')) {
-                                            finish();
-                                        }
-                                    });
-                                }
-                                // 兜底超时
-                                setTimeout(finish, 20000);
-                            });
-                            if (signal.aborted) return;
-                            const retryResult = await loadImagesFromServer(folderPath, 0, FOLDER_FETCH_BATCH);
-                            serverImages = retryResult.images;
-                            folderLoadTotal = retryResult.total;
-                            folderLoadOffset = serverImages.length;
-                            folderCacheMeta[normalizedFolder] = { total: retryResult.total };
-                            if (serverImages.length === 0) {
-                                showLoading(false);
-                                galleryGrid.innerHTML = `
-                                    <div class="folder-empty">
-                                        <div class="folder-empty-icon"><span class="icon icon-warning"></span></div>
-                                        <p class="folder-empty-text">图片加载超时</p>
-                                        <p class="folder-empty-hint">请点击 <span class="icon icon-refresh"></span> 刷新按钮重试</p>
-                                    </div>`;
-                                galleryGrid.className = 'gallery-grid';
-                                updateImageCount();
-                                return;
-                            }
-                        }
-                        // total === 0：后端无数据，不轮询；后台扫描完成后 scan:complete 事件会自动刷新
-                    }
-
-                    // ★ 问题一修复：检查是否已被中断
-                    if (signal.aborted) {
-                        console.log('[Gallery] 文件夹切换已中断');
-                        return;
-                    }
-
-                    // 移除该 rootPath 旧的后端图片，避免重复
-                    images = images.filter(img => {
-                        if (!img._fromServer) return true;
-                        const imgRoot = (img.rootPath || '').replace(/\\/g, '/');
-                        const imgFolder = (img.folder || '').replace(/\\/g, '/');
-                        const imageFolderPath = imgFolder ? `${imgRoot}/${imgFolder}` : imgRoot;
-                        return !(imageFolderPath === normalizedFolder || imageFolderPath.startsWith(normalizedFolder + '/'));
-                    });
-
-                    if (serverImages.length > 0) {
-                        images.push(...serverImages);
-                    }
-
-                    // ★ 修复：images 数组被过滤/追加后，使路径索引失效
-                    invalidatePathIndex();
+                if (serverImages.length > 0) {
+                    // ★ dedup: prevent duplicate IDs
+                    const existingIDs = new Set(); for (const img of images) { if (img.id) existingIDs.add(img.id); }
+                    for (const img of serverImages) { if (img.id && !existingIDs.has(img.id)) { images.push(img); existingIDs.add(img.id); } };
                 }
+
+                // ★ 修复：images 数组被过滤/追加后，使路径索引失效
+                invalidatePathIndex();
+
+                // ★ global dedup: remove any remaining duplicate entries by id
+                images = _dedupImages(images);
 
                 // ★ 问题一修复：再次检查是否已被中断
                 if (signal.aborted) {
@@ -2366,8 +2733,16 @@ const Gallery = (() => {
         applyCurrentFilter({ includeDescendants });
         sortImages();
         
+        await lazyLoadFolder(folderPath, isFilteringActive ? filteredImages : images);
+
+        // ★ 修复：lazyLoadFolder 会多轮 setTimeout 让出主线程，期间用户可能已切换文件夹。
+        //   过期续体必须放弃，并用"当前"数据重新取 displayImages，否则会用旧文件夹的数组
+        //   重新渲染，覆盖新文件夹的图廊（表现为显示其它文件夹内容，刷新才恢复）。
+        if (signal.aborted || folderAbortController !== currentController) {
+            console.log('[filterByFolder] 已切换文件夹，放弃本地路径过期续体:', folderPath);
+            return;
+        }
         const displayImages = isFilteringActive ? filteredImages : images;
-        await lazyLoadFolder(folderPath, displayImages);
 
         if (displayImages.length > 100) {
             if (currentLayout === 'masonry') {
@@ -2389,6 +2764,11 @@ const Gallery = (() => {
     }
 
     async function filterByTag(tagId) {
+        // ★ 修复：进入标签视图前中断进行中的文件夹加载，
+        //   否则旧 filterByFolder 续体会在标签视图上渲染文件夹内容（显示错乱）
+        abortFolderSwitch();
+        cancelProgressiveRender();
+
         currentTagFilter = tagId;
         currentFavoriteFilter = false;
         currentFolderFilter = null;
@@ -2419,9 +2799,15 @@ const Gallery = (() => {
                 return;
             }
 
+            // ★ 记录标签分页状态，供滚动增量加载（标签结果超过首屏数量时按路径分批拉取）
+            tagPaths = taggedPaths;
+            tagLoadTotal = taggedPaths.length;
+            tagLoadOffset = 0;
+
             // ★ 精准查询：只向 Go 请求标签关联的图片路径，而非全量
             const firstResult = await loadImagesByPaths(taggedPaths, 0, FOLDER_LOOKAHEAD);
             const tagImages = firstResult.images;
+            tagLoadOffset = tagImages.length;
 
             // 移除已有 server 同路径旧条目，避免重复；保留非 server 图片
             const pathSet = new Set(taggedPaths);
@@ -2461,6 +2847,10 @@ const Gallery = (() => {
             render();
             return;
         }
+        // ★ 修复：进入收藏视图前中断进行中的文件夹加载（同 filterByTag）
+        abortFolderSwitch();
+        cancelProgressiveRender();
+
         currentTagFilter = null;
         currentFavoriteFilter = true;
         currentFolderFilter = null;
@@ -2475,19 +2865,25 @@ const Gallery = (() => {
         renderedRange = { start: -1, end: -1 };
 
         try {
-            const favPaths = await Storage.getAllFavorites();
+            const favPathList = await Storage.getAllFavorites();
 
-            if (favPaths.length === 0) {
+            if (favPathList.length === 0) {
                 filteredImages = [];
                 render();
                 return;
             }
 
-            // ★ 精准查询：只向 Go 请求收藏的图片路径
-            const firstResult = await loadImagesByPaths(favPaths, 0, FOLDER_LOOKAHEAD);
-            const favImages = firstResult.images;
+            // ★ 记录收藏分页状态，供滚动增量加载
+            favPaths = favPathList;
+            favLoadTotal = favPathList.length;
+            favLoadOffset = 0;
 
-            const pathSet = new Set(favPaths);
+            // ★ 精准查询：只向 Go 请求收藏的图片路径
+            const firstResult = await loadImagesByPaths(favPathList, 0, FOLDER_LOOKAHEAD);
+            const favImages = firstResult.images;
+            favLoadOffset = favImages.length;
+
+            const pathSet = new Set(favPathList);
             images = images.filter(img => !(img._fromServer && pathSet.has(img.path)));
 
             if (favImages.length > 0) {
@@ -2518,6 +2914,14 @@ const Gallery = (() => {
         currentTagFilter = null;
         currentFavoriteFilter = false;
         isFilteringActive = false;
+        // ★ 重置标签分页状态
+        tagPaths = [];
+        tagLoadTotal = 0;
+        tagLoadOffset = 0;
+        // ★ 重置收藏分页状态
+        favPaths = [];
+        favLoadTotal = 0;
+        favLoadOffset = 0;
         // ★ 不复制数组，直接引用
         filteredImages = images;
         sortImages();
@@ -2591,7 +2995,22 @@ const Gallery = (() => {
         return div.innerHTML;
     }
 
+
+    // ★ 按 ID 去重：清理已存在的重复图片条目
+    function _dedupImages(arr) {
+        if (!Array.isArray(arr) || arr.length === 0) return arr;
+        const seen = new Set();
+        return arr.filter(item => {
+            const key = item.id || item.path;
+            if (!key || seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+    }
     function render() {
+        // ★ auto-dedup: remove duplicate entries by id/path
+        images = _dedupImages(images);
+        filteredImages = _dedupImages(filteredImages);
         const displayImages = isFilteringActive ? filteredImages : images;
         console.log('[render] 被调用，displayImages.length:', displayImages.length, 'isFilteringActive:', isFilteringActive);
 
@@ -3432,6 +3851,19 @@ const Gallery = (() => {
                 info.appendChild(folder);
             }
 
+            // ★ 搜索模式：显示命中片段（命中词前后截取 + 高亮），帮助用户了解为何命中
+            if (imgData._searchResult && imgData.prompt) {
+                const kws = (typeof SearchModule !== 'undefined' && SearchModule.getCurrentKeywords) ? SearchModule.getCurrentKeywords() : [];
+                const snippet = kws.length > 0 ? buildSearchSnippet(imgData.prompt, kws) : '';
+                if (snippet) {
+                    const sn = document.createElement('div');
+                    sn.className = 'card-snippet';
+                    sn.title = imgData.prompt;
+                    sn.innerHTML = snippet;
+                    info.appendChild(sn);
+                }
+            }
+
             // 隐藏 resolution 和 promptBadge（list 模式不需要）
             resolution.style.display = 'none';
         }
@@ -3503,7 +3935,7 @@ const Gallery = (() => {
         card.addEventListener('contextmenu', (e) => {
             e.preventDefault();
             if (typeof ImageContextMenu !== 'undefined') {
-                ImageContextMenu.show(e.clientX, e.clientY, imgData.path, imgData.rootPath, imgData.folder);
+                ImageContextMenu.show(e.clientX, e.clientY, imgData.path, imgData.rootPath, imgData.folder, imgData.url);
             }
         });
 
@@ -3541,7 +3973,8 @@ const Gallery = (() => {
             }
             if (card._infoPromptBadge && showPromptCount) {
                 getPromptCount(imgData.path).then(count => {
-                    if (count >= 2 && card._infoPromptBadge && card.isConnected) {
+                    // ★ 显示 ≥1 的提示词版本数量（原为 ≥2，1 个版本也值得显示）
+                    if (count >= 1 && card._infoPromptBadge && card.isConnected) {
                         card._infoPromptBadge.textContent = count;
                         card._infoPromptBadge.style.display = '';
                     }
@@ -3747,13 +4180,17 @@ const Gallery = (() => {
                     item.title = tag.name;
                     const htmlBox = document.createElement('span');
                     htmlBox.style.cssText = 'display:inline-flex;align-items:center;justify-content:center;width:' + w + 'px;height:' + h + 'px;overflow:hidden;vertical-align:middle;border:1px solid var(--border-color);border-radius:2px;flex-shrink:0;';
+                    const isFill = !!tag.htmlFill;
                     const inner = document.createElement('div');
-                    inner.style.cssText = 'display:inline-block;transform-origin:center center;';
+                    inner.style.cssText = isFill
+                        ? 'width:100%;height:100%;transform-origin:center center;'
+                        : 'display:inline-block;transform-origin:center center;';
+                    if (isFill) htmlBox.style.position = 'relative';
                     htmlBox.appendChild(inner);
                     const scopeId = 'dd-tag-scope-' + tag.id;
                     htmlBox.setAttribute('data-tag-scope', scopeId);
-                    let processedCode = (typeof WailsBridge !== 'undefined' && WailsBridge.fixRelativeUrls)
-                        ? WailsBridge.fixRelativeUrls(tag.htmlCode || '') : (tag.htmlCode || '');
+                        let processedCode = (typeof WailsBridge !== 'undefined' && WailsBridge.prepareHtmlTagCode)
+                            ? WailsBridge.prepareHtmlTagCode(tag.htmlCode || '', tag.htmlImageUrls) : (tag.htmlCode || '');
                     let scopedHtml = processedCode.replace(/<style([^>]*)>/g, (_, attrs) => {
                         return '<style' + attrs + ' data-scope="' + scopeId + '">';
                     });
@@ -3761,22 +4198,23 @@ const Gallery = (() => {
                     inner.querySelectorAll('style[data-scope]').forEach(styleEl => {
                         const raw = styleEl.textContent;
                         if (!raw) return;
-                        const scoped = raw.replace(/([^{}]*\{)/g, (rule) => {
-                            const trimmed = rule.trim();
-                            if (/^@|^\d+(\.\d+)?%|^(from|to)\b/i.test(trimmed)) return rule;
-                            if (/\b(html|body|:root)\b|\*/.test(trimmed)) return '';
-                            return rule.replace(/(^|,)\s*/g, (sep) => {
-                                return sep + '[data-tag-scope="' + scopeId + '"] ';
-                            });
-                        });
+                        let scoped = (typeof WailsBridge !== 'undefined' && WailsBridge.scopeHtmlTagCss)
+                            ? WailsBridge.scopeHtmlTagCss(raw, scopeId, isFill) : raw;
                         styleEl.textContent = (typeof WailsBridge !== 'undefined' && WailsBridge.fixRelativeUrls) ? WailsBridge.fixRelativeUrls(scoped) : scoped;
                         styleEl.removeAttribute('data-scope');
                     });
                     inner.querySelectorAll('script').forEach(s => {
                         try { eval(s.textContent); } catch(e) {}
                     });
-                    // 等比缩放
                     requestAnimationFrame(() => {
+                        if (isFill) {
+                            // ★ 填满容器模式：自适应缩放内容到容器内（图片加载后自动重算）
+                            if (typeof WailsBridge !== 'undefined' && WailsBridge.fitHtmlTagContentAfterImages) {
+                                WailsBridge.fitHtmlTagContentAfterImages(inner, w, h);
+                            }
+                            return;
+                        }
+                        // 等比缩放
                         const rect = inner.getBoundingClientRect();
                         const nw = rect.width || w;
                         const nh = rect.height || h;
@@ -3936,6 +4374,73 @@ const Gallery = (() => {
         if (card) {
             card.scrollIntoView({ block: 'center', behavior: 'instant' });
         }
+    }
+
+    // 在当前视图数据中查找图片索引（过滤视图用 filteredImages，否则用 images）
+    function findImageIndexInView(path) {
+        const arr = isFilteringActive ? filteredImages : images;
+        for (let i = 0; i < arr.length; i++) {
+            if (arr[i].path === path) return i;
+        }
+        // 过滤视图中没有 → 回退到全量已加载池
+        if (isFilteringActive) {
+            for (let i = 0; i < images.length; i++) {
+                if (images[i].path === path) return i;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * 定位并滚动到指定图片：目标图未加载时逐批加载到它，再按当前布局滚动到其位置并高亮。
+     * 供侧边栏预览图点击"追踪图片"使用。
+     * @param {string} path - 图片完整路径
+     * @returns {Promise<boolean>} 是否定位成功
+     */
+    async function revealImage(path) {
+        if (!path) return false;
+        console.log('[reveal] 定位图片, path =', path, '| 当前文件夹 =', currentFolderFilter, '| 筛选 =', isFilteringActive, '| 已加载 =', images.length, '| 视图中 =', (isFilteringActive ? filteredImages : images).length);
+        // 1. 确保目标图已加载（未加载则触发分页加载，直到出现在当前视图或没有更多）
+        let idx = findImageIndexInView(path);
+        let guard = 0;
+        while (idx < 0 && folderLoadTotal > 0 && folderLoadOffset < folderLoadTotal && guard < 200) {
+            const before = isFilteringActive ? filteredImages.length : images.length;
+            await loadMoreFolderImages();
+            const after = isFilteringActive ? filteredImages.length : images.length;
+            if (after === before) {
+                // 本次未加载到新数据（可能在途/被守卫跳过）→ 稍等再试
+                await new Promise(resolve => setTimeout(resolve, 60));
+            }
+            idx = findImageIndexInView(path);
+            guard++;
+        }
+        console.log('[reveal] 查找结束, idx =', idx, '| 已加载 =', images.length, '| 还有更多 =', folderLoadTotal > 0 && folderLoadOffset < folderLoadTotal);
+        if (idx < 0) {
+            // 数据里没有（可能不在当前筛选视图）→ 退化为直接滚动已渲染卡片
+            scrollToImage(path);
+            return false;
+        }
+        // 2. 按当前布局把索引换算成滚动位置（目标行上方留 ~80px 余量）
+        let top = 0;
+        if (currentLayout === 'grid') {
+            const cols = getColumnCount();
+            const row = Math.floor(idx / cols);
+            top = Math.max(0, row * ((thumbnailSize + 36) + 8) - 80);
+        } else if (masonryLayout && masonryLayout[idx] && masonryLayout[idx].y != null) {
+            top = Math.max(0, masonryLayout[idx].y - 80);
+        } else if (galleryScroll) {
+            // 兜底：按已加载比例估算
+            const arr = isFilteringActive ? filteredImages : images;
+            const ratio = arr.length > 1 ? idx / (arr.length - 1) : 0;
+            top = ratio * galleryScroll.scrollHeight;
+        }
+        scrollTop = top;
+        if (galleryScroll) galleryScroll.scrollTop = top;
+        // 3. 等一帧让虚拟滚动渲染目标区域后，精确居中并高亮
+        await new Promise(resolve => requestAnimationFrame(resolve));
+        render();
+        scrollToImage(path);
+        return true;
     }
 
     function updateSelectionUI() {
@@ -4449,6 +4954,22 @@ const Gallery = (() => {
                         console.warn('[Gallery] Go ParseMetadata 失败:', e.message);
                     }
                 }
+            } else if (typeof WailsBridge !== 'undefined' && !WailsBridge.isWails()) {
+                // ★ 浏览器/局域网模式：通过 LAN 服务的 /api/metadata 接口解析（Go 端本地读文件头部）
+                console.log('[Gallery] resolveMetadataOnDemand: 通过 /api/metadata 解析, path:', imgData.path);
+                try {
+                    const resp = await fetch('/api/metadata?path=' + encodeURIComponent(imgData.path));
+                    if (resp.ok) {
+                        const m = await resp.json();
+                        if (m && m.success !== false && (m.prompt || Object.keys(m.params || {}).length > 0 || Object.keys(m.raw || {}).length > 0)) {
+                            meta = m;
+                        } else {
+                            meta = null;
+                        }
+                    }
+                } catch (e) {
+                    console.warn('[Gallery] /api/metadata 解析失败:', e.message);
+                }
             } else {
                 console.warn('[Gallery] resolveMetadataOnDemand: 无法获取图片数据', 'url:', imgData.url, '_fromServer:', imgData._fromServer, 'file:', !!imgData.file);
                 return null;
@@ -4536,6 +5057,7 @@ const Gallery = (() => {
             rootId: r.rootId,
             name: r.name,
             displayName: r.displayName || r.name,
+            addedAt: r.addedAt || '',
             imageCount: images.filter(img => img.rootId === r.rootId).length
         }));
     }
@@ -4567,6 +5089,13 @@ const Gallery = (() => {
      * 现在使用 markDirty 机制自动保存，不再需要手动 await
      */
     async function saveImportedRootsToServer() {
+        // ★ 修复：启动时 importedRoots 尚未从后端恢复前不保存。
+        //   否则会把不完整的列表全量提交给后端（配合旧版 SaveRootsWithMeta 的全量替换，
+        //   会误删已注册文件夹——表现为"导入后重启文件夹消失"）。
+        if (!importedRootsLoaded) {
+            console.log('[Gallery] importedRoots 尚未加载完成，跳过本次保存');
+            return;
+        }
         try {
             const rootsData = importedRoots.map(r => ({
                 path: r.rootId,
@@ -4613,7 +5142,8 @@ const Gallery = (() => {
                                 name: r.name || r.Name || '',
                                 handleName: r.handleName || r.HandleName || '',
                                 displayName: r.displayName || r.DisplayName || r.name || r.Name || '',
-                                folderType: r.folderType || r.FolderType || ''
+                                folderType: r.folderType || r.FolderType || '',
+                                addedAt: r.addedAt || r.AddedAt || ''
                             });
                             addedCount++;
                         }
@@ -4621,6 +5151,7 @@ const Gallery = (() => {
                     if (addedCount > 0) {
                         console.log(`[Gallery] 从 SQLite 恢复了 ${addedCount} 个导入文件夹信息`);
                     }
+                    importedRootsLoaded = true;
                     return roots;
                 }
             }
@@ -4669,15 +5200,61 @@ const Gallery = (() => {
                 if (addedCount > 0) {
                     console.log(`[Gallery] 从后端恢复了 ${addedCount} 个导入文件夹信息`);
                 }
+                importedRootsLoaded = true;
                 return saved;
             }
         } catch (err) {
             console.warn('[Gallery] 从后端加载导入文件夹信息:', err.message);
         }
+        importedRootsLoaded = true;
         return [];
     }
 
     // ==================== 搜索结果显示 ====================
+
+    /**
+     * 生成搜索命中片段 HTML：定位第一个命中词，截取前后 ±40 字符并高亮
+     * @param {string} text - 提示词原文
+     * @param {string[]} keywords - 命中词列表
+     * @returns {string} 转义并高亮后的 HTML 片段，无命中时返回空串
+     */
+    function buildSearchSnippet(text, keywords) {
+        if (!text || !keywords || keywords.length === 0) return '';
+        let idx = -1;
+        let kwLen = 0;
+        const lower = text.toLowerCase();
+        for (const kw of keywords) {
+            if (!kw) continue;
+            const i = lower.indexOf(kw.toLowerCase());
+            if (i >= 0 && (idx === -1 || i < idx)) {
+                idx = i;
+                kwLen = kw.length;
+            }
+        }
+        if (idx < 0) return '';
+        const start = Math.max(0, idx - 40);
+        const end = Math.min(text.length, idx + kwLen + 40);
+        let snippet = text.slice(start, end);
+        if (start > 0) snippet = '…' + snippet;
+        if (end < text.length) snippet = snippet + '…';
+
+        // 转义后高亮
+        const div = document.createElement('div');
+        div.textContent = snippet;
+        let html = div.innerHTML;
+        for (const kw of keywords) {
+            if (!kw) continue;
+            const d = document.createElement('div');
+            d.textContent = kw;
+            const esc = d.innerHTML;
+            if (!esc) continue;
+            try {
+                html = html.replace(new RegExp('(' + esc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi'),
+                    '<mark class="search-highlight">$1</mark>');
+            } catch (e) { /* 非法正则忽略 */ }
+        }
+        return html;
+    }
 
     /**
      * 显示搜索结果（由 SearchModule 调用）
@@ -4756,9 +5333,31 @@ const Gallery = (() => {
         if (currentLayout === 'masonry') {
             // ★ 追加前重算整体布局，更新容器高度，确保滚动条范围正确
             const allDisplayImages = isFilteringActive ? filteredImages : images;
+            // 记录追加前的布局坐标，用于检测重算是否移动了旧卡片
+            const oldLayout = masonryLayout;
+            const oldCount = oldLayout.length;
             computeMasonryLayout(allDisplayImages);
             galleryGrid.style.height = masonryTotalHeight + 'px';
             galleryGrid.style.minHeight = '';
+
+            // ★ 修复：若重算导致旧卡片位置变化（新增图片改变了行划分），
+            //   旧卡片 DOM 仍是旧坐标，直接追加会错位 → 全量重渲染。
+            //   仅当旧卡片坐标全部未变时才增量追加，保证滚动时布局稳定不跳动。
+            let layoutStable = oldCount === 0 || (oldCount <= masonryLayout.length);
+            if (layoutStable && oldCount > 0) {
+                for (let i = 0; i < oldCount; i++) {
+                    const a = oldLayout[i], b = masonryLayout[i];
+                    if (!b || a.x !== b.x || a.y !== b.y || a.row !== b.row) {
+                        layoutStable = false;
+                        break;
+                    }
+                }
+            }
+            if (!layoutStable) {
+                renderMasonry(allDisplayImages);
+                updateImageCount();
+                return;
+            }
 
             // 只为新增图片创建卡片（布局坐标已在 masonryLayout 末尾）
             const startIdx = allDisplayImages.length - newImages.length;
@@ -4794,9 +5393,29 @@ const Gallery = (() => {
         } else if (currentLayout === 'pinterest') {
             // Pinterest：重算整体布局，更新容器高度
             const allDisplayImages = isFilteringActive ? filteredImages : images;
+            const oldPinterestLayout = pinterestLayout;
+            const oldPCount = oldPinterestLayout.length;
             computePinterestLayout(allDisplayImages);
             galleryGrid.style.height = pinterestTotalHeight + 'px';
             galleryGrid.style.minHeight = '';
+
+            // ★ 修复：与 masonry 一致——若重算改变了旧卡片坐标则全量重渲染，
+            //   否则增量追加。避免增量加载后旧卡片错位导致的滚动跳动。
+            let pLayoutStable = oldPCount === 0 || oldPCount <= pinterestLayout.length;
+            if (pLayoutStable && oldPCount > 0) {
+                for (let i = 0; i < oldPCount; i++) {
+                    const a = oldPinterestLayout[i], b = pinterestLayout[i];
+                    if (!b || a.x !== b.x || a.y !== b.y) {
+                        pLayoutStable = false;
+                        break;
+                    }
+                }
+            }
+            if (!pLayoutStable) {
+                renderPinterest(allDisplayImages);
+                updateImageCount();
+                return;
+            }
 
             const startIdx = allDisplayImages.length - newImages.length;
             const newLayoutItems = pinterestLayout.slice(startIdx);
@@ -4866,6 +5485,8 @@ const Gallery = (() => {
         mergeServerImages,            // ★ 将后端图片合并到全局 images 数组
         refreshRootFromServer,        // ★ 以"重新导入"方式刷新根目录
         refreshThumbGen,              // ★ 清缓存后刷新缩略图版本号
+        makeThumbURL,                 // ★ 缩略图 URL 构造（侧边栏子文件夹预览复用同一方法）
+        ensureBaseURLs,               // ★ 确保 http 基地址已初始化（侧边栏预览复用）
         restoreFromDirectoryHandles,
         saveImportedRootsToServer,    // ★ 跨浏览器持久化保存
         loadImportedRootsFromServer,  // ★ 跨浏览器持久化恢复
@@ -4892,6 +5513,7 @@ const Gallery = (() => {
         getSelectedImages,
         clearSelection,
         scrollToImage,
+        revealImage,              // ★ 定位并滚动到指定图片（侧边栏预览点击追踪用）
         setActiveImage,
         batchAddTag,
         batchRemoveTag,

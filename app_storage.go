@@ -221,8 +221,8 @@ func (a *App) loadFolderIndexLight() {
 		return
 	}
 	a.mu.Lock()
-	a.images = make(map[string]*ImageEntry)     // 启动时空
-	a.folderIndex = make(map[string][]string)   // key 存在，value=nil 标记"未加载"
+	a.images = make(map[string]*ImageEntry)   // 启动时空
+	a.folderIndex = make(map[string][]string) // key 存在，value=nil 标记"未加载"
 	a.folderLoaded = make(map[string]bool)
 	a.folderCount = make(map[string]int)
 	if a.folderLRU == nil {
@@ -492,35 +492,33 @@ func (a *App) saveImageIndexForRoot(rootPath string) {
 		return
 	}
 	normalized := strings.ReplaceAll(rootPath, "\\", "/")
-	go a.saveImageIndexByRoot(normalized)
+	// ★ sync: update image_cache before scan:complete
+	a.saveImageIndexByRoot(normalized)
 }
 
 func (a *App) saveImageIndexByRoot(rootPath string) {
 	a.mu.RLock()
-	// Collect all image IDs under this root from folderIndex
-	imageIDs := make(map[string]bool)
-	for folderKey, ids := range a.folderIndex {
-		if folderKey == rootPath || strings.HasPrefix(folderKey, rootPath+"/") {
-			for _, id := range ids {
-				imageIDs[id] = true
-			}
-		}
-	}
-	// Build entries only for images belonging to this root
-	entries := make([]database.ImageCacheEntry, 0, len(imageIDs))
-	for id := range imageIDs {
-		if img, ok := a.images[id]; ok {
+	// ★ 修复：从权威的内存 a.images 直接按 RootPath 收集，而不是经 folderIndex。
+	//   重启后 loadFolderIndexLight 会把 folderIndex 的值设为 nil（"未加载"标记），
+	//   旧逻辑收集不到任何 ID → SaveImageCacheByRoot 的 DELETE-then-replace 会把
+	//   image_cache 里已落盘的图片删光再只写回残缺子集 → 计数对不上总数。
+	//   扫描/增量刷新都会先把该根目录全部文件放进 a.images 再落库，因此这里
+	//   收集到的就是该根目录的完整数据。
+	normalizedRoot := strings.ReplaceAll(rootPath, "\\", "/")
+	entries := make([]database.ImageCacheEntry, 0, 256)
+	for _, img := range a.images {
+		if strings.ReplaceAll(img.RootPath, "\\", "/") == normalizedRoot {
 			entries = append(entries, database.ImageCacheEntry{
 				ID: img.ID, Path: img.Path, Name: img.Name, Size: img.Size,
 				LastModified: img.LastModified, CreatedAt: img.CreatedAt,
 				Folder: img.Folder, RootPath: img.RootPath,
-				Width: img.Width, Height: img.Height, IsVideo: img.IsVideo,
+				Width: img.Width, Height: img.Height, IsVideo: img.IsVideo, ContentHash: img.ContentHash,
 			})
 		}
 	}
 	a.mu.RUnlock()
 	if len(entries) == 0 {
-		fmt.Printf("[增量存储] %s: 无图片数据，跳过\n", rootPath)
+		fmt.Printf("[增量存储] %s: 无图片数据，跳过（不清空现有缓存）\n", rootPath)
 		return
 	}
 	if err := a.imageDB.SaveImageCacheByRoot(rootPath, entries); err != nil {
@@ -539,7 +537,7 @@ func (a *App) saveImageIndexToSQLite() {
 			ID: img.ID, Path: img.Path, Name: img.Name, Size: img.Size,
 			LastModified: img.LastModified, CreatedAt: img.CreatedAt,
 			Folder: img.Folder, RootPath: img.RootPath,
-			Width: img.Width, Height: img.Height, IsVideo: img.IsVideo,
+			Width: img.Width, Height: img.Height, IsVideo: img.IsVideo, ContentHash: img.ContentHash,
 		})
 		if len(entries) >= batchSize {
 			a.imageDB.SaveImageCacheBatch(entries)
@@ -558,7 +556,6 @@ func (a *App) saveRegisteredRoots() {
 	}
 	a.mu.RLock()
 	var importedRoots []database.ImportedRoot
-	now := time.Now().Format(time.RFC3339)
 	for r := range a.registeredRoots {
 		ft := a.folderTypes[r]
 		name := filepath.Base(r)
@@ -566,7 +563,9 @@ func (a *App) saveRegisteredRoots() {
 			Path:       r,
 			Name:       name,
 			FolderType: ft,
-			AddedAt:    now,
+			// ★ AddedAt 留空：MergeRoots 对已存在记录保留原 added_at，
+			//   仅对新建记录用当前时间，避免每次保存都把添加日期重置为今天。
+			AddedAt: "",
 		}
 		importedRoots = append(importedRoots, ir)
 	}
@@ -576,6 +575,67 @@ func (a *App) saveRegisteredRoots() {
 	if err := a.userDataDB.MergeRoots(importedRoots); err != nil {
 		fmt.Printf("[错误] 保存注册目录到 SQLite 失败: %v\n", err)
 	}
+}
+
+// ==================== 扫描状态标记（防中断丢失/计数半成品） ====================
+
+// 扫描状态持久化在 userDataDir/scan-state.json：
+// 扫描开始时同步写入"扫描中"，完成后清除。若程序在扫描中途退出，
+// 标记残留 → 下次启动 ensureImageIndex 会补扫该根目录，
+// 避免"导入中途退出导致文件夹消失或计数对不上总数"。
+
+const scanStateFileName = "scan-state.json"
+
+type scanStateFile struct {
+	Scanning map[string]bool `json:"scanning"`
+}
+
+func (a *App) scanStatePath() string {
+	return filepath.Join(a.userDataDir, scanStateFileName)
+}
+
+func (a *App) loadScanState() map[string]bool {
+	data, err := os.ReadFile(a.scanStatePath())
+	if err != nil {
+		return map[string]bool{}
+	}
+	var s scanStateFile
+	if err := json.Unmarshal(data, &s); err != nil || s.Scanning == nil {
+		return map[string]bool{}
+	}
+	return s.Scanning
+}
+
+// setScanInProgress 原子持久化扫描状态。扫描开始前同步调用，完成后清除。
+func (a *App) setScanInProgress(rootPath string, inProgress bool) {
+	state := a.loadScanState()
+	if inProgress {
+		state[rootPath] = true
+	} else {
+		delete(state, rootPath)
+	}
+	if len(state) == 0 {
+		os.Remove(a.scanStatePath())
+		return
+	}
+	if b, err := json.Marshal(scanStateFile{Scanning: state}); err == nil {
+		tmp := a.scanStatePath() + ".tmp"
+		if os.WriteFile(tmp, b, 0644) == nil {
+			os.Rename(tmp, a.scanStatePath())
+		}
+	}
+}
+
+// getInterruptedScans 返回上次中断（标记残留）的扫描根目录
+func (a *App) getInterruptedScans() []string {
+	state := a.loadScanState()
+	var roots []string
+	for root, scanning := range state {
+		if scanning {
+			roots = append(roots, root)
+		}
+	}
+	return roots
 }
 
 // migrateUserData 一次性迁移：从 user-data.json 迁移数据到 SQLite
@@ -712,8 +772,20 @@ func (a *App) writeUserDataFile(data map[string]interface{}) error {
 	if err != nil {
 		return fmt.Errorf("JSON 序列化失败: %w", err)
 	}
-	if err := os.WriteFile(a.userDataFile, bytes, 0644); err != nil {
-		return fmt.Errorf("写入文件失败: %w", err)
+	// ★ 原子写入：先写临时文件再替换，避免写入中途崩溃/断电/磁盘满导致文件损坏。
+	// ★ 覆盖前自动备份上一版到 user-data.json.bak，任何异常覆盖后都能手动恢复。
+	tmpPath := a.userDataFile + ".tmp"
+	if err := os.WriteFile(tmpPath, bytes, 0644); err != nil {
+		return fmt.Errorf("写入临时文件失败: %w", err)
+	}
+	if _, err := os.Stat(a.userDataFile); err == nil {
+		backupPath := a.userDataFile + ".bak"
+		if old, err := os.ReadFile(a.userDataFile); err == nil {
+			_ = os.WriteFile(backupPath, old, 0644)
+		}
+	}
+	if err := os.Rename(tmpPath, a.userDataFile); err != nil {
+		return fmt.Errorf("替换文件失败: %w", err)
 	}
 	return nil
 }

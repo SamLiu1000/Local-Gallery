@@ -35,6 +35,14 @@ const WailsBridge = (() => {
         return getApp().SelectFolder();
     }
 
+    // ★ 选择缩略图数据库文件（.db）——直接选文件而非文件夹，路径天然正确
+    async function selectThumbDBFile() {
+        if (!isWailsEnv) {
+            throw new Error('仅桌面环境支持选择缩略图数据库文件');
+        }
+        return getApp().SelectThumbDBFile();
+    }
+
     async function scanFolder(path, folderType = 'ai', quick = true) {
         if (!isWailsEnv) {
             const response = await fetch('/api/scan-folder', {
@@ -449,6 +457,10 @@ const WailsBridge = (() => {
     function fixRelativeUrls(htmlOrCssText) {
         if (!htmlOrCssText) return htmlOrCssText;
         let result = htmlOrCssText;
+        // ★ 归一化：本程序的图片/缩略图服务器端口每次启动都会变（127.0.0.1:随机端口）。
+        //   先把"任意端口的完整链接"还原成相对路径（/image/、/thumb/），
+        //   再统一补上当前端口，保证重启后已保存的旧链接（含旧端口）仍然可用。
+        result = result.replace(/(https?:\/\/)(127\.0\.0\.1|localhost)(:\d+)?(\/image\/|\/thumb\/)/gi, '$4');
         if (_imageBaseURL) {
             // CSS url(/image/...) 和 url("/image/...") 和 url('/image/...')
             result = result.replace(/url\((['"]?)\/image\//g, 'url($1' + _imageBaseURL + '/image/');
@@ -462,6 +474,320 @@ const WailsBridge = (() => {
             result = result.replace(/(src|href)=(['"])\/thumb\//g, '$1=$2' + _httpBaseURL + '/thumb/');
         }
         return result;
+    }
+
+    /**
+     * ★ HTML 标签 CSS 作用域化（供侧栏/详情/画廊/预览共用）。
+     * 修复两个兼容性 bug：
+     * 1. @keyframes 名全局冲突：不同标签用同名动画会互相覆盖。
+     *    这里把 @keyframes 名加作用域后缀重命名，并同步替换 animation/animation-name 引用。
+     * 2. `*` 通用选择器被直接删除：改为作用域化（[data-tag-scope] *），保留其效果。
+     * html/body/:root 仍剔除，避免污染整个页面。
+     */
+    // scopeHtmlTagCss(raw, scopeId, fillMode)
+    // fillMode=true（填满容器模式）：html/body/:root 视为"标签容器本身"，
+    // 让整页式 CSS（html/body/scene 的 100% 高度链）在标签的固定盒子里成立。
+    function scopeHtmlTagCss(raw, scopeId, fillMode) {
+        if (!raw) return raw;
+
+        // 0. 先剔除 CSS 注释：注释紧贴在 @keyframes/@media 前面时，会与 at 规则
+        //    被规则分割正则当作同一个"选择器"处理，导致 @keyframes 名被整体当作
+        //    普通选择器前缀化而语法损坏（对应动画静默失效）。注释不影响渲染语义。
+        raw = raw.replace(/\/\*[\s\S]*?\*\//g, ' ');
+
+        // 1. 收集并重命名 @keyframes（加作用域后缀，避免全局冲突）
+        const kfMap = {}; // 原始名 → 作用域名
+        let result = raw.replace(/@keyframes\s+([A-Za-z0-9_-]+)/g, (m, name) => {
+            const scopedName = name + '-' + scopeId;
+            kfMap[name] = scopedName;
+            return '@keyframes ' + scopedName;
+        });
+
+        // 2. 替换 animation / animation-name 中引用的 keyframes 名
+        const kfNames = Object.keys(kfMap);
+        if (kfNames.length > 0) {
+            result = result.replace(/animation\s*:\s*([^;{}]+)/g, (m, list) => {
+                let out = list;
+                for (const name of kfNames) {
+                    out = out.replace(new RegExp('\\b' + name + '\\b', 'g'), kfMap[name]);
+                }
+                return 'animation: ' + out;
+            });
+            result = result.replace(/animation-name\s*:\s*([^;{}]+)/g, (m, v) => {
+                let out = v;
+                for (const name of kfNames) {
+                    out = out.replace(new RegExp('\\b' + name + '\\b', 'g'), kfMap[name]);
+                }
+                return 'animation-name: ' + out;
+            });
+        }
+
+        // 3. 作用域化普通规则（@规则与 keyframes 步骤保留；
+        //    html/body/:root 也作用域化——在标签容器内永远不会匹配，既避免污染页面
+        //    又保持 CSS 语法完整（不能直接剔除，否则会留下孤立的 {…} 破坏后续规则）；
+        //    `*` 作用域化为 [data-tag-scope] *，保留其效果）
+        result = result.replace(/([^{}]*\{)/g, (rule) => {
+            const trimmed = rule.trim();
+            if (/^@|^\d+(\.\d+)?%|^(from|to)\b/i.test(trimmed)) return rule;
+            if (fillMode) {
+                // 填满容器：html/body/:root → 容器本身；其余选择器前缀作用域
+                // 注意：regex 匹配到的 rule 已含末尾 {，先去掉再统一补回
+                const selectorPart = trimmed.replace(/\{\s*$/, '');
+                return selectorPart.split(',').map((part) => {
+                    const p = part.trim();
+                    if (!p) return '';
+                    if (/^(html|body|:root)$/.test(p)) {
+                        return '[data-tag-scope="' + scopeId + '"]';
+                    }
+                    if (/^(html|body|:root)([\s>+~]|$)/.test(p)) {
+                        return p.replace(/^(html|body|:root)/, '[data-tag-scope="' + scopeId + '"]');
+                    }
+                    return '[data-tag-scope="' + scopeId + '"] ' + p;
+                }).filter(Boolean).join(', ') + '{';
+            }
+            return rule.replace(/(^|,)\s*/g, (sep) => {
+                return sep + '[data-tag-scope="' + scopeId + '"] ';
+            });
+        });
+        if (fillMode) {
+            // ★ 填满容器模式：标签盒子就是"视口"。把 vh/vw/vmin 等视口单位换算成 %，
+            //   否则 body 的 min-height:100vh 会被作用域化到容器上，把固定尺寸的标签框
+            //   拉到整个窗口高（标签导航栏被撑爆）。换算成 % 后相对容器解析（容器尺寸固定）。
+            result = result.replace(/(\d*\.?\d+)(dvh|dvw|svh|svw|lvh|lvw|vmin|vmax|vh|vw)\b/gi, '$1%');
+
+            // ★ 保证标签盒子本身透明：去掉"容器本身"（html/body/:root 映射到的
+            //   [data-tag-scope] 裸选择器）所在规则里的背景类声明。
+            //   页面的 body 背景是为整页视口设计的，作用到固定尺寸的标签盒上后，
+            //   会从内容边缘（fit 安全边距 + 百分比留白，如 width:92vw 的留白）露出，
+            //   变成图片周围的黑/暗框。内容元素（如 .scene/.wrapper）自己的背景不受影响。
+            //   用"裸选择器后跟 , 或 {" 判断容器本身，兼容 body, .foo { } 这类分组规则。
+            result = result.replace(/([^{}]+)\{([^{}]*)\}/g, (m, sel, decls) => {
+                // 判断选择器里是否有"容器本身"（裸 [data-tag-scope]，后跟逗号或行尾），
+                // 兼容 body, .foo { } 这类分组规则
+                if (!/(?:^|,)\s*\[data-tag-scope="[^"]+"\]\s*(?=,|$)/.test(sel)) return m;
+                if (!/background/i.test(decls)) return m;
+                const cleaned = decls.replace(/background(?:-[a-z-]+)?\s*:\s*((?:[^;()]|\([^)]*\))*);/gi, '');
+                return sel + '{' + cleaned + '}';
+            });
+        }
+        return result;
+    }
+
+    /**
+     * ★ 填满容器模式的壁纸式缩放（类似 background-size: cover）：
+     * 1. 先测量内容的世界范围，把 inner 撑开到世界尺寸（scene 的 100% 高度变成世界大小，背景铺满）；
+     * 2. 布局稳定后：
+     *    - 缩放：按整个世界范围 cover 缩放（保证背景铺满标签框、允许放大、超出裁切）；
+     *    - 居中：以"视觉主体"为准（排除直接铺满容器的背景层，如 .scene），
+     *      避免主体元素定位偏下/偏上（如 top:55%）时在标签框里留下大片空白。
+     * @param {HTMLElement} inner - 填满容器(100%)的内容元素
+     * @param {number} boxW - 标签框宽
+     * @param {number} boxH - 标签框高
+     */
+    function fitHtmlTagContent(inner, boxW, boxH) {
+        const MARGIN = 0.06; // 安全边距（适配亚像素/四舍五入）
+        // 测量世界范围（排除"横条装饰"——无限滚动背景条是设计上可被裁切的）
+        const measureWorld = () => {
+            const box = inner.getBoundingClientRect();
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            inner.querySelectorAll('*').forEach(el => {
+                const r = el.getBoundingClientRect();
+                if (!(r.width > 0) || !(r.height > 0)) return;
+                if (r.width / r.height > 3) return; // 横条装饰排除（如 200% 宽的滚动地面）
+                const rx = r.left - box.left;
+                const ry = r.top - box.top;
+                if (rx < minX) minX = rx;
+                if (ry < minY) minY = ry;
+                if (r.right - box.left > maxX) maxX = r.right - box.left;
+                if (r.bottom - box.top > maxY) maxY = r.bottom - box.top;
+            });
+            return { minX, minY, maxX, maxY, w: maxX - minX, h: maxY - minY };
+        };
+        // 测量时暂时清除 transform（得到未变换的世界坐标），测完恢复
+        const measure = () => {
+            const saved = inner.style.transform;
+            inner.style.transform = 'none';
+            const e = measureWorld();
+            inner.style.transform = saved;
+            return e;
+        };
+        // 按范围铺满标签框（非均匀拉伸 + 居中）
+        const applyFit = (ext) => {
+            if (!isFinite(ext.w) || !isFinite(ext.h) || ext.w <= 0 || ext.h <= 0) return;
+            const scaleX = boxW / (ext.w * (1 + MARGIN));
+            const scaleY = boxH / (ext.h * (1 + MARGIN));
+            const cx = ext.minX + ext.w / 2;
+            const cy = ext.minY + ext.h / 2;
+            inner.style.transformOrigin = '0 0';
+            inner.style.transform = `translate(${boxW / 2 - cx * scaleX}px, ${boxH / 2 - cy * scaleY}px) scale(${scaleX}, ${scaleY})`;
+        };
+        // ★ 通过代码计算动画的完整边界：
+        //   用 Web Animations API 把每个动画跳到每个关键帧，让浏览器渲染该帧，
+        //   测量整个世界范围，取所有关键帧的并集 = 动画的精确最大边界。
+        //   对任何纯 CSS @keyframes 动画（transform/opacity/margin/尺寸等）都成立。
+        const measureWithAnimationExtremes = () => {
+            let ext = measure();
+            const anims = [];
+            inner.querySelectorAll('*').forEach(el => {
+                if (el.getAnimations) {
+                    el.getAnimations().forEach(a => anims.push({
+                        a,
+                        wasRunning: a.playState === 'running',
+                        origTime: a.currentTime
+                    }));
+                }
+            });
+            if (anims.length === 0) return ext;
+            anims.forEach(({ a }) => { try { a.pause(); } catch (e) {} });
+            for (const { a } of anims) {
+                try {
+                    const effect = a.effect;
+                    if (!effect || !effect.getKeyframes) continue;
+                    const kfs = effect.getKeyframes();
+                    const timing = effect.getComputedTiming();
+                    const dur = timing ? timing.duration : 0;
+                    if (!kfs || kfs.length === 0 || typeof dur !== 'number' || !isFinite(dur) || dur <= 0) continue;
+                    for (let i = 0; i < kfs.length; i++) {
+                        const off = (kfs[i].offset !== undefined && kfs[i].offset !== null)
+                            ? kfs[i].offset : (kfs.length > 1 ? i / (kfs.length - 1) : 0);
+                        a.currentTime = off * dur;
+                        const e = measure();
+                        if (isFinite(e.w) && e.w > 0 && isFinite(e.h) && e.h > 0) {
+                            ext.minX = Math.min(ext.minX, e.minX);
+                            ext.minY = Math.min(ext.minY, e.minY);
+                            ext.maxX = Math.max(ext.maxX, e.maxX);
+                            ext.maxY = Math.max(ext.maxY, e.maxY);
+                        }
+                    }
+                } catch (e) { /* 单个动画失败忽略 */ }
+            }
+            // ★ 恢复动画：只恢复原本就在运行的动画到原位再继续播放，
+            //   避免 fit 反复暂停/重置把动画卡在起点或暂停态（表现为"动画不动"）。
+            anims.forEach(({ a, wasRunning, origTime }) => {
+                try {
+                    a.currentTime = origTime;
+                    if (wasRunning) { a.play(); } else { a.pause(); }
+                } catch (e) {}
+            });
+            ext.w = ext.maxX - ext.minX;
+            ext.h = ext.maxY - ext.minY;
+            return ext;
+        };
+
+        // 固定点迭代：inner 尺寸 ↔ 百分比定位 ↔ 动画极端 互相影响。
+        // 场景是 100%×100%（=inner），百分比定位的元素随 inner 尺寸移动，
+        // 迭代撑开 inner 直到所有内容（含动画极端）都落在场景内，再铺满标签框。
+        let innerW = inner.getBoundingClientRect().width || boxW;
+        let innerH = inner.getBoundingClientRect().height || boxH;
+        inner.style.width = innerW + 'px';
+        inner.style.height = innerH + 'px';
+        let ext = null;
+        for (let iter = 0; iter < 8; iter++) {
+            const e = measureWithAnimationExtremes();
+            if (!isFinite(e.w) || e.w <= 0 || !isFinite(e.h) || e.h <= 0) { ext = e; break; }
+            ext = e;
+            // 内容（含动画极端）需要落在 0..innerW / 0..innerH 内，场景才不裁切
+            const needW = Math.max(e.maxX, e.w);
+            const needH = Math.max(e.maxY, e.h);
+            const newW = Math.max(innerW, needW);
+            const newH = Math.max(innerH, needH);
+            if (Math.abs(newW - innerW) < 0.5 && Math.abs(newH - innerH) < 0.5) break; // 收敛
+            innerW = newW;
+            innerH = newH;
+            inner.style.width = innerW + 'px';
+            inner.style.height = innerH + 'px';
+        }
+        if (ext) applyFit(ext);
+    }
+
+    /**
+     * ★ 填满容器模式的 fit + 图片/字体加载完成后自动重算。
+     * 初次 fit 时图片往往还没加载（宽高为 0），会算出错误的缩放/位置
+     * （内容被过度拉伸或偏移，看起来"效果奇怪"，需要手动调尺寸才会正常）。
+     * 这里在图片加载完、字体 ready 后重新 fit，让预览/渲染自动恢复正常。
+     * @param {HTMLElement} inner - 填满容器(100%)的内容元素
+     * @param {number} boxW - 标签框宽
+     * @param {number} boxH - 标签框高
+     */
+    function fitHtmlTagContentAfterImages(inner, boxW, boxH) {
+        const doFit = () => {
+            try { fitHtmlTagContent(inner, boxW, boxH); } catch (e) { /* 静默 */ }
+        };
+        doFit();
+        const imgs = inner.querySelectorAll('img');
+        if (imgs.length === 0) return;
+        let pending = 0;
+        imgs.forEach(img => {
+            if (img.complete) return;
+            pending++;
+            const h = () => { if (--pending <= 0) doFit(); };
+            img.addEventListener('load', h, { once: true });
+            img.addEventListener('error', h, { once: true });
+        });
+        // 字体加载完成后也可能改变文字尺寸进而影响世界范围
+        if (document.fonts && document.fonts.ready) {
+            document.fonts.ready.then(() => { try { doFit(); } catch (e) {} });
+        }
+    }
+
+    // ==================== HTML 标签图片引用 ====================
+
+    // 匹配 HTML/CSS 中的图片引用：<img src="X"> / <image href="X"> / url(X)
+    // 组: img(1=前,2=值,3=后引号) image(4=前,5=值,6=后引号) url(7=前,8=值,9=后)
+    const IMG_REF_RE = /(<img\b[^>]*?\bsrc\s*=\s*["'])([^"']*)(["'])|(<image\b[^>]*?\bhref\s*=\s*["'])([^"']*)(["'])|(url\(\s*["']?)([^"')]*)(["']?\s*\))/gi;
+
+    /**
+     * ★ 检测 HTML/CSS 中的图片引用（按文档顺序）。
+     * @param {string} html - HTML 标签代码
+     * @returns {Array<{type:string,value:string}>} 引用列表
+     */
+    function findImageRefs(html) {
+        const refs = [];
+        if (!html) return refs;
+        IMG_REF_RE.lastIndex = 0;
+        let m;
+        while ((m = IMG_REF_RE.exec(html)) !== null) {
+            if (m[1] !== undefined) refs.push({ type: 'img', value: m[2] });
+            else if (m[4] !== undefined) refs.push({ type: 'image', value: m[5] });
+            else refs.push({ type: 'url', value: m[8] });
+        }
+        return refs;
+    }
+
+    /**
+     * ★ 把 url 数组按文档顺序替换进 HTML 的图片引用（与 findImageRefs 顺序一致）。
+     * 用于 HTML 标签：编辑器里检测到 N 个图片引用 → 用户填 N 个链接 → 渲染时替换。
+     * @param {string} html - HTML 标签代码
+     * @param {string[]} urls - 用户填写的图片链接数组
+     * @returns {string}
+     */
+    function substituteImageRefs(html, urls) {
+        if (!html || !urls || urls.length === 0) return html;
+        let i = 0;
+        IMG_REF_RE.lastIndex = 0;
+        return html.replace(IMG_REF_RE, (m, g1, g2, g3, g4, g5, g6, g7, g8, g9) => {
+            if (i >= urls.length) return m;
+            const url = urls[i++];
+            if (g1 !== undefined) return g1 + url + g3;
+            if (g4 !== undefined) return g4 + url + g6;
+            return g7 + url + g9;
+        });
+    }
+
+    /**
+     * ★ 准备 HTML 标签的最终代码：先替换图片引用链接，再修复相对 URL。
+     * 供侧栏/详情/画廊/预览共用。
+     * @param {string} htmlCode - 用户输入的 HTML 代码
+     * @param {string[]} [htmlImageUrls] - 用户填写的图片链接
+     * @returns {string}
+     */
+    function prepareHtmlTagCode(htmlCode, htmlImageUrls) {
+        let code = htmlCode || '';
+        if (htmlImageUrls && htmlImageUrls.length > 0) {
+            code = substituteImageRefs(code, htmlImageUrls);
+        }
+        return (typeof WailsBridge !== 'undefined' && WailsBridge.fixRelativeUrls)
+            ? WailsBridge.fixRelativeUrls(code) : code;
     }
 
     // ==================== 搜索 ====================
@@ -496,6 +822,16 @@ const WailsBridge = (() => {
             console.error('[WailsBridge] advancedSearch 调用失败:', err);
             return { success: false, message: err.message || String(err) };
         }
+    }
+
+    // ==================== 生成参数标签 ====================
+
+    // 获取生成参数标签面板数据（按参数类别分组汇总取值标签）。force=true 强制重新聚合。
+    async function getParamTags(force) {
+        if (!isWailsEnv) {
+            return { success: false, message: '浏览器环境不支持' };
+        }
+        return getApp().GetParamTags(!!force);
     }
 
     // ==================== Prompt 版本 ====================
@@ -746,6 +1082,7 @@ const WailsBridge = (() => {
     return {
         isWails,
         selectFolder,
+        selectThumbDBFile,
         scanFolder,
         refreshAll,
         rescanFolder,
@@ -791,8 +1128,15 @@ const WailsBridge = (() => {
         getThumbBaseURL2,
         getImageBaseURL,
         fixRelativeUrls,
+        scopeHtmlTagCss,
+        fitHtmlTagContent,
+        fitHtmlTagContentAfterImages,
+        findImageRefs,
+        substituteImageRefs,
+        prepareHtmlTagCode,
         searchImages,
         advancedSearch,
+        getParamTags,
         addPromptVersion,
         getPromptVersions,
         deletePromptVersion,

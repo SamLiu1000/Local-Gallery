@@ -113,10 +113,26 @@ const App = (() => {
             // 绑定全局事件（锁按钮、刷新、编辑模式等）
             bindGlobalEvents();
 
+            // ★ 提前注册 index:ready：后端 ensureImageIndex 可能在下面 await 完成前
+            //   就发出该事件。若等初始化结束才注册，事件会被错过 → 侧栏树停在启动
+            //   竞态的空/旧状态（已注册的文件夹不显示，需手动重扫才恢复）。
+            if (window.runtime && window.runtime.EventsOn) {
+                window.runtime.EventsOn('index:ready', () => {
+                    if (typeof Sidebar !== 'undefined' && Sidebar.refreshFolderTree) {
+                        console.log('[App] 收到 index:ready，刷新侧栏');
+                        Sidebar.refreshFolderTree();
+                    }
+                });
+            }
+
             // Phase 3: 侧边栏数据立即并行启动（不依赖 Storage），其他设置同步等 Storage 就绪
             const sidebarReady = Promise.all([
                 Sidebar.refreshFolderTree(),
-                Sidebar.refreshTagTree(),
+                // ★ 修复：标签数据来自 Storage（serverDataCache.tags），而 Storage 需
+                //   先从后端 syncFromServer 加载。若不等待 storageReady，refreshTagTree
+                //   会读到空的 tags → 标签栏空白；且 sync 完成后没有事件触发重渲染，
+                //   直到用户"创建新标签"才重新渲染（表现为"点一下才出现"）。
+                storageReady.then(() => Sidebar.refreshTagTree()),
                 Sidebar.refreshApiConfigSelect()
             ]);
 
@@ -154,14 +170,12 @@ const App = (() => {
             // ★ 检查是否自动启动局域网服务
             checkLANAutoStart();
 
-            // 后端 ensureImageIndex 完成时刷新侧栏（事件驱动，替代固定 setTimeout）
-            if (window.runtime && window.runtime.EventsOn) {
-                window.runtime.EventsOn('index:ready', () => {
-                    if (typeof Sidebar !== 'undefined' && Sidebar.refreshFolderTree) {
-                        console.log('[App] 收到 index:ready，刷新侧栏');
-                        Sidebar.refreshFolderTree();
-                    }
-                });
+            // ★ 兜底刷新侧栏：后端 ensureImageIndex 可能已在初始化 await 之前完成，
+            //   若其 index:ready 事件被错过，侧栏树可能停留在启动竞态的空/旧状态
+            //   （表现为"已注册的文件夹重启后不显示"）。这里无条件再刷新一次，
+            //   数据未变时 renderFolderTree 的 hash 比对会跳过重建，开销极小。
+            if (typeof Sidebar !== 'undefined' && Sidebar.refreshFolderTree) {
+                Sidebar.refreshFolderTree();
             }
         } catch (err) {
             console.error('[App] 初始化失败:', err);
@@ -247,11 +261,19 @@ const App = (() => {
             }
         });
 
-        // 全局刷新按钮：刷新整个 Wails 页面
+        // 全局刷新按钮：先触发后端增量修复（残缺/中断的文件夹计数），再重载页面
         btnRefresh.addEventListener('click', () => {
             btnRefresh.classList.add('spinning');
-            // 刷新页面，重新加载所有资源（包括自定义图标）
-            window.location.reload();
+            const doReload = () => window.location.reload();
+            if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails() && WailsBridge.refreshAll) {
+                // ★ 修复：原来只 reload 页面，后端从不重扫 → 计数残缺永远修不好。
+                //   现在先让后端后台增量刷新（逐根目录补扫+落库），稍后重载让前端拿到最新状态。
+                WailsBridge.refreshAll().then(() => {
+                    setTimeout(doReload, 800);
+                }).catch(() => doReload());
+            } else {
+                doReload();
+            }
         });
 
         // 窗口大小变化
@@ -280,6 +302,14 @@ const App = (() => {
                 }
             }
         });
+
+        // ★ 语言切换：重新应用静态翻译 + 刷新动态 UI
+        window.addEventListener('i18n:changed', () => {
+            if (typeof I18n !== 'undefined' && I18n.scanDOM) I18n.scanDOM();
+            if (typeof Sidebar !== 'undefined' && Sidebar.refreshTagTree) Sidebar.refreshTagTree();
+            if (typeof Sidebar !== 'undefined' && Sidebar.refreshFolderTree) Sidebar.refreshFolderTree();
+            if (typeof DetailPanel !== 'undefined' && DetailPanel.refreshI18n) DetailPanel.refreshI18n();
+        });
     }
 
     // ==================== 主题管理 ====================
@@ -295,13 +325,13 @@ const App = (() => {
             btn.addEventListener('click', toggleTheme);
         }
 
-        // 语言切换后刷新页面，确保所有动态渲染的 UI 使用新语言
+        // 语言切换：不依赖 location.reload()（Wails WebView 中可能不可靠），
+        // 改为 I18n.setLang 派发 i18n:changed 事件，各模块监听后刷新动态文本。
         const langSelect = document.getElementById('langSelect');
         if (langSelect && typeof I18n !== 'undefined') {
             langSelect.value = I18n.lang();
             langSelect.addEventListener('change', async () => {
                 await I18n.setLang(langSelect.value);
-                location.reload();
             });
         }
 
@@ -462,6 +492,8 @@ const App = (() => {
         const rightPanel = document.getElementById('rightPanel');
         const btnFolder = document.getElementById('mobileNavFolder');
         const btnInfo = document.getElementById('mobileNavInfo');
+        const btnSort = document.getElementById('mobileNavSort');
+        const btnLock = document.getElementById('mobileNavLock');
 
         if (!overlay || !btnFolder || !btnInfo) return;
 
@@ -500,6 +532,65 @@ const App = (() => {
         btnFolder.addEventListener('click', () => toggle('left'));
         btnInfo.addEventListener('click', () => toggle('right'));
         overlay.addEventListener('click', close);
+
+        // ★ 排序按钮：弹出排序列表选择（不再点击循环切换）
+        if (btnSort) {
+            const sortMenu = document.getElementById('mobileSortMenu');
+            const closeSortMenu = () => { if (sortMenu) sortMenu.style.display = 'none'; };
+            const openSortMenu = () => {
+                const sel = document.getElementById('sortOrder');
+                if (!sel || !sortMenu || sel.options.length === 0) return;
+                // 从桌面端下拉的选项构建列表（标签已按当前语言翻译）
+                sortMenu.innerHTML = '';
+                Array.from(sel.options).forEach(opt => {
+                    const item = document.createElement('button');
+                    item.type = 'button';
+                    item.className = 'mobile-sort-option' + (opt.value === sel.value ? ' active' : '');
+                    item.textContent = opt.textContent || opt.value;
+                    item.addEventListener('click', () => {
+                        sel.value = opt.value;
+                        sel.dispatchEvent(new Event('change', { bubbles: true }));
+                        closeSortMenu();
+                        if (typeof App !== 'undefined' && App.showToast) {
+                            App.showToast(opt.textContent || opt.value, 'info');
+                        }
+                    });
+                    sortMenu.appendChild(item);
+                });
+                sortMenu.style.display = 'block';
+            };
+            btnSort.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (sortMenu && sortMenu.style.display === 'block') {
+                    closeSortMenu();
+                } else {
+                    openSortMenu();
+                }
+            });
+            // 点击其它区域关闭排序菜单
+            document.addEventListener('click', (e) => {
+                if (sortMenu && sortMenu.style.display === 'block' && !sortMenu.contains(e.target)) {
+                    closeSortMenu();
+                }
+            });
+            // 打开抽屉时也关闭排序菜单
+            btnFolder.addEventListener('click', closeSortMenu);
+            btnInfo.addEventListener('click', closeSortMenu);
+        }
+        // ★ 锁定按钮：切换右侧信息面板锁定状态（复用 DetailPanel.setLocked 逻辑）
+        if (btnLock && typeof DetailPanel !== 'undefined') {
+            const syncLockBtn = () => {
+                const locked = !!DetailPanel.getLocked();
+                btnLock.classList.toggle('active', locked);
+                const icon = btnLock.querySelector('.icon');
+                if (icon) icon.className = 'icon ' + (locked ? 'icon-lock' : 'icon-unlock');
+            };
+            btnLock.addEventListener('click', () => {
+                DetailPanel.setLocked(!DetailPanel.getLocked());
+                syncLockBtn();
+            });
+            syncLockBtn();
+        }
     }
 
     // ==================== 面板分割条拖拽 ====================

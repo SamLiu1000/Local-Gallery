@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="slidersKnob" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#D0D8E4"/>
+    </linearGradient>
+    <linearGradient id="slidersTrack" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#B8C4D4"/>
+      <stop offset="100%" stop-color="#8A96A8"/>
+    </linearGradient>
+    <filter id="sliderShadow">
+      <feDropShadow dx="0" dy="1" stdDeviation="1" flood-color="#000" flood-opacity="0.25"/>
+    </filter>
+  </defs>
+  <!-- 横向轨道 x3 -->
+  <rect x="6" y="12" width="24" height="4" rx="2" fill="url(#slidersTrack)"/>
+  <rect x="6" y="22" width="28" height="4" rx="2" fill="url(#slidersTrack)"/>
+  <rect x="6" y="32" width="20" height="4" rx="2" fill="url(#slidersTrack)"/>
+  <!-- 滑块圆钮 x3 -->
+  <circle cx="22" cy="14" r="5.5" fill="url(#slidersKnob)" stroke="#5A6B80" stroke-width="1.5" filter="url(#sliderShadow)"/>
+  <circle cx="30" cy="24" r="5.5" fill="url(#slidersKnob)" stroke="#5A6B80" stroke-width="1.5" filter="url(#sliderShadow)"/>
+  <circle cx="16" cy="34" r="5.5" fill="url(#slidersKnob)" stroke="#5A6B80" stroke-width="1.5" filter="url(#sliderShadow)"/>
+  <!-- 高光 -->
+  <circle cx="20.5" cy="12.5" r="1.6" fill="#fff" opacity="0.8"/>
+  <circle cx="28.5" cy="22.5" r="1.6" fill="#fff" opacity="0.8"/>
+  <circle cx="14.5" cy="32.5" r="1.6" fill="#fff" opacity="0.8"/>
+</svg>

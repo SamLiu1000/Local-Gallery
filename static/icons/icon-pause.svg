@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="pauseGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#F0B850"/>
+      <stop offset="100%" stop-color="#C88020"/>
+    </linearGradient>
+    <filter id="pauseShadow">
+      <feDropShadow dx="0" dy="1.5" stdDeviation="1.5" flood-color="#482010" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+  <circle cx="24" cy="24" r="20" fill="url(#pauseGrad)" filter="url(#pauseShadow)"/>
+  <ellipse cx="18" cy="17" rx="7" ry="4" fill="#fff" opacity="0.2" transform="rotate(-30 18 17)"/>
+  <!-- Pause bars -->
+  <rect x="17" y="15" width="5.5" height="18" rx="2" fill="#fff"/>
+  <rect x="25.5" y="15" width="5.5" height="18" rx="2" fill="#fff"/>
+</svg>

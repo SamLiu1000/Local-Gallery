@@ -5,7 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"local-gallery/internal/database"
 )
@@ -20,6 +24,7 @@ func (a *App) SearchImages(query string, folder string, offset int, limit int) *
 		return &SearchResponse{
 			Success: false,
 			Message: "搜索关键词不能为空",
+			Code:    "keyword_empty",
 		}
 	}
 
@@ -27,6 +32,7 @@ func (a *App) SearchImages(query string, folder string, offset int, limit int) *
 		return &SearchResponse{
 			Success: false,
 			Message: "图片元数据库未初始化，搜索功能不可用",
+			Code:    "db_not_init",
 		}
 	}
 
@@ -39,6 +45,7 @@ func (a *App) SearchImages(query string, folder string, offset int, limit int) *
 		return &SearchResponse{
 			Success: false,
 			Message: fmt.Sprintf("搜索失败: %v", err),
+			Code:    "search_failed",
 		}
 	}
 
@@ -63,6 +70,7 @@ func (a *App) AdvancedSearch(request *AdvancedSearchRequest) *AdvancedSearchResp
 		return &AdvancedSearchResponse{
 			Success: false,
 			Message: "图片元数据库未初始化，搜索功能不可用",
+			Code:    "db_not_init",
 		}
 	}
 
@@ -78,6 +86,7 @@ func (a *App) AdvancedSearch(request *AdvancedSearchRequest) *AdvancedSearchResp
 		return &AdvancedSearchResponse{
 			Success: false,
 			Message: "请至少指定一个搜索条件、文件夹过滤或日期范围",
+			Code:    "no_conditions",
 		}
 	}
 
@@ -110,6 +119,7 @@ func (a *App) AdvancedSearch(request *AdvancedSearchRequest) *AdvancedSearchResp
 		return &AdvancedSearchResponse{
 			Success: false,
 			Message: fmt.Sprintf("高级搜索失败: %v", err),
+			Code:    "advanced_failed",
 		}
 	}
 
@@ -125,6 +135,175 @@ func (a *App) AdvancedSearch(request *AdvancedSearchRequest) *AdvancedSearchResp
 		Offset:  request.Offset,
 		Limit:   request.Limit,
 	}
+}
+
+// paramTagCategoryDefs 生成参数标签面板的类别白名单（展示顺序 = 数组顺序）。
+// key 是 params_json 中的参数键；field 是点击标签时直接用于高级搜索的条件字段
+// （"json:Key" 前缀由 getFields 识别为从 params_json 提取对应键）。
+// mode 是点击标签时的匹配模式：名称类（Model/LoRA/VAE 等）用 contains，
+// 数值类（CFG/Steps/Size）用 exact 避免 "7" 误命中 "7.5"。
+// 不在白名单里的键（如 Seed、内部噪声键）不展示，避免标签爆炸。
+var paramTagCategoryDefs = []struct {
+	Key   string
+	Field string
+	Mode  string
+}{
+	{"Model", "json:Model", "contains"},
+	{"LoRA", "json:LoRA", "contains"},
+	{"Sampler", "json:Sampler", "contains"},
+	{"Scheduler", "json:Scheduler", "contains"},
+	{"Schedule type", "json:Schedule type", "contains"},
+	{"CFG Scale", "json:CFG Scale", "exact"},
+	{"Distilled CFG Scale", "json:Distilled CFG Scale", "exact"},
+	{"Steps", "json:Steps", "exact"},
+	{"Size", "json:Size", "exact"},
+	{"VAE", "json:VAE", "contains"},
+	{"CLIP", "json:CLIP", "contains"},
+	{"Clip Skip", "json:Clip Skip", "exact"},
+	{"Denoising strength", "json:Denoising strength", "exact"},
+	{"Hires upscaler", "json:Hires upscaler", "contains"},
+	{"Hires upscale", "json:Hires upscale", "exact"},
+	{"Hires steps", "json:Hires steps", "exact"},
+}
+
+// maxTagsPerGroup 每个类别最多展示的标签数（按出现次数降序取前 N）
+const maxTagsPerGroup = 200
+
+// splitLoRATags 把 params_json 里的 LoRA 值（如 "name1:0.80, name2:1.00"）拆成
+// 单个 LoRA 名称标签（去掉权重后缀），并按名称聚合出现次数。
+// 这样标签面板展示的是"单个 LoRA 名"，而不是整串组合值。
+func splitLoRATags(values map[string]int) map[string]int {
+	out := make(map[string]int)
+	for v, c := range values {
+		for _, part := range strings.Split(v, ",") {
+			name := strings.TrimSpace(part)
+			// 去掉 ":权重" 后缀（兼容 "name:0.80" / "name:0.8" 格式）
+			if idx := strings.LastIndex(name, ":"); idx > 0 {
+				name = strings.TrimSpace(name[:idx])
+			}
+			if name == "" {
+				continue
+			}
+			out[name] += c
+		}
+	}
+	return out
+}
+
+// GetParamTags 返回生成参数标签面板数据：按参数类别分组，汇总每类的取值分布。
+// forceRefresh=true 时绕过缓存强制重新聚合（面板上"刷新"按钮使用）。
+// 结果按 类别白名单顺序 排列，每类标签按出现次数降序，最多 maxTagsPerGroup 个。
+//
+// ★ 持久化：聚合结果写入 userDataDir/paramtags-cache.json，重启后直接读取磁盘缓存，
+//   不再每次打开面板都做全库 json_each 聚合（50 万行约 4 秒）。只有
+//   invalidateParamTags（导入新文件夹 / 右键刷新 / 元数据回填完成）会清空内存+磁盘缓存，
+//   下次打开才重新计算。
+func (a *App) GetParamTags(forceRefresh bool) *ParamTagsResponse {
+	if a.imageDB == nil {
+		return &ParamTagsResponse{Success: false, Message: "图片元数据库未初始化", Code: "db_not_init"}
+	}
+
+	a.paramTagsMu.Lock()
+	defer a.paramTagsMu.Unlock()
+
+	// 内存缓存命中（非强制刷新）
+	if !forceRefresh && a.paramTagsCache != nil {
+		return &ParamTagsResponse{Success: true, Groups: a.paramTagsCache}
+	}
+
+	// 尝试从磁盘读取上次持久化的结果（重启后首次打开也能秒开）
+	if !forceRefresh {
+		if groups, ok := a.loadParamTagsFromDisk(); ok {
+			a.paramTagsCache = groups
+			a.paramTagsCacheAt = time.Now()
+			return &ParamTagsResponse{Success: true, Groups: groups}
+		}
+	}
+
+	// 重新聚合
+	agg, err := a.imageDB.GetParamTagAggregation()
+	if err != nil {
+		fmt.Printf("[参数标签] 聚合失败: %v\n", err)
+		return &ParamTagsResponse{Success: false, Message: "生成参数聚合失败: " + err.Error(), Code: "agg_failed"}
+	}
+
+	groups := make([]ParamTagGroup, 0, len(paramTagCategoryDefs))
+	for _, def := range paramTagCategoryDefs {
+		values := agg[def.Key]
+		if len(values) == 0 {
+			continue
+		}
+		if def.Key == "LoRA" {
+			values = splitLoRATags(values)
+		}
+		tags := make([]ParamTagItem, 0, len(values))
+		for v, c := range values {
+			tags = append(tags, ParamTagItem{Value: v, Count: c})
+		}
+		// 按出现次数降序
+		sort.Slice(tags, func(i, j int) bool {
+			if tags[i].Count != tags[j].Count {
+				return tags[i].Count > tags[j].Count
+			}
+			return tags[i].Value < tags[j].Value
+		})
+		if len(tags) > maxTagsPerGroup {
+			tags = tags[:maxTagsPerGroup]
+		}
+		groups = append(groups, ParamTagGroup{Key: def.Key, Field: def.Field, Mode: def.Mode, Tags: tags})
+	}
+
+	a.paramTagsCache = groups
+	a.paramTagsCacheAt = time.Now()
+	// 持久化到磁盘，供下次启动直接读取
+	if err := a.saveParamTagsToDisk(groups); err != nil {
+		fmt.Printf("[参数标签] 持久化缓存失败: %v\n", err)
+	}
+	return &ParamTagsResponse{Success: true, Groups: groups}
+}
+
+// paramTagsCachePath 参数标签磁盘缓存文件路径（位于 userDataDir）
+func (a *App) paramTagsCachePath() string {
+	return filepath.Join(a.userDataDir, "paramtags-cache.json")
+}
+
+// saveParamTagsToDisk 将聚合结果写入磁盘缓存（先写临时文件再改名，避免写入中断损坏）
+func (a *App) saveParamTagsToDisk(groups []ParamTagGroup) error {
+	data, err := json.Marshal(groups)
+	if err != nil {
+		return err
+	}
+	tmp := a.paramTagsCachePath() + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, a.paramTagsCachePath())
+}
+
+// loadParamTagsFromDisk 读取磁盘缓存；文件缺失/损坏时返回 false
+func (a *App) loadParamTagsFromDisk() ([]ParamTagGroup, bool) {
+	data, err := os.ReadFile(a.paramTagsCachePath())
+	if err != nil {
+		return nil, false
+	}
+	var groups []ParamTagGroup
+	if err := json.Unmarshal(data, &groups); err != nil {
+		fmt.Printf("[参数标签] 磁盘缓存解析失败，忽略: %v\n", err)
+		return nil, false
+	}
+	if len(groups) == 0 {
+		return nil, false
+	}
+	return groups, true
+}
+
+// invalidateParamTags 使参数标签缓存失效（扫描/回填等数据变更后调用）。
+// 同时删除磁盘缓存，确保下次打开面板重新聚合而不是读到过期数据。
+func (a *App) invalidateParamTags() {
+	a.paramTagsMu.Lock()
+	a.paramTagsCache = nil
+	os.Remove(a.paramTagsCachePath())
+	a.paramTagsMu.Unlock()
 }
 
 // indexImageMetadata 扫描后索引单张图片的元数据到 SQLite
@@ -235,6 +414,62 @@ func (a *App) batchIndexImages(images map[string]*ImageEntry, folderType string)
 		fmt.Printf("[批量索引] 失败: %v\n", err)
 	} else if indexed > 0 {
 		fmt.Printf("[批量索引] 已索引 %d 张图片元数据\n", indexed)
+	}
+}
+
+// backfillImageMetadata 后台回填搜索索引缺失的元数据（Model/LoRA/CFG 等生成参数）。
+// 旧扫描/增量刷新写入 images 表时只填了 id/path，params_json 为空，导致按参数搜索不到。
+// 多 worker 并发读取文件头部提取并 upsert；无元数据的文件标记为 {}（合法 JSON），
+// 避免下次启动重复解析。分批 + 节流，不阻塞界面，可自然续跑。
+func (a *App) backfillImageMetadata() {
+	if a.imageDB == nil {
+		return
+	}
+	const batchSize = 400
+	const workers = 8
+	jobs := make(chan database.ImageCacheEntry, workers*2)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for r := range jobs {
+				if _, err := os.Stat(r.Path); err != nil {
+					// 文件已删除：标记 {} 避免重复
+					a.imageDB.MarkMetadataEmpty(r.ID)
+					continue
+				}
+				// 有元数据 → 提取并 upsert；无元数据 → indexImageMetadata 也会写 {} 占位
+				a.indexImageMetadata(r.ID, r.Path, r.Name, r.Size,
+					r.LastModified, r.CreatedAt, r.Folder, r.RootPath)
+			}
+		}()
+	}
+	processed := 0
+	for {
+		rows, err := a.imageDB.GetImagesNeedingMetadataBackfill(batchSize)
+		if err != nil {
+			fmt.Printf("[元数据回填] 查询失败: %v\n", err)
+			break
+		}
+		if len(rows) == 0 {
+			break
+		}
+		for _, r := range rows {
+			jobs <- r
+		}
+		processed += len(rows)
+		if processed%20000 == 0 {
+			fmt.Printf("[元数据回填] 进度: %d 条\n", processed)
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	fmt.Printf("[元数据回填] 完成，处理 %d 条\n", processed)
+	// ★ 只有确实处理了数据才失效参数标签缓存。
+	//   否则每次启动即使回填 0 条也会删掉磁盘缓存 → 用户每次点"生成参数"都要重新聚合（慢）。
+	if processed > 0 {
+		a.invalidateParamTags()
 	}
 }
 

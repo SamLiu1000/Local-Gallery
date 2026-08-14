@@ -3,10 +3,12 @@ package main
 import (
 	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 )
@@ -71,6 +73,19 @@ func generateStableID(filePath string, fileSize int64, fileModified int64) strin
 	data := fmt.Sprintf("%s::%d::%d", filePath, fileSize, fileModified)
 	hash := md5.Sum([]byte(data))
 	return hex.EncodeToString(hash[:])
+}
+
+func computeFileSHA256(filePath string) string {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func generateUUID() string {

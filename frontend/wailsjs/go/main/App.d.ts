@@ -12,7 +12,11 @@ export function AdvancedSearch(arg1:main.AdvancedSearchRequest):Promise<main.Adv
 
 export function AppendReverseLog(arg1:string,arg2:string,arg3:string):Promise<void>;
 
+export function BackfillContentHashes():Promise<void>;
+
 export function CancelProxyRequest(arg1:string):Promise<void>;
+
+export function CleanDuplicateImages():Promise<Record<string, any>>;
 
 export function CleanOrphanedThumbs():Promise<Record<string, any>>;
 
@@ -67,6 +71,8 @@ export function GetImagesForTagIds(arg1:Array<string>):Promise<Array<string>>;
 export function GetImportedRoots():Promise<Array<database.ImportedRoot>>;
 
 export function GetLANInfo():Promise<Record<string, any>>;
+
+export function GetParamTags(arg1:boolean):Promise<main.ParamTagsResponse>;
 
 export function GetPreGenStatus():Promise<main.PreGenStatus>;
 
@@ -155,6 +161,8 @@ export function ScanFolderQuick(arg1:string,arg2:string,arg3:boolean):Promise<ma
 export function SearchImages(arg1:string,arg2:string,arg3:number,arg4:number):Promise<main.SearchResponse>;
 
 export function SelectFolder():Promise<string>;
+
+export function SelectThumbDBFile():Promise<string>;
 
 export function SetContext(arg1:context.Context):Promise<void>;
 

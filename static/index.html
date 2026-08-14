@@ -39,6 +39,7 @@
     <header id="topBar">
         <div class="topbar-left">
             <h1 class="app-title">Local Gallery</h1>
+            <span class="app-version">v1.0.4</span>
         </div>
         <div class="topbar-center">
             <div class="search-group">
@@ -49,6 +50,7 @@
                 </div>
                 <button id="searchBtn" class="search-btn" data-i18n-title="search.search" title="搜索"><span class="icon icon-search"></span></button>
                 <button id="advancedSearchToggle" class="search-action-btn" data-i18n-title="search.advanced" title="Advanced"><span class="icon icon-settings" style="pointer-events:none;"></span> <span data-i18n="search.advanced" style="pointer-events:none;">Advanced</span></button>
+                <button id="paramTagsToggle" class="search-action-btn" data-i18n-title="search.param_tags" title="生成参数"><span class="icon icon-sliders" style="pointer-events:none;"></span> <span data-i18n="search.param_tags" style="pointer-events:none;">生成参数</span></button>
                 <div class="search-actions" id="searchActions" style="display:none;">
                     <button id="searchShowAllBtn" class="search-action-btn" data-i18n-title="search.show_all" title="显示全部搜索结果"><span data-i18n="search.show_all">显示全部</span></button>
                     <button id="searchLoadMoreBtn" class="search-action-btn" data-i18n-title="search.load_more" title="加载更多搜索结果"><span data-i18n="search.load_more">加载更多</span></button>
@@ -80,6 +82,14 @@
                                 <option value="negative_prompt" data-i18n="search.field.negative_prompt">反向提示词</option>
                                 <option value="params_json" data-i18n="search.field.params">参数</option>
                                 <option value="folder_name" data-i18n="search.field.folder_name">文件夹名称</option>
+                                <option value="param_sampler" data-i18n="search.field.param_sampler">采样器</option>
+                                <option value="param_model" data-i18n="search.field.param_model">模型</option>
+                                <option value="param_steps" data-i18n="search.field.param_steps">步数</option>
+                                <option value="param_seed" data-i18n="search.field.param_seed">种子</option>
+                                <option value="param_cfg" data-i18n="search.field.param_cfg">CFG</option>
+                                <option value="param_size" data-i18n="search.field.param_size">尺寸</option>
+                                <option value="param_vae" data-i18n="search.field.param_vae">VAE</option>
+                                <option value="param_lora" data-i18n="search.field.param_lora">LoRA</option>
                             </select>
                             <select class="condition-mode">
                                 <option value="contains" data-i18n="search.mode.contains">包含</option>
@@ -111,6 +121,25 @@
                         <div class="folder-checkbox-list" id="folderCheckboxList"></div>
                     </div>
                 </div>
+                </div>
+                <div class="search-history" id="searchHistoryPanel" style="display:none;">
+                    <div class="search-history-header">
+                        <span class="search-history-title" data-i18n="search.history">搜索历史</span>
+                        <button class="search-history-clear" id="searchHistoryClear" data-i18n="search.clear_history">清空历史</button>
+                    </div>
+                    <div class="search-history-list" id="searchHistoryList"></div>
+                </div>
+                <div class="param-tags-panel" id="paramTagsPanel" style="display:none;">
+                    <div class="param-tags-header">
+                        <span class="param-tags-title" data-i18n="search.param_tags">生成参数</span>
+                        <div class="param-tags-tools">
+                            <input type="text" id="paramTagsFilter" class="param-tags-filter-input" data-i18n-placeholder="search.param_tags_filter" placeholder="筛选标签..." autocomplete="off" />
+                            <button id="paramTagsRefresh" class="btn-small" data-i18n-title="search.param_tags_refresh" title="刷新"><span class="icon icon-refresh"></span></button>
+                        </div>
+                    </div>
+                    <div class="param-tags-body" id="paramTagsBody">
+                        <p class="param-tags-empty" data-i18n="search.param_tags_loading">加载中...</p>
+                    </div>
                 </div>
             </div>
         </div>
@@ -152,6 +181,14 @@
                     <button id="btnRemoveFolder" class="btn-icon btn-danger" data-i18n-title="panel.remove_folder" title="移除选中的文件夹"><span class="icon icon-delete"></span></button>
                     <button id="btnEditFolderOrder" class="btn-small" data-i18n-title="panel.edit_order_title" title="进入排序模式：拖动文件夹调整顺序"><span class="icon icon-edit"></span> <span data-i18n="panel.edit_order">排序</span></button>
                     <button id="btnCollapseAllFolders" class="btn-small" data-i18n-title="panel.collapse_all_title" title="折叠所有展开的文件夹"><span class="icon icon-collapse"></span> <span data-i18n="panel.collapse_all">折叠全部</span></button>
+                </div>
+                <div class="folder-filter-bar">
+                    <input type="text" id="folderNavFilter" class="folder-nav-filter-input" data-i18n-placeholder="sidebar.filter_folder_placeholder" placeholder="筛选文件夹..." autocomplete="off" />
+                </div>
+                <div class="folder-tree-header" id="folderTreeHeader">
+                    <span class="fth-col fth-name" data-sort="name" data-i18n="sidebar.sort_name" title="按名称排序">名称</span>
+                    <span class="fth-col fth-count-placeholder"></span>
+                    <span class="fth-col fth-date" data-sort="date" data-i18n="sidebar.sort_date" title="按添加日期排序">添加日期</span>
                 </div>
                 <div class="folder-tree" id="folderTree">
                     <p class="placeholder-text" data-i18n="panel.folder_placeholder">点击"选择文件夹"按钮，使用系统对话框选择图片目录</p>
@@ -256,6 +293,13 @@
                             <input type="text" id="apiProxyHost" placeholder="127.0.0.1" />
                         </div>
                         <div class="form-group">
+                            <label data-i18n="panel.proxy_protocol">代理协议</label>
+                            <select id="apiProxyProtocol" class="config-select" style="width:100%;">
+                                <option value="http">HTTP</option>
+                                <option value="https">HTTPS</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
                             <label data-i18n="panel.proxy_port">代理端口</label>
                             <input type="number" id="apiProxyPort" placeholder="7890" min="1" max="65535" />
                         </div>
@@ -345,6 +389,10 @@
 
             <div class="gallery-scroll" id="galleryScroll">
                 <div class="gallery-grid" id="galleryGrid"></div>
+                <div class="load-more-indicator" id="loadMoreIndicator" style="display:none;">
+                    <div class="spinner"></div>
+                    <span data-i18n="gallery.loading_more">正在加载更多图片...</span>
+                </div>
                 <p class="placeholder-text gallery-placeholder" id="galleryPlaceholder" data-i18n="gallery.placeholder">请先在左侧选择一个文件夹来浏览图片</p>
             </div>
 
@@ -444,11 +492,22 @@
             <span class="icon icon-folder"></span>
             <span data-i18n="panel.folder">文件夹</span>
         </button>
+        <button id="mobileNavSort" data-i18n-title="toolbar.sort" title="排序">
+            <span class="icon icon-sort"></span>
+            <span data-i18n="toolbar.sort">排序</span>
+        </button>
         <button id="mobileNavInfo" data-i18n-title="detail.title" title="信息">
             <span class="icon icon-file"></span>
             <span data-i18n="detail.title">信息</span>
         </button>
+        <button id="mobileNavLock" data-i18n-title="toolbar.lock_panel" title="锁定">
+            <span class="icon icon-unlock"></span>
+            <span data-i18n="toolbar.lock_panel">锁定</span>
+        </button>
     </nav>
+
+    <!-- 移动端排序选择菜单（由 mobileNavSort 弹出） -->
+    <div id="mobileSortMenu" class="mobile-sort-menu" style="display:none;"></div>
 
     <div class="modal-overlay" id="modalOverlay" style="display:none;">
         <div class="modal-content" id="modalContent"></div>
@@ -512,10 +571,12 @@
     <div class="image-context-menu" id="folderContextMenu" style="display:none;">
         <button data-action="refresh"><span class="icon icon-refresh"></span> <span data-i18n="ctx.refresh">刷新</span></button>
         <button data-action="convertTag"><span class="icon icon-tag"></span> <span data-i18n="ctx.convert_tag">转换为标签</span></button>
+        <button data-action="togglePreview"><span class="icon icon-grid"></span> <span id="ctxTogglePreviewLabel">开启预览</span></button>
     </div>
     <div class="image-context-menu" id="imageContextMenu" style="display:none;">
         <button id="ctxOpenInFolder"><span class="icon icon-browse"></span> <span data-i18n="ctx.open_folder">在文件夹中打开</span></button>
         <button id="ctxTrackFolder"><span class="icon icon-search"></span> <span data-i18n="ctx.track_folder">追踪文件夹</span></button>
+        <button id="ctxCopyImageLink"><span class="icon icon-link"></span> <span data-i18n="ctx.copy_image_link">复制引用图片链接</span></button>
     </div>
 
     <!-- 文件夹类型选择对话框 -->

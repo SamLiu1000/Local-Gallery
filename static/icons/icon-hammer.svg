@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <defs>
+    <linearGradient id="hammerHead" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#D8DCE2"/>
+      <stop offset="100%" stop-color="#8A909A"/>
+    </linearGradient>
+    <linearGradient id="hammerHandle" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#C8A870"/>
+      <stop offset="100%" stop-color="#8A6030"/>
+    </linearGradient>
+    <filter id="hammerShadow">
+      <feDropShadow dx="0" dy="2" stdDeviation="1.5" flood-color="#000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+  <!-- 锤柄 -->
+  <rect x="27" y="16" width="5.5" height="28" rx="2.75" fill="url(#hammerHandle)" filter="url(#hammerShadow)"/>
+  <rect x="28.6" y="17" width="1.8" height="25" rx="0.9" fill="#fff" opacity="0.3"/>
+  <!-- 锤头 -->
+  <rect x="14" y="10" width="25" height="8.5" rx="4" fill="url(#hammerHead)" filter="url(#hammerShadow)"/>
+  <rect x="16" y="11.6" width="6" height="5.3" rx="2.6" fill="#fff" opacity="0.25"/>
+</svg>

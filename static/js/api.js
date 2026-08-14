@@ -58,7 +58,12 @@ Respond ONLY with the JSON object, no other text.`;
                 headers: options.headers || {},
                 body: options.body || null,
                 proxyHost: proxyHost || '',
-                proxyPort: proxyPort || 0
+                proxyPort: proxyPort || 0,
+                // ★ 让 Go 层代理超时与前端一致（config.timeout，默认 120s），
+                //   避免 Go 层硬编码 60s 提前掐断长任务
+                timeout: (config && config.timeout) || 120,
+                // ★ 代理协议：http/https
+                proxyProtocol: proxyProtocol || 'http'
             };
 
             // ★ Wails 环境：通过 WailsBridge 代理请求
@@ -393,7 +398,18 @@ Respond ONLY with the JSON object, no other text.`;
 
         if (!response.ok) {
             const errorText = await response.text();
-            throw new Error(`连接失败 (${response.status}): ${errorText}`);
+            const status = response.status;
+            // ★ 按状态码给出可操作的提示，避免只抛原始文本
+            if (status === 401 || status === 403) {
+                throw new Error(`API Key 无效或无权限 (${status})，请检查 API Key 是否正确`);
+            }
+            if (status === 404) {
+                throw new Error(`API 地址不正确 (${status})，/models 端点不存在，请检查 Base URL（通常以 /v1 结尾）`);
+            }
+            if (status >= 500) {
+                throw new Error(`服务端错误 (${status})，API 服务可能未启动或已崩溃`);
+            }
+            throw new Error(`连接失败 (${status}): ${errorText}`);
         }
 
         const data = await response.json();

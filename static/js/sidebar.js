@@ -169,6 +169,15 @@ const Sidebar = (() => {
     let cachedModelList = [];    // 已检测到的模型列表缓存
     let currentApiConfigId = null;
     let isEditingFolderOrder = false; // 文件夹排序编辑模式
+    // ★ 文件夹导航栏列排序：key = 'name' | 'date' | 'custom'，desc = 是否降序
+    let folderSortKey = 'custom';
+    let folderSortDesc = false;
+    // ★ 文件夹导航栏筛选关键字（实时过滤）
+    let folderNavFilter = '';
+    // ★ 子文件夹缩略图预览：已开启预览的文件夹路径集合（归一化）。缩略图 URL 复用图廊 makeThumbURL
+    let previewFolderSet = new Set();
+    // ★ 预览开关的保存/刷新串行队列（快速连点时保证最终状态正确、互不覆盖）
+    let previewSaveChain = Promise.resolve();
 
     // 回调
     let onFolderSelected = null;
@@ -241,6 +250,32 @@ const Sidebar = (() => {
         bindEvents();
         initModelDropdown();
 
+        // ★ 子文件夹缩略图预览初始化（加载持久化开关集合与缩略图 URL 参数）
+        initFolderPreview();
+
+        // ★ 文件夹导航栏列排序（名称/添加日期）初始化
+        initFolderSortHeader();
+        loadFolderSortSetting().then(() => {
+            updateFolderSortHeaderUI();
+            if (!folderTreeLoaded) refreshFolderTree();
+        });
+
+        // ★ 文件夹导航栏实时筛选
+        const navFilter = document.getElementById('folderNavFilter');
+        if (navFilter) {
+            navFilter.addEventListener('input', (e) => {
+                folderNavFilter = (e.target.value || '').trim().toLowerCase();
+                renderFolderTree();
+            });
+            navFilter.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') {
+                    navFilter.value = '';
+                    folderNavFilter = '';
+                    renderFolderTree();
+                }
+            });
+        }
+
         // 恢复左侧面板展开状态（移动端默认关闭面板）
         const isMobile = document.body.classList.contains('mobile');
         const savedLeftPanelCollapsed = isMobile ? 'true' : localStorage.getItem('leftPanelCollapsed');
@@ -256,6 +291,16 @@ const Sidebar = (() => {
         folderTree.addEventListener('click', (e) => {
             if (isEditingFolderOrder) return;
 
+            // ★ 拉绳子回家：点击预览文件夹的红色引导线 → 收缩该文件夹并跳转其父文件夹
+            const guide = e.target.closest('.tree-guide');
+            if (guide) {
+                e.stopPropagation();
+                const container = guide.closest('.tree-node');
+                const node = container && container._nodeData;
+                if (node) pullRopeHome(node, container);
+                return;
+            }
+
             // 展开/折叠按钮
             const toggle = e.target.closest('.tree-toggle');
             if (toggle) {
@@ -270,20 +315,9 @@ const Sidebar = (() => {
             const header = e.target.closest('.tree-node-header');
             if (header) {
                 console.log('[Sidebar] 点击文件夹:', header.dataset.path);
-                const prevActivePath = activeFolderPath;
-                folderTree.querySelectorAll('.tree-node-header.active').forEach(el => el.classList.remove('active'));
-                header.classList.add('active');
-                activeFolderPath = header.dataset.path;
-
                 const container = header.closest('.tree-node');
                 const node = container && container._nodeData;
-                if (node) {
-                    if (typeof Gallery !== 'undefined' && Gallery.filterByFolder) {
-                        if (Gallery._beginScanLoad) Gallery._beginScanLoad(node.path);
-                        Gallery.filterByFolder(node.path, node.displayName || node.name);
-                    }
-                    if (onFolderSelected) onFolderSelected(node);
-                }
+                if (node) selectFolderNode(node, container);
             }
         });
 
@@ -299,20 +333,78 @@ const Sidebar = (() => {
             }
         });
 
-        // 监听缩略图进度事件，自动刷新导航栏计数（节流：最多每 200ms 刷一次，避免高频 DOM 重建闪动）
+        // 监听缩略图进度事件，自动刷新导航栏计数。
+        // ★ 优化：后端 thumb:progress 携带 folders（folderKey → 新缩略图计数）时，
+        //   就地更新对应文件夹的计数徽章（不重建树、不整树拉取）；
+        //   仅当无增量信息时才走低频全量刷新兜底（最多每 5s 一次，重同步 folderRoots）。
         let _pendingTreeRefresh = null;
+        let _lastFullTreeRefresh = 0;
+        const FULL_TREE_REFRESH_INTERVAL = 5000;
         try {
             if (window.runtime && window.runtime.EventsOn) {
-                window.runtime.EventsOn('thumb:progress', () => {
+                window.runtime.EventsOn('thumb:progress', (data) => {
                     if (!folderTreeLoaded) return;
-                    if (_pendingTreeRefresh) return; // 已有待执行的刷新，合并
-                    _pendingTreeRefresh = setTimeout(() => {
-                        _pendingTreeRefresh = null;
-                        refreshFolderTree();
-                    }, 200);
+                    const folders = data && data.folders;
+                    const updatedAny = (folders && Object.keys(folders).length > 0)
+                        ? updateThumbCountsInPlace(folders)
+                        : false;
+                    if (updatedAny) {
+                        schedulePeriodicFolderTreeRefresh();
+                    } else {
+                        scheduleFolderTreeRefresh();
+                    }
                 });
             }
         } catch (e) { /* ignore */ }
+
+        // 就地更新指定文件夹的缩略图计数徽章（含 folderRoots 数据同步），返回是否有命中
+        function updateThumbCountsInPlace(folders) {
+            if (!folderTree) return false;
+            let updated = false;
+            const nodes = folderTree.querySelectorAll('.tree-node');
+            for (const el of nodes) {
+                const key = normalizeFolderPath(el.dataset.path);
+                if (!Object.prototype.hasOwnProperty.call(folders, key)) continue;
+                const countEl = el.querySelector(':scope > .tree-node-header > .tree-count');
+                if (countEl) {
+                    applyFolderProgress(countEl, Number(countEl.dataset.total) || 0, folders[key]);
+                    updated = true;
+                }
+            }
+            // 同步 folderRoots 数据，保证后续整树重建时计数不倒退
+            (function walk(nodes) {
+                for (const n of nodes || []) {
+                    const key = normalizeFolderPath(n.path);
+                    if (Object.prototype.hasOwnProperty.call(folders, key)) {
+                        n.thumbCount = folders[key];
+                    }
+                    walk(n.children);
+                }
+            })(folderRoots);
+            return updated;
+        }
+
+        // 低频全量刷新：持续有增量时也最多每 5s 全量同步一次
+        function schedulePeriodicFolderTreeRefresh() {
+            const now = Date.now();
+            if (_lastFullTreeRefresh === 0) {
+                _lastFullTreeRefresh = now; // 首次增量事件不立即全量刷
+                return;
+            }
+            if (now - _lastFullTreeRefresh < FULL_TREE_REFRESH_INTERVAL) return;
+            _lastFullTreeRefresh = now;
+            scheduleFolderTreeRefresh();
+        }
+
+        // 防抖全量刷新（空 payload / 节点不在 DOM 时的兜底）
+        function scheduleFolderTreeRefresh() {
+            if (!folderTreeLoaded) return;
+            if (_pendingTreeRefresh) return; // 已有待执行的刷新，合并
+            _pendingTreeRefresh = setTimeout(() => {
+                _pendingTreeRefresh = null;
+                refreshFolderTree();
+            }, 200);
+        }
 
         // 从服务器同步标签色板（服务器优先 → localStorage 回退）
         syncTagColorPresets();
@@ -447,6 +539,16 @@ const Sidebar = (() => {
                 }
             });
         }
+
+        // ★ 修复：标签数据变化（含启动时 Storage 同步完成）后刷新标签树。
+        //   避免启动时序导致标签栏空白、需"创建新标签"才出现的问题。
+        //   refreshTagTree 内部会派发 tags-changed，用标记防止重入死循环。
+        let _tagRefreshing = false;
+        window.addEventListener('tags-changed', () => {
+            if (_tagRefreshing) return;
+            _tagRefreshing = true;
+            refreshTagTree().finally(() => { _tagRefreshing = false; });
+        });
     }
 
     // ==================== 左侧面板收缩/展开 ====================
@@ -650,12 +752,114 @@ const Sidebar = (() => {
         }
     }
 
+    // ==================== 文件夹导航栏列排序（名称/添加日期） ====================
+
+    // ★ 加载/保存排序设置（存 SQLite settings）
+    async function loadFolderSortSetting() {
+        try {
+            if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails()) {
+                const r = await WailsBridge.getSidebarSetting('sidebar_folder_sort');
+                if (r && r.success && r.value) {
+                    const parsed = JSON.parse(r.value);
+                    if (parsed && (parsed.key === 'name' || parsed.key === 'date' || parsed.key === 'custom')) {
+                        folderSortKey = parsed.key;
+                        folderSortDesc = !!parsed.desc;
+                    }
+                }
+            } else if (typeof Storage !== 'undefined' && Storage.getSetting) {
+                const saved = await Storage.getSetting('sidebar_folder_sort', null);
+                if (saved && (saved.key === 'name' || saved.key === 'date' || saved.key === 'custom')) {
+                    folderSortKey = saved.key;
+                    folderSortDesc = !!saved.desc;
+                }
+            }
+        } catch (err) {
+            console.warn('[Sidebar] 加载文件夹排序设置失败:', err.message);
+        }
+    }
+
+    function saveFolderSortSetting() {
+        const val = JSON.stringify({ key: folderSortKey, desc: folderSortDesc });
+        if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails()) {
+            WailsBridge.setSidebarSetting('sidebar_folder_sort', val).catch(() => {});
+        } else if (typeof Storage !== 'undefined' && Storage.setSetting) {
+            Storage.setSetting('sidebar_folder_sort', { key: folderSortKey, desc: folderSortDesc });
+        }
+    }
+
+    // ★ 按用户选择的列排序（名称 / 添加日期），原地修改 treeNodes
+    function applyFolderColumnSort(treeNodes) {
+        if (!treeNodes || treeNodes.length === 0) return;
+        const desc = folderSortDesc;
+        if (folderSortKey === 'name') {
+            treeNodes.sort((a, b) => {
+                const an = (a.displayName || a.name || '').toLowerCase();
+                const bn = (b.displayName || b.name || '').toLowerCase();
+                return desc ? bn.localeCompare(an, 'zh-CN') : an.localeCompare(bn, 'zh-CN');
+            });
+        } else if (folderSortKey === 'date') {
+            treeNodes.sort((a, b) => {
+                const ad = a.addedAt || '';
+                const bd = b.addedAt || '';
+                if (desc) return bd.localeCompare(ad);
+                return ad.localeCompare(bd);
+            });
+        }
+    }
+
+    // ★ 格式化添加日期（YYYY-MM-DD）
+    function formatFolderDate(d) {
+        const y = d.getFullYear();
+        const m = String(d.getMonth() + 1).padStart(2, '0');
+        const day = String(d.getDate()).padStart(2, '0');
+        return `${y}-${m}-${day}`;
+    }
+
+    // ★ 初始化表头点击：名称 / 添加日期排序
+    function initFolderSortHeader() {
+        const header = document.getElementById('folderTreeHeader');
+        if (!header || header._sortInited) return;
+        header._sortInited = true;
+
+        header.addEventListener('click', (e) => {
+            const col = e.target.closest('.fth-col');
+            if (!col) return;
+            const key = col.dataset.sort;
+            if (!key) return;
+
+            // 点击同一列 → 切换升降序；不同列 → 新列升序
+            if (folderSortKey === key) {
+                folderSortDesc = !folderSortDesc;
+            } else {
+                folderSortKey = key;
+                folderSortDesc = false;
+            }
+            saveFolderSortSetting();
+            updateFolderSortHeaderUI();
+            // ★ 用户显式点击排序表头：强制重新排序
+            refreshFolderTree({ sort: true });
+        });
+    }
+
+    // ★ 表头箭头/激活态
+    function updateFolderSortHeaderUI() {
+        const header = document.getElementById('folderTreeHeader');
+        if (!header) return;
+        header.querySelectorAll('.fth-col').forEach(col => {
+            const key = col.dataset.sort;
+            col.classList.toggle('active', key === folderSortKey);
+            col.classList.toggle('desc', key === folderSortKey && folderSortDesc);
+        });
+    }
+
     // ==================== 文件夹树（合并前端 Gallery 和后端数据） ====================
 
     /**
      * ★ 修复：添加全局锁 isFolderTreeRefreshing，防止并发调用导致 DOM 竞态覆写
+     * @param {Object} [options]
+     * @param {boolean} [options.sort] - 是否强制应用列排序（用户点击排序表头时传 true）
      */
-    async function refreshFolderTree() {
+    async function refreshFolderTree(options = {}) {
         if (isFolderTreeRefreshing) return;
         isFolderTreeRefreshing = true;
         const requestId = ++currentRefreshId; // ★ 请求序号，旧请求结果丢弃
@@ -664,6 +868,7 @@ const Sidebar = (() => {
             const expandedReady = initExpandedStates();
             const serverTreePromise = (async () => {
                 let tree = [];
+                let fetched = false; // 后端 RPC 是否成功返回（即使空列表）
                 const maxRetries = 3;
                 for (let retryCount = 0; retryCount < maxRetries; retryCount++) {
                     try {
@@ -673,6 +878,7 @@ const Sidebar = (() => {
                             const response = await fetch('/api/folders');
                             if (response.ok) tree = await response.json();
                         }
+                        fetched = true;
                         if (tree.length > 0 || retryCount >= maxRetries - 1) break;
                     } catch (err) {
                         console.warn('[Sidebar] 从后端加载文件夹树失败:', err.message);
@@ -680,9 +886,9 @@ const Sidebar = (() => {
                     // 缩短重试间隔：后端轻量索引加载已很快
                     await new Promise(resolve => setTimeout(resolve, 150));
                 }
-                return tree;
+                return { tree, fetched };
             })();
-            const [_, serverTree] = await Promise.all([expandedReady, serverTreePromise]);
+            const [_, { tree: serverTree, fetched }] = await Promise.all([expandedReady, serverTreePromise]);
 
             // ★ 异步 IO 后检查：请求已过期则丢弃
             if (requestId !== currentRefreshId) return;
@@ -706,14 +912,37 @@ const Sidebar = (() => {
             // 5. 排序：必须在首次渲染前完成，否则会看到跳动
             await loadFolderOrder(mergedTree);
 
+            // ★ 列排序（名称/添加日期）：仅在首次加载（应用保存的排序模式）
+            //   或用户显式点击排序表头（options.sort=true）时应用。
+            //   平时自动刷新（添加新文件夹/扫描完成等）保持当前顺序、新文件夹追加到末尾，
+            //   避免"添加新文件夹后自动被重新排序"。
+            if (options.sort || (!folderTreeLoaded && folderSortKey !== 'custom')) {
+                applyFolderColumnSort(mergedTree);
+            }
+
             if (requestId !== currentRefreshId) return; // 再次检查
 
             // ★ 6. 展开状态：只读内存缓存，不读存储
             applyExpandedStates(mergedTree);
 
             folderRoots = mergedTree;
+            // ★ [调试] 统计带 previews 的节点数量 + 当前已开启的预览根
+            let previewNodeCount = 0;
+            (function countPreview(nodes) {
+                for (const n of nodes || []) {
+                    if (n.previews && n.previews.length) previewNodeCount++;
+                    countPreview(n.children);
+                }
+            })(mergedTree);
+            console.log('[预览] refreshFolderTree 完成, 带 previews 的节点数 =', previewNodeCount, '| 已开启预览:', Array.from(previewFolderSet));
             renderFolderTree();
-            folderTreeLoaded = true;
+            // ★ 修复：仅当后端拉取成功才标记树已加载。
+            //   启动期若 GetFolders RPC 被阻塞/失败（如 ensureImageIndex 持锁），
+            //   保持 folderTreeLoaded=false，switchTab/后续刷新会继续重试，
+            //   避免"已注册的文件夹因启动竞态一直不显示"（需要手动重扫才恢复）。
+            if (fetched) {
+                folderTreeLoaded = true;
+            }
         } catch (err) {
             console.error('[Sidebar] 刷新文件夹树失败:', err);
         } finally {
@@ -745,6 +974,7 @@ const Sidebar = (() => {
                     imageCount: node.imageCount || 0,
                     thumbCount: node.thumbCount || 0,
                     isRoot: true,
+                    previews: node.previews || undefined,
                     children: (node.children || []).map(c => convertChildNode(c))
                 });
             }
@@ -764,6 +994,7 @@ const Sidebar = (() => {
                     imageCount: node.imageCount || 0,
                     thumbCount: node.thumbCount || 0,
                     isRoot: true,
+                    previews: node.previews || undefined,
                     children: (node.children || []).map(c => convertChildNode(c))
                 });
             }
@@ -781,6 +1012,7 @@ const Sidebar = (() => {
             imageCount: node.imageCount || 0,
             thumbCount: node.thumbCount || 0,
             isRoot: false,
+            previews: node.previews || undefined,
             children: (node.children || []).map(c => convertChildNode(c))
         };
     }
@@ -793,8 +1025,10 @@ const Sidebar = (() => {
 
         // ★ Bug 2: 规范化路径再比较，避免斜杠风格不一致导致 Map 查找失败
         const nameMap = new Map();
+        const dateMap = new Map();
         for (const root of importedRootsList) {
             nameMap.set((root.rootId || '').replace(/\\/g, '/'), root.displayName || root.name);
+            dateMap.set((root.rootId || '').replace(/\\/g, '/'), root.addedAt || '');
         }
 
         for (const node of treeNodes) {
@@ -802,32 +1036,97 @@ const Sidebar = (() => {
             if (nameMap.has(key)) {
                 node.displayName = nameMap.get(key);
             }
+            // ★ 添加日期：关联 importedRoots 的 addedAt，用于"添加日期"列排序
+            if (dateMap.has(key)) {
+                node.addedAt = dateMap.get(key);
+            }
         }
     }
 
     // ==================== 渲染文件夹树 ====================
 
+    // ★ 递归过滤文件夹树：关键字命中节点自身或其任意层子节点则保留。
+    //   命中的子节点分支会被强制展开，保证搜索结果可见。
+    function filterFolderNodes(nodes, keyword) {
+        if (!Array.isArray(nodes) || !keyword) return nodes;
+        const kw = keyword.toLowerCase();
+        const result = [];
+        for (const node of nodes) {
+            const name = ((node.displayName || node.name || '') + ' ' + (node.path || '')).toLowerCase();
+            const selfMatch = name.includes(kw);
+            const childCopy = filterFolderNodes(node.children, keyword);
+            if (selfMatch) {
+                // 自身匹配 → 保留整个子树并展开，返回浅拷贝
+                result.push(Object.assign({}, node, { expanded: true, children: childCopy }));
+            } else if (childCopy.length > 0) {
+                // 子节点命中 → 保留本节点并展开，children 为过滤后的分支
+                result.push(Object.assign({}, node, { expanded: true, children: childCopy }));
+            }
+        }
+        return result;
+    }
+
+    // ★ 结构哈希：只含影响"结构"的字段（路径/名称/展开/子节点），不含计数。
+    //   计数变化走 updateFolderCountsInPlace 原地更新，不重建 DOM
+    function folderNodeStructureHash(node) {
+        return {
+            p: node.path,
+            n: node.displayName || node.name,
+            e: node.expanded,
+            pr: node.previews && node.previews.length ? 1 : 0,
+            ch: node.children && node.children.length ? node.children.map(folderNodeStructureHash) : undefined
+        };
+    }
+
+    // ★ 原地更新所有可见节点的计数（不重建 DOM，保留展开/滚动/高亮状态）
+    function updateFolderCountsInPlace(visibleRoots) {
+        if (!folderTree) return;
+        const countMap = {};
+        (function walk(nodes) {
+            for (const n of nodes) {
+                countMap[n.path] = { total: n.imageCount || 0, thumb: n.thumbCount || 0 };
+                if (n.children && n.children.length) walk(n.children);
+            }
+        })(visibleRoots);
+        folderTree.querySelectorAll('.tree-node').forEach(el => {
+            const info = countMap[el.dataset.path];
+            if (!info) return;
+            const countEl = el.querySelector(':scope > .tree-node-header > .tree-count');
+            if (countEl) applyFolderProgress(countEl, info.total, info.thumb);
+        });
+    }
+
     function renderFolderTree() {
         if (!folderTree) return;
 
-        if (folderRoots.length === 0) {
-            folderTree.innerHTML = '<p class="placeholder-text">' + t('panel.folder_placeholder') + '</p>';
+        // ★ 实时筛选：递归匹配根/子文件夹（名称/显示名/路径），命中子文件夹时自动展开分支
+        let visibleRoots = folderRoots;
+        if (folderNavFilter) {
+            visibleRoots = filterFolderNodes(folderRoots, folderNavFilter);
+        }
+
+        if (visibleRoots.length === 0) {
+            folderTree.innerHTML = folderNavFilter
+                ? '<p class="placeholder-text">' + t('sidebar.filter_no_match') + '</p>'
+                : '<p class="placeholder-text">' + t('panel.folder_placeholder') + '</p>';
             lastFolderTreeHash = '';
             return;
         }
 
-        // ★ 性能修复：比较树结构与上次是否一致，一致则跳过 DOM 重建
-        const currentHash = JSON.stringify(folderRoots.map(r => ({
-            p: r.path, n: r.displayName || r.name, e: r.expanded,
-            c: r.imageCount, t: r.thumbCount, ch: r.children
-        })));
-        if (currentHash === lastFolderTreeHash) return;
-        lastFolderTreeHash = currentHash;
+        // ★ 性能修复：结构哈希（不含计数）——结构未变时只原地更新计数，
+        //   避免缩略图生成/计数刷新期间整树重建导致的导航栏闪烁
+        const structureHash = JSON.stringify(visibleRoots.map(folderNodeStructureHash));
+        if (structureHash === lastFolderTreeHash) {
+            // 计数可能变化：原地更新 .tree-count 文本与进度条，保留展开/滚动/高亮状态
+            updateFolderCountsInPlace(visibleRoots);
+            return;
+        }
+        lastFolderTreeHash = structureHash;
 
         const fragment = document.createDocumentFragment();
 
-        for (let i = 0; i < folderRoots.length; i++) {
-            const root = folderRoots[i];
+        for (let i = 0; i < visibleRoots.length; i++) {
+            const root = visibleRoots[i];
             const rootEl = createFolderNode(root, 0);
             rootEl.dataset.folderIndex = i;
             fragment.appendChild(rootEl);
@@ -885,12 +1184,16 @@ const Sidebar = (() => {
     /**
      * 创建单个文件夹树节点（递归）
      */
-    function createFolderNode(node, depth) {
+    function createFolderNode(node, depth, inPreviewBranch) {
         const container = document.createElement('div');
         container.className = 'tree-node';
         container.dataset.path = node.path;
         container.dataset.isRoot = node.isRoot ? 'true' : 'false';
         container._nodeData = node; // 事件委托时获取节点数据
+
+        // ★ 是否处于已开启预览的子树中（自身或祖先开启预览 → 该层显示层级引导线）
+        const isPreviewEnabled = previewFolderSet.has(normalizeFolderPath(node.path));
+        const isPreviewBranch = inPreviewBranch || isPreviewEnabled;
 
         // 头部
         const header = document.createElement('div');
@@ -920,6 +1223,10 @@ const Sidebar = (() => {
         const label = document.createElement('span');
         label.className = 'tree-label';
         label.textContent = node.displayName || node.name;
+        // ★ 已开启子文件夹预览的文件夹：高亮名称
+        if (previewFolderSet.has(normalizeFolderPath(node.path))) {
+            label.classList.add('tree-label-preview');
+        }
 
         // 图片计数 + 缩略图进度条
         const total = node.imageCount || 0;
@@ -986,6 +1293,20 @@ const Sidebar = (() => {
         header.appendChild(label);
         header.appendChild(count);
 
+        // ★ 添加日期列（与表头"添加日期"对齐，仅根节点显示）
+        if (node.isRoot) {
+            const dateEl = document.createElement('span');
+            dateEl.className = 'tree-date';
+            if (node.addedAt) {
+                const d = new Date(node.addedAt);
+                if (!isNaN(d.getTime())) {
+                    dateEl.textContent = formatFolderDate(d);
+                    dateEl.title = d.toLocaleString();
+                }
+            }
+            header.appendChild(dateEl);
+        }
+
         // ★ 搜索索引按钮（仅根节点）
         if (node.isRoot) {
             const idxBtn = document.createElement('button');
@@ -1007,6 +1328,12 @@ const Sidebar = (() => {
         header.appendChild(sortActions);
         container.appendChild(header);
 
+        // ★ 子文件夹缩略图预览条（4 个横排小窗格，复用图廊缩略图通道）
+        if (node.previews && node.previews.length > 0) {
+            const previewEl = createFolderPreview(node.previews, node.path, node.displayName || node.name);
+            if (previewEl) container.appendChild(previewEl);
+        }
+
         // 子节点容器
         const childrenContainer = document.createElement('div');
         childrenContainer.className = 'tree-children';
@@ -1014,9 +1341,18 @@ const Sidebar = (() => {
             childrenContainer.style.display = 'none';
         }
 
+        // ★ 预览子树的层级引导线：细虚线、紧贴文件夹、一层一层拐弯下去。
+        //   仅已开启预览的文件夹及其子孙（isPreviewBranch）显示；点击引导线 = 拉绳子回家
+        if (node.children && node.children.length > 0 && isPreviewBranch) {
+            childrenContainer.classList.add('tree-children-preview');
+            const guide = document.createElement('div');
+            guide.className = 'tree-guide';
+            childrenContainer.appendChild(guide);
+        }
+
         if (node.children && node.children.length > 0) {
             for (const child of node.children) {
-                const childEl = createFolderNode(child, depth + 1);
+                const childEl = createFolderNode(child, depth + 1, isPreviewBranch);
                 childrenContainer.appendChild(childEl);
             }
         }
@@ -1027,6 +1363,264 @@ const Sidebar = (() => {
         // Pointer-based drag is set up in initFolderDrag() called from renderFolderTree()
 
         return container;
+    }
+
+    // ==================== 子文件夹缩略图预览 ====================
+
+    // 归一化文件夹路径：统一正斜杠、去尾部斜杠（与后端 sidebar_preview_folders 存储格式一致）
+    function normalizeFolderPath(p) {
+        return (p || '').replace(/\\/g, '/').replace(/\/+$/g, '');
+    }
+
+    /**
+     * 初始化子文件夹预览：加载持久化的开启路径集合。
+     * 缩略图 URL 复用图廊的 makeThumbURL（含 baseURL/版本号），不再单独缓存。
+     */
+    async function initFolderPreview() {
+        try {
+            if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails()) {
+                const result = await WailsBridge.getSidebarSetting('sidebar_preview_folders');
+                if (result && result.success && result.value) {
+                    try {
+                        const arr = JSON.parse(result.value);
+                        if (Array.isArray(arr)) {
+                            const loaded = new Set(arr.map(normalizeFolderPath));
+                            // ★ 启动竞态防护：加载返回前用户若已手动切换过开关，
+                            //   合并而不是整体覆盖，避免把已开启的路径丢掉
+                            if (previewFolderSet.size === 0) {
+                                previewFolderSet = loaded;
+                            } else {
+                                for (const p of loaded) previewFolderSet.add(p);
+                            }
+                        }
+                    } catch (e) {}
+                }
+            } else if (typeof Storage !== 'undefined' && Storage.getSetting) {
+                // 浏览器调试模式：localStorage
+                const saved = await Storage.getSetting('sidebar_preview_folders', null);
+                if (Array.isArray(saved)) {
+                    const loaded = new Set(saved.map(normalizeFolderPath));
+                    if (previewFolderSet.size === 0) {
+                        previewFolderSet = loaded;
+                    } else {
+                        for (const p of loaded) previewFolderSet.add(p);
+                    }
+                }
+            }
+        } catch (err) {
+            console.warn('[Sidebar] 初始化子文件夹预览失败:', err.message);
+        }
+        // ★ 集合加载完成后强制重建一次，确保已开启预览的文件夹名称高亮显示
+        if (previewFolderSet.size > 0 && folderTree && folderTree.children.length > 0) {
+            lastFolderTreeHash = '';
+            renderFolderTree();
+        }
+    }
+
+    /**
+     * 创建单个文件夹的缩略图预览条：始终 4 个横排小窗格。
+     * 文件夹直接图片不足 4 张时，剩余位置用占位格补齐，避免单张图被拉伸成大横条。
+     * 缩略图 URL 与图廊完全相同：复用 Gallery.makeThumbURL（baseURL + /thumb/{id}?t={lastModified}&g={gen}）。
+     * 先建 4 格骨架，异步确保图廊 baseURL 就绪后再填充图片，避免启动初期出现破图。
+     * 预览图可点击：自动切换到所属文件夹并定位该图片。
+     * @param {Array} previews - 该文件夹直接包含的图片预览条目 [{id, lastModified, path}]（后端确定性选取 ≤4 条）
+     * @param {string} folderPath - 该预览条所属文件夹路径
+     * @param {string} folderName - 该预览条所属文件夹显示名
+     */
+    function createFolderPreview(previews, folderPath, folderName) {
+        if (!previews || !previews.length) {
+            console.warn('[预览] createFolderPreview 跳过: previews =', previews);
+            return null;
+        }
+        const strip = document.createElement('div');
+        strip.className = 'tree-preview';
+        strip.title = t('sidebar.preview_hint');
+        if (folderPath) strip.dataset.folderPath = folderPath;
+        if (folderName) strip.dataset.folderName = folderName;
+        const count = Math.min(previews.length, 4);
+        const imgCells = [];
+        for (let i = 0; i < 4; i++) {
+            if (i < count) {
+                const p = previews[i];
+                const img = document.createElement('img');
+                img.loading = 'lazy';       // 懒加载：只取视口附近的缩略图
+                img.decoding = 'async';     // 异步解码，滚动不卡
+                img.alt = '';
+                if (p.path) img.dataset.path = p.path;
+                img.addEventListener('error', () => { img.style.visibility = 'hidden'; });
+                // ★ 点击预览缩略图 → 图廊切换到该文件夹并定位到该图片
+                img.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    if (p.path) onPreviewImageClick(p.path, folderPath, folderName);
+                });
+                imgCells.push(img);
+                strip.appendChild(img);
+            } else {
+                // 不足 4 张：补占位格保持四格横排
+                const empty = document.createElement('div');
+                empty.className = 'tree-preview-empty';
+                strip.appendChild(empty);
+            }
+        }
+        // 异步填充：确保图廊 baseURL 就绪后赋 src（与图廊同一 URL 构造方式）
+        (async () => {
+            try {
+                if (typeof Gallery !== 'undefined' && Gallery.ensureBaseURLs) {
+                    await Gallery.ensureBaseURLs();
+                }
+                if (typeof Gallery === 'undefined' || !Gallery.makeThumbURL) {
+                    console.warn('[预览] Gallery.makeThumbURL 不可用，无法构造缩略图 URL');
+                    return;
+                }
+                for (let i = 0; i < count; i++) {
+                    const p = previews[i];
+                    imgCells[i].src = Gallery.makeThumbURL(p.id, p.lastModified);
+                }
+            } catch (err) {
+                console.warn('[预览] 构造缩略图 URL 失败:', err.message);
+            }
+        })();
+        return strip;
+    }
+
+    /**
+     * 点击侧边栏预览缩略图 → 图廊切换到该预览条所属文件夹，并定位滚动到该图片。
+     * @param {string} imagePath - 图片完整路径
+     * @param {string} folderPath - 预览条所属文件夹路径
+     * @param {string} folderName - 预览条所属文件夹显示名
+     */
+    async function onPreviewImageClick(imagePath, folderPath, folderName) {
+        if (!imagePath || typeof Gallery === 'undefined') return;
+        try {
+            console.log('[预览] 点击预览图: image =', imagePath, '| folder =', folderPath, '| cur =', (Gallery.getCurrentFolder ? Gallery.getCurrentFolder() : null));
+            // 1. 始终切到该预览条所属文件夹：filterByFolder 会清掉搜索/标签/收藏筛选，
+            //    保证图廊处于干净的文件夹视图（同一文件夹也调用，走缓存命中快速渲染）
+            if (Gallery.filterByFolder) {
+                await Gallery.filterByFolder(folderPath, folderName || '');
+            }
+            // 2. 图廊定位该图片（未加载则自动逐批加载到它，再滚动+高亮）
+            if (Gallery.revealImage) {
+                await Gallery.revealImage(imagePath);
+            }
+        } catch (err) {
+            console.warn('[预览] 定位图片失败:', err.message);
+        }
+    }
+
+    /**
+     * 切换文件夹预览：名称高亮与层级引导线即时同步更新（丝滑），
+     * 设置保存与预览条数据刷新改为后台异步完成，不阻塞 UI。
+     * @param {Object} node - 右键的文件夹节点
+     */
+    function toggleFolderPreview(node) {
+        const key = normalizeFolderPath(node.path);
+        console.log('[预览] toggleFolderPreview, node.path =', node.path, '→ key =', key, '当前已开启:', Array.from(previewFolderSet));
+        const nowEnabled = !previewFolderSet.has(key);
+        if (nowEnabled) {
+            previewFolderSet.add(key);
+        } else {
+            previewFolderSet.delete(key);
+        }
+
+        // ★ 立即同步更新 DOM：名称高亮 + 层级引导线（含子孙），不等待后端
+        const targets = folderTree.querySelectorAll('.tree-node[data-path="' + CSS.escape(node.path) + '"]');
+        targets.forEach(t => {
+            const inBranch = hasEnabledAncestor(t);
+            setPreviewBranchDOM(t, inBranch);
+            // 关闭时立即移除预览条
+            if (!nowEnabled) {
+                t.querySelectorAll('.tree-preview').forEach(el => el.remove());
+            }
+        });
+
+        // ★ 即时反馈：明确告知本次是"开启"还是"关闭"
+        App.showToast((nowEnabled ? t('ctx.preview_on_done') : t('ctx.preview_off_done')) + ': ' + (node.displayName || node.name), 'info');
+
+        // ★ 后台异步：保存设置 + 刷新数据（新增/移除预览条），不阻塞 UI
+        queuePreviewRefresh();
+    }
+
+    // 该节点的任意祖先是否已开启预览（决定其是否处于预览分支）
+    function hasEnabledAncestor(nodeEl) {
+        let cur = nodeEl.parentElement;
+        while (cur) {
+            const anc = cur.closest('.tree-node');
+            if (!anc) break;
+            if (anc._nodeData && previewFolderSet.has(normalizeFolderPath(anc._nodeData.path))) return true;
+            cur = anc.parentElement;
+        }
+        return false;
+    }
+
+    /**
+     * 就地更新预览分支的 DOM：名称高亮 + 层级引导线（递归含子孙），不重建整棵树
+     * @param {HTMLElement} nodeEl - 某个 .tree-node 元素
+     * @param {boolean} inBranch - 该节点是否处于预览分支（祖先已开启，由外部传入）
+     */
+    function setPreviewBranchDOM(nodeEl, inBranch) {
+        const nodeData = nodeEl._nodeData;
+        if (!nodeData) return;
+        const selfEnabled = previewFolderSet.has(normalizeFolderPath(nodeData.path));
+        const branch = inBranch || selfEnabled;
+
+        // 本节点名称高亮
+        const label = nodeEl.querySelector(':scope > .tree-node-header > .tree-label');
+        if (label) label.classList.toggle('tree-label-preview', selfEnabled);
+
+        // 本节点子文件夹的层级引导线
+        const children = nodeEl.querySelector(':scope > .tree-children');
+        if (children && nodeData.children && nodeData.children.length) {
+            if (branch) {
+                children.classList.add('tree-children-preview');
+                if (!children.querySelector(':scope > .tree-guide')) {
+                    const guide = document.createElement('div');
+                    guide.className = 'tree-guide';
+                    children.insertBefore(guide, children.firstChild);
+                }
+            } else {
+                children.classList.remove('tree-children-preview');
+                const guide = children.querySelector(':scope > .tree-guide');
+                if (guide) guide.remove();
+            }
+        }
+
+        // 递归子孙
+        const childContainer = nodeEl.querySelector(':scope > .tree-children');
+        if (childContainer) {
+            for (const childEl of childContainer.querySelectorAll(':scope > .tree-node')) {
+                setPreviewBranchDOM(childEl, branch);
+            }
+        }
+    }
+
+    // 预览保存 + 刷新串行队列：快速连点不丢开关、互不覆盖
+    function queuePreviewRefresh() {
+        previewSaveChain = previewSaveChain.then(async () => {
+            // 执行时读取最新集合，串行保存
+            const arr = Array.from(previewFolderSet);
+            console.log('[预览] 保存 preview_folders:', JSON.stringify(arr));
+            try {
+                if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails()) {
+                    const res = await WailsBridge.setSidebarSetting('sidebar_preview_folders', JSON.stringify(arr));
+                    if (res && res.success === false) {
+                        console.warn('[预览] 保存失败:', res.error);
+                        App.showToast(t('toast.op_failed') + ': ' + (res.error || ''), 'error');
+                    }
+                } else if (typeof Storage !== 'undefined' && Storage.setSetting) {
+                    await Storage.setSetting('sidebar_preview_folders', arr);
+                }
+            } catch (err) {
+                console.warn('[Sidebar] 保存预览设置失败:', err.message);
+                App.showToast(t('toast.op_failed') + ': ' + err.message, 'error');
+            }
+            // 等待在途刷新结束后再刷，确保最新集合生效
+            while (isFolderTreeRefreshing) {
+                await new Promise(r => setTimeout(r, 50));
+            }
+            lastFolderTreeHash = '';
+            await refreshFolderTree();
+        });
     }
 
     /**
@@ -1058,6 +1652,13 @@ const Sidebar = (() => {
         const menu = document.getElementById('folderContextMenu');
         if (!menu) return;
         menu._currentNode = node;
+        // ★ 预览切换按钮按当前状态显示"开启/关闭预览"
+        const previewLabel = document.getElementById('ctxTogglePreviewLabel');
+        if (previewLabel) {
+            previewLabel.textContent = previewFolderSet.has(normalizeFolderPath(node.path))
+                ? t('ctx.preview_off')
+                : t('ctx.preview_on');
+        }
         menu.style.display = 'block';
         menu.style.left = x + 'px';
         menu.style.top = y + 'px';
@@ -1084,6 +1685,8 @@ const Sidebar = (() => {
                     await refreshSingleFolder(node);
                 } else if (action === 'convertTag') {
                     await convertFolderToTag(node);
+                } else if (action === 'togglePreview') {
+                    toggleFolderPreview(node);
                 }
             } catch (err) {
                 console.error('[Sidebar] 菜单操作失败:', err);
@@ -1114,22 +1717,33 @@ const Sidebar = (() => {
                 }
             }
         }
-        if (typeof WailsBridge !== 'undefined') {
-            const result = await WailsBridge.rescanFolder(rootPath);
-            App.showToast(result.message || '文件夹已刷新', 'success');
-        }
-        if (typeof Gallery !== 'undefined' && Gallery.refreshRootFromServer) {
-            await Gallery.refreshRootFromServer(rootPath);
-        }
-        await refreshFolderTree();
-        if (typeof Gallery !== 'undefined') {
-            const currentFolder = Gallery.getCurrentFolder ? Gallery.getCurrentFolder() : null;
-            if (currentFolder && currentFolder.path) {
-                const currentNorm = currentFolder.path.replace(/\\/g, '/');
-                if (currentNorm === normalizedPath || currentNorm.startsWith(normalizedPath + '/') || normalizedPath.startsWith(currentNorm + '/')) {
-                    if (Gallery.render) Gallery.render();
+        // ★ 开始反馈：文件夹行显示旋转指示 + toast（rescanFolder 是同步阻塞的，不提示会以为卡死）
+        const targets = folderTree.querySelectorAll('.tree-node[data-path="' + CSS.escape(node.path) + '"]');
+        targets.forEach(t => t.classList.add('tree-refreshing'));
+        App.showToast(t('sidebar.refreshing_folder') + ': ' + (node.displayName || node.name), 'info');
+        try {
+            if (typeof WailsBridge !== 'undefined') {
+                // ★ 传文件夹本身（而非根目录）：后端 refreshFolderInternal 已支持子文件夹路径，
+                //   只刷新该文件夹及其子树，避免把整个根目录下所有文件夹都扫一遍
+                const result = await WailsBridge.rescanFolder(node.path);
+                App.showToast(result.message || '文件夹已刷新', 'success');
+            }
+            if (typeof Gallery !== 'undefined' && Gallery.refreshRootFromServer) {
+                await Gallery.refreshRootFromServer(rootPath);
+            }
+            await refreshFolderTree();
+            if (typeof Gallery !== 'undefined') {
+                const currentFolder = Gallery.getCurrentFolder ? Gallery.getCurrentFolder() : null;
+                if (currentFolder && currentFolder.path) {
+                    const currentNorm = currentFolder.path.replace(/\\/g, '/');
+                    if (currentNorm === normalizedPath || currentNorm.startsWith(normalizedPath + '/') || normalizedPath.startsWith(currentNorm + '/')) {
+                        if (Gallery.render) Gallery.render();
+                    }
                 }
             }
+        } finally {
+            // 完成/失败均移除旋转指示（树若已重建，targets 是旧元素，移除无副作用）
+            targets.forEach(t => t.classList.remove('tree-refreshing'));
         }
     }
 
@@ -1167,6 +1781,49 @@ const Sidebar = (() => {
         }
 
         // ★ 防抖持久化（不阻塞 UI）
+        clearTimeout(saveExpandedTimer);
+        saveExpandedTimer = setTimeout(() => saveExpandedStates(), 500);
+    }
+
+    // 选中文件夹：高亮 + 图廊过滤 + 回调（供头部点击与"拉绳子回家"复用）
+    function selectFolderNode(node, container) {
+        if (!node) return;
+        const header = container ? container.querySelector(':scope > .tree-node-header') : null;
+        if (header) {
+            folderTree.querySelectorAll('.tree-node-header.active').forEach(el => el.classList.remove('active'));
+            header.classList.add('active');
+        }
+        activeFolderPath = node.path;
+        if (typeof Gallery !== 'undefined' && Gallery.filterByFolder) {
+            if (Gallery._beginScanLoad) Gallery._beginScanLoad(node.path);
+            Gallery.filterByFolder(node.path, node.displayName || node.name);
+        }
+        if (onFolderSelected) onFolderSelected(node);
+    }
+
+    /**
+     * 拉绳子回家：点击预览文件夹的红色引导线时，
+     * 收缩被点击的文件夹，并返回到它的总文件夹（父文件夹）。
+     * @param {Object} node - 被点击引导线的文件夹节点
+     * @param {HTMLElement} container - 该文件夹的 .tree-node 元素
+     */
+    function pullRopeHome(node, container) {
+        // 1. 收缩被点击的文件夹
+        if (node.expanded) {
+            node.expanded = false;
+            expandedStateCache.set(node.path, false);
+            const toggle = container.querySelector(':scope > .tree-node-header > .tree-toggle');
+            if (toggle) toggle.classList.remove('expanded');
+            const children = container.querySelector(':scope > .tree-children');
+            if (children) children.style.display = 'none';
+        }
+        // 2. 返回到它的总文件夹（父文件夹）
+        const parentContainer = container.parentElement ? container.parentElement.closest('.tree-node') : null;
+        const parent = parentContainer ? parentContainer._nodeData : null;
+        if (parent) {
+            selectFolderNode(parent, parentContainer);
+        }
+        // 3. 防抖持久化展开状态
         clearTimeout(saveExpandedTimer);
         saveExpandedTimer = setTimeout(() => saveExpandedStates(), 500);
     }
@@ -1453,6 +2110,14 @@ const Sidebar = (() => {
                 folderDrag.dragEl.style.boxShadow = '';
             }
             folderDrag = null;
+        }
+
+        // ★ 进入编辑排序模式时切回自定义顺序，避免列排序覆盖手动拖动的结果
+        if (isEditingFolderOrder) {
+            folderSortKey = 'custom';
+            folderSortDesc = false;
+            saveFolderSortSetting();
+            updateFolderSortHeaderUI();
         }
 
         // 重新渲染文件夹树（应用/移除拖拽属性）
@@ -1890,6 +2555,9 @@ const Sidebar = (() => {
     let isEditingTags = false;
     let selectedTagIds = new Set();
 
+    // 标签集合内容哈希（去重 tags-changed 派发，避免画廊重复全量渲染）
+    let _lastTagTreeHash = '';
+
     // Global drag state (one active drag at a time)
     let tagDrag = null;
 
@@ -1905,7 +2573,15 @@ const Sidebar = (() => {
             await loadTagExpandedStates();
             renderTagTree();
             tagTreeLoaded = true;
-            window.dispatchEvent(new CustomEvent('tags-changed'));
+            // ★ 修复：仅在标签集合真的变化时才派发 tags-changed。
+            //   旧逻辑每次刷新都派发，而画廊/详情监听该事件会全量重渲染，
+            //   加上 storage.js 在标签操作后也会派发一次 → 一次操作触发多次全量渲染。
+            //   用内容哈希去重：纯刷新（如启动、语言切换、扫描完成）不再打扰画廊。
+            const hash = JSON.stringify(tags.map(t => t.id + '|' + (t.name || '') + '|' + (t.color || '') + '|' + (t.parentId || '') + '|' + (t.linkedFolder || '')).sort());
+            if (hash !== _lastTagTreeHash) {
+                _lastTagTreeHash = hash;
+                window.dispatchEvent(new CustomEvent('tags-changed'));
+            }
         } catch (err) {
             console.error('[Sidebar] 刷新标签树失败:', err);
         }
@@ -2117,18 +2793,25 @@ const Sidebar = (() => {
             item.classList.add('tag-item-html');
             const w = tag.htmlWidth || 120;
             const h = tag.htmlHeight || 40;
+            // ★ 填满容器模式（tag.htmlFill）：标签盒子当作"视口"，
+            //   inner 绝对定位填满 wrapper，html/body/scene 的 100% 高度链在容器内成立
+            const isFill = !!tag.htmlFill;
             item.style.cssText = `display:inline-flex;align-items:center;gap:2px;margin-left:${depth * 20}px;flex-shrink:0;`;
             if (depth > 0) item.style.setProperty('--tag-depth', depth);
             const wrapper = document.createElement('div');
-            wrapper.style.cssText = `width:${w}px;height:${h}px;overflow:hidden;flex-shrink:0;pointer-events:none;display:flex;align-items:center;justify-content:center;`;
+            wrapper.style.cssText = isFill
+                ? `width:${w}px;height:${h}px;overflow:hidden;position:relative;flex-shrink:0;pointer-events:none;`
+                : `width:${w}px;height:${h}px;overflow:hidden;flex-shrink:0;pointer-events:none;display:flex;align-items:center;justify-content:center;`;
             const inner = document.createElement('div');
-            inner.style.cssText = 'display:inline-block;transform-origin:center center;';
+            inner.style.cssText = isFill
+                ? 'position:absolute;top:0;left:0;width:100%;height:100%;transform-origin:center center;'
+                : 'display:inline-block;transform-origin:center center;';
             // 用唯一 scope 包裹，防止 CSS 污染其他标签
             const scopeId = 'tag-scope-' + tag.id;
             wrapper.setAttribute('data-tag-scope', scopeId);
             // 先对完整 HTML 做 URL 替换（<img src>, <image href> + CSS url()）
-            let processedCode = (typeof WailsBridge !== 'undefined' && WailsBridge.fixRelativeUrls)
-                ? WailsBridge.fixRelativeUrls(tag.htmlCode || '') : (tag.htmlCode || '');
+            let processedCode = (typeof WailsBridge !== 'undefined' && WailsBridge.prepareHtmlTagCode)
+                ? WailsBridge.prepareHtmlTagCode(tag.htmlCode || '', tag.htmlImageUrls) : (tag.htmlCode || '');
             let scopedHtml = processedCode.replace(/<style([^>]*)>/g, (_, attrs) => {
                 return '<style' + attrs + ' data-scope="' + scopeId + '">';
             });
@@ -2137,21 +2820,21 @@ const Sidebar = (() => {
             inner.querySelectorAll('style[data-scope]').forEach(styleEl => {
                 const raw = styleEl.textContent;
                 if (!raw) return;
-                const scoped = raw.replace(/([^{}]*\{)/g, (rule) => {
-                    const trimmed = rule.trim();
-                    if (/^@|^\d+(\.\d+)?%|^(from|to)\b/i.test(trimmed)) return rule;
-                    if (/\b(html|body|:root)\b|\*/.test(trimmed)) return '';
-                    return rule.replace(/(^|,)\s*/g, (sep) => {
-                        return sep + '[data-tag-scope="' + scopeId + '"] ';
-                    });
-                });
+                let scoped = (typeof WailsBridge !== 'undefined' && WailsBridge.scopeHtmlTagCss)
+                    ? WailsBridge.scopeHtmlTagCss(raw, scopeId, isFill) : raw;
                 styleEl.textContent = (typeof WailsBridge !== 'undefined' && WailsBridge.fixRelativeUrls)
                     ? WailsBridge.fixRelativeUrls(scoped) : scoped;
                 styleEl.removeAttribute('data-scope');
             });
             wrapper.appendChild(inner);
-            // 测量自然尺寸，等比缩放适配容器
+            // 测量并缩放：fill 模式自适应缩放内容到容器内（图片加载后自动重算）；否则按自然尺寸等比缩小
             requestAnimationFrame(() => {
+                if (isFill) {
+                    if (typeof WailsBridge !== 'undefined' && WailsBridge.fitHtmlTagContentAfterImages) {
+                        WailsBridge.fitHtmlTagContentAfterImages(inner, w, h);
+                    }
+                    return;
+                }
                 const rect = inner.getBoundingClientRect();
                 const nw = rect.width || w;
                 const nh = rect.height || h;
@@ -3274,8 +3957,17 @@ const Sidebar = (() => {
                         </div>
                     </div>
                     <div class="form-group">
+                        <label class="checkbox-label" style="cursor:pointer;">
+                            <input type="checkbox" id="htmlTagFill" />
+                            <span>填满容器（整页式 CSS：html/body 视为容器，100% 高度生效；适合贴整页动画代码）</span>
+                        </label>
+                    </div>
+                    <div class="form-group">
                         <label>${t("sidebar.html_css_code")}</label>
                         <textarea id="htmlTagCode" class="html-tag-code-editor" placeholder="&lt;style&gt;&#10;.my-tag {&#10;  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);&#10;  color: #fff;&#10;  border-radius: 20px;&#10;  padding: 8px 16px;&#10;  font-size: 14px;&#10;  text-shadow: 0 1px 3px rgba(0,0,0,0.3);&#10;}&#10;&lt;/style&gt;&#10;&lt;div class=&quot;my-tag&quot;&gt;标签文字&lt;/div&gt;" rows="12"></textarea>
+                    </div>
+                    <div class="form-group">
+                        <div id="htmlImageRefs" class="html-image-refs" style="display:none;"></div>
                     </div>
                     <div class="form-group">
                         <label>${t("sidebar.preview")}</label>
@@ -3829,6 +4521,9 @@ const Sidebar = (() => {
             const width = parseInt(document.getElementById('htmlTagWidth').value) || 120;
             const height = parseInt(document.getElementById('htmlTagHeight').value) || 40;
             const showName = document.getElementById('htmlTagShowName')?.checked !== false;
+            const htmlFill = document.getElementById('htmlTagFill')?.checked === true;
+            // ★ 收集图片引用链接（与代码里的引用顺序对应）
+            const htmlImageUrls = collectImageRefUrls(document.getElementById('htmlImageRefs'));
             if (!name) { App.showToast(t('sidebar.enter_tag_name'), 'warning'); return; }
             if (!code) { App.showToast(t('sidebar.enter_html_code'), 'warning'); return; }
             try {
@@ -3839,6 +4534,8 @@ const Sidebar = (() => {
                     htmlCode: code,
                     htmlWidth: width,
                     htmlHeight: height,
+                    htmlFill: htmlFill,
+                    htmlImageUrls: htmlImageUrls,
                     showName: showName,
                     color: '#ffffff',
                     bgColor: 'transparent',
@@ -3867,10 +4564,30 @@ const Sidebar = (() => {
             const htmlPreviewScopeId = 'new-html-preview';
             const htmlTagWidthInput = document.getElementById('htmlTagWidth');
             const htmlTagHeightInput = document.getElementById('htmlTagHeight');
-            htmlTagCodeEl.addEventListener('input', () => {
+            // ★ 统一刷新预览（代码/图片链接/填满开关变化都走这里）
+            const applyCreatePreview = (code) => {
+                const w = htmlTagWidthInput ? parseInt(htmlTagWidthInput.value) || 120 : 120;
+                const h = htmlTagHeightInput ? parseInt(htmlTagHeightInput.value) || 40 : 40;
+                htmlTagPreviewEl.style.width = w + 'px';
+                htmlTagPreviewEl.style.height = h + 'px';
+                const urls = collectImageRefUrls(document.getElementById('htmlImageRefs'));
+                applyScopeToContainer(htmlTagPreviewEl, code, htmlPreviewScopeId, document.getElementById('htmlTagFill')?.checked === true, urls);
+            };
+            const updateCreatePreview = () => {
                 clearTimeout(htmlPreviewTimer);
                 htmlPreviewTimer = setTimeout(() => {
                     const code = htmlTagCodeEl.value;
+                    const refsBox = document.getElementById('htmlImageRefs');
+                    // 检测图片引用，生成"图片N：链接输入框"。
+                    // 保留已填写的链接值；链接输入变化时防抖刷新预览（避免每敲一个字符就整幅重渲染）
+                    if (refsBox) {
+                        const currentUrls = refsBox.querySelectorAll('.html-image-ref-input').length > 0
+                            ? collectImageRefUrls(refsBox) : [];
+                        renderImageRefInputs(refsBox, code, currentUrls, () => {
+                            clearTimeout(htmlPreviewTimer);
+                            htmlPreviewTimer = setTimeout(() => applyCreatePreview(htmlTagCodeEl.value), 250);
+                        });
+                    }
                     if (!code.trim()) {
                         htmlTagPreviewEl.removeAttribute('data-tag-scope');
                         htmlTagPreviewEl.innerHTML = '<span style="color:var(--text-muted);font-size:12px;">' + t('sidebar.preview_area') + '</span>';
@@ -3878,18 +4595,30 @@ const Sidebar = (() => {
                         htmlTagPreviewEl.style.height = '';
                         return;
                     }
-                    const w = htmlTagWidthInput ? parseInt(htmlTagWidthInput.value) || 120 : 120;
-                    const h = htmlTagHeightInput ? parseInt(htmlTagHeightInput.value) || 40 : 40;
-                    htmlTagPreviewEl.style.width = w + 'px';
-                    htmlTagPreviewEl.style.height = h + 'px';
-                    applyScopeToContainer(htmlTagPreviewEl, code, htmlPreviewScopeId);
+                    applyCreatePreview(code);
                 }, 300);
-            });
+            };
+            htmlTagCodeEl.addEventListener('input', updateCreatePreview);
+            // ★ 填满容器开关变化时重新应用预览
+            const htmlFillCb = document.getElementById('htmlTagFill');
+            if (htmlFillCb) {
+                htmlFillCb.addEventListener('change', updateCreatePreview);
+            }
 
             // 宽高输入框变化时实时更新预览尺寸并重新缩放
             const rescalePreview = () => {
                 const inner = htmlTagPreviewEl.querySelector('.html-preview-inner');
                 if (!inner) return;
+                if (document.getElementById('htmlTagFill')?.checked === true) {
+                    // 填满容器模式：尺寸变化要重新执行 fit（含动画边界 + 图片加载重算）
+                    const cw = htmlTagPreviewEl.clientWidth;
+                    const ch = htmlTagPreviewEl.clientHeight;
+                    if (!cw || !ch) return;
+                    if (typeof WailsBridge !== 'undefined' && WailsBridge.fitHtmlTagContentAfterImages) {
+                        WailsBridge.fitHtmlTagContentAfterImages(inner, cw, ch);
+                    }
+                    return;
+                }
                 // 重置 transform 才能测量真实尺寸
                 inner.style.transform = '';
                 requestAnimationFrame(() => {
@@ -4177,6 +4906,15 @@ const Sidebar = (() => {
                     <div class="form-group">
                         <label>${t("sidebar.html_css_code")}</label>
                         <textarea id="editHtmlCode" class="html-tag-code-editor" rows="12">${escapeHtmlSidebar(htmlCode)}</textarea>
+                    </div>
+                    <div class="form-group">
+                        <div id="editHtmlImageRefs" class="html-image-refs" style="display:none;"></div>
+                    </div>
+                    <div class="form-group">
+                        <label class="checkbox-label" style="cursor:pointer;">
+                            <input type="checkbox" id="editHtmlFill" ${tag.htmlFill ? 'checked' : ''} />
+                            <span>填满容器（整页式 CSS：html/body 视为容器，100% 高度生效；适合贴整页动画代码）</span>
+                        </label>
                     </div>
                     <div class="form-group">
                         <label>${t("sidebar.preview")}</label>
@@ -4685,10 +5423,15 @@ const Sidebar = (() => {
             if (currentType === 'avatar' && !avatarCropBlob && !avatarDataUrl) {
                 App.showToast(t('toast.avatar_image_needed'), 'warning'); return;
             }
+            let editHtmlFill = undefined;
+            let editHtmlImageUrls = undefined;
             if (currentType === 'html') {
                 htmlCode = document.getElementById('editHtmlCode')?.value || '';
                 htmlWidth = parseInt(document.getElementById('editHtmlWidth')?.value) || 120;
                 htmlHeight = parseInt(document.getElementById('editHtmlHeight')?.value) || 40;
+                const htmlFillEl = document.getElementById('editHtmlFill');
+                if (htmlFillEl) editHtmlFill = htmlFillEl.checked === true;
+                editHtmlImageUrls = collectImageRefUrls(document.getElementById('editHtmlImageRefs'));
             }
 
             try {
@@ -4697,6 +5440,8 @@ const Sidebar = (() => {
                 updatedTag.name = name;
                 updatedTag.showName = showName;
                 updatedTag.tagType = currentType;
+                if (editHtmlFill !== undefined) updatedTag.htmlFill = editHtmlFill;
+                if (editHtmlImageUrls !== undefined) updatedTag.htmlImageUrls = editHtmlImageUrls;
                 updatedTag.parentId = editParentId || null;
 
                 if (currentType === 'avatar') {
@@ -4778,8 +5523,26 @@ const Sidebar = (() => {
             const editPreviewScopeId = 'edit-html-preview';
             const editWidthInput = document.getElementById('editHtmlWidth');
             const editHeightInput = document.getElementById('editHtmlHeight');
+            const applyEditPreview = (code) => {
+                const w = editWidthInput ? parseInt(editWidthInput.value) || 120 : 120;
+                const h = editHeightInput ? parseInt(editHeightInput.value) || 40 : 40;
+                editHtmlPreviewEl.style.width = w + 'px';
+                editHtmlPreviewEl.style.height = h + 'px';
+                const urls = collectImageRefUrls(document.getElementById('editHtmlImageRefs'));
+                applyScopeToContainer(editHtmlPreviewEl, code, editPreviewScopeId, document.getElementById('editHtmlFill')?.checked === true, urls);
+            };
             const updateEditHtmlPreview = () => {
                 const code = editHtmlCodeEl.value;
+                // ★ 检测图片引用，生成"图片N：链接输入框"（保留已填写的值，变化时防抖刷新预览）
+                const editRefsBox = document.getElementById('editHtmlImageRefs');
+                if (editRefsBox) {
+                    const currentUrls = editRefsBox.querySelectorAll('.html-image-ref-input').length > 0
+                        ? collectImageRefUrls(editRefsBox) : (tag.htmlImageUrls || []);
+                    renderImageRefInputs(editRefsBox, code, currentUrls, () => {
+                        clearTimeout(editHtmlPreviewTimer);
+                        editHtmlPreviewTimer = setTimeout(() => applyEditPreview(editHtmlCodeEl.value), 250);
+                    });
+                }
                 if (!code.trim()) {
                     editHtmlPreviewEl.removeAttribute('data-tag-scope');
                     editHtmlPreviewEl.innerHTML = '';
@@ -4787,20 +5550,34 @@ const Sidebar = (() => {
                     editHtmlPreviewEl.style.height = '';
                     return;
                 }
-                const w = editWidthInput ? parseInt(editWidthInput.value) || 120 : 120;
-                const h = editHeightInput ? parseInt(editHeightInput.value) || 40 : 40;
-                editHtmlPreviewEl.style.width = w + 'px';
-                editHtmlPreviewEl.style.height = h + 'px';
-                applyScopeToContainer(editHtmlPreviewEl, code, editPreviewScopeId);
+                applyEditPreview(code);
             };
             let editHtmlPreviewTimer = null;
             editHtmlCodeEl.addEventListener('input', () => {
                 clearTimeout(editHtmlPreviewTimer);
                 editHtmlPreviewTimer = setTimeout(updateEditHtmlPreview, 300);
             });
+            // ★ 填满容器开关变化时重新应用预览
+            const editHtmlFillCb = document.getElementById('editHtmlFill');
+            if (editHtmlFillCb) {
+                editHtmlFillCb.addEventListener('change', () => {
+                    clearTimeout(editHtmlPreviewTimer);
+                    editHtmlPreviewTimer = setTimeout(updateEditHtmlPreview, 50);
+                });
+            }
             const editRescalePreview = () => {
                 const inner = editHtmlPreviewEl.querySelector('.html-preview-inner');
                 if (!inner) return;
+                if (document.getElementById('editHtmlFill')?.checked === true) {
+                    // 填满容器模式：尺寸变化要重新执行 fit（含动画边界 + 图片加载重算）
+                    const cw = editHtmlPreviewEl.clientWidth;
+                    const ch = editHtmlPreviewEl.clientHeight;
+                    if (!cw || !ch) return;
+                    if (typeof WailsBridge !== 'undefined' && WailsBridge.fitHtmlTagContentAfterImages) {
+                        WailsBridge.fitHtmlTagContentAfterImages(inner, cw, ch);
+                    }
+                    return;
+                }
                 // 重置 transform 才能测量真实尺寸
                 inner.style.transform = '';
                 requestAnimationFrame(() => {
@@ -4834,11 +5611,58 @@ const Sidebar = (() => {
 
     // scopeHtmlCode: 对 HTML 代码的 style 标签做 scope 隔离 + 过滤全局选择器
     // 同时创建 inner 容器 + 缩放逻辑，与标签栏 createTagItem 保持一致
-    function applyScopeToContainer(container, htmlCode, scopeId) {
+    // ============ HTML 标签图片引用输入 ============
+
+    /**
+     * ★ 检测 HTML 代码里的图片引用，按数量生成"图片N：链接输入框"。
+     * 用户在输入框里粘贴从图廊右键菜单复制的专属图片链接，渲染时替换进代码。
+     * @param {HTMLElement} container - 放置输入框的容器
+     * @param {string} code - HTML 标签代码
+     * @param {string[]} [existingUrls] - 已有链接（编辑时回填）
+     */
+    function renderImageRefInputs(container, code, existingUrls, onChange) {
+        if (!container || typeof WailsBridge === 'undefined' || !WailsBridge.findImageRefs) return;
+        const refs = WailsBridge.findImageRefs(code);
+        if (refs.length === 0) {
+            container.innerHTML = '';
+            container.style.display = 'none';
+            return;
+        }
+        container.style.display = '';
+        container.innerHTML = '';
+        const title = document.createElement('div');
+        title.className = 'html-image-refs-title';
+        title.textContent = t('html_tag.image_refs') + ' (' + refs.length + ')';
+        container.appendChild(title);
+        refs.forEach((ref, idx) => {
+            const row = document.createElement('div');
+            row.className = 'html-image-ref-row';
+            const label = document.createElement('span');
+            label.className = 'html-image-ref-label';
+            label.textContent = t('html_tag.image_ref').replace('{n}', idx + 1);
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.className = 'html-image-ref-input';
+            input.placeholder = t('html_tag.image_ref_placeholder');
+            input.value = (existingUrls && existingUrls[idx]) || '';
+            input.addEventListener('input', () => { if (onChange) onChange(); });
+            row.appendChild(label);
+            row.appendChild(input);
+            container.appendChild(row);
+        });
+    }
+
+    /** 收集图片引用输入框里填写的链接（按顺序） */
+    function collectImageRefUrls(container) {
+        if (!container) return [];
+        return Array.from(container.querySelectorAll('.html-image-ref-input')).map(inp => inp.value.trim());
+    }
+
+    function applyScopeToContainer(container, htmlCode, scopeId, fillMode, imageUrls) {
         container.setAttribute('data-tag-scope', scopeId);
-        // 先对完整 HTML 做 URL 替换（<img src>, <image href> + CSS url()）
-        let processedCode = (typeof WailsBridge !== 'undefined' && WailsBridge.fixRelativeUrls)
-            ? WailsBridge.fixRelativeUrls(htmlCode || '') : (htmlCode || '');
+        // 先替换图片引用链接，再修复相对 URL（供预览实时显示填写的图片）
+        let processedCode = (typeof WailsBridge !== 'undefined' && WailsBridge.prepareHtmlTagCode)
+            ? WailsBridge.prepareHtmlTagCode(htmlCode || '', imageUrls) : (htmlCode || '');
         let scopedHtml = processedCode.replace(/<style([^>]*)>/g, (_, attrs) => {
             return '<style' + attrs + ' data-scope="' + scopeId + '">';
         });
@@ -4847,9 +5671,18 @@ const Sidebar = (() => {
         if (!inner) {
             inner = document.createElement('div');
             inner.className = 'html-preview-inner';
-            inner.style.cssText = 'display:inline-block;transform-origin:center center;';
+            inner.style.cssText = fillMode
+                ? 'position:absolute;top:0;left:0;width:100%;height:100%;transform-origin:center center;'
+                : 'display:inline-block;transform-origin:center center;';
             container.innerHTML = '';
+            container.style.position = fillMode ? 'relative' : '';
             container.appendChild(inner);
+        } else if (fillMode) {
+            inner.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;transform-origin:center center;';
+            container.style.position = 'relative';
+        } else {
+            inner.style.cssText = 'display:inline-block;transform-origin:center center;';
+            container.style.position = '';
         }
         // 重置 transform 才能正确测量自然尺寸
         inner.style.transform = '';
@@ -4857,14 +5690,8 @@ const Sidebar = (() => {
         inner.querySelectorAll('style[data-scope]').forEach(styleEl => {
             const raw = styleEl.textContent;
             if (!raw) return;
-            const scoped = raw.replace(/([^{}]*\{)/g, (rule) => {
-                const trimmed = rule.trim();
-                if (/^@|^\d+(\.\d+)?%|^(from|to)\b/i.test(trimmed)) return rule;
-                if (/\b(html|body|:root)\b|\*/.test(trimmed)) return '';
-                return rule.replace(/(^|,)\s*/g, (sep) => {
-                    return sep + '[data-tag-scope="' + scopeId + '"] ';
-                });
-            });
+            let scoped = (typeof WailsBridge !== 'undefined' && WailsBridge.scopeHtmlTagCss)
+                ? WailsBridge.scopeHtmlTagCss(raw, scopeId, fillMode) : raw;
             styleEl.textContent = (typeof WailsBridge !== 'undefined' && WailsBridge.fixRelativeUrls)
                 ? WailsBridge.fixRelativeUrls(scoped) : scoped;
             styleEl.removeAttribute('data-scope');
@@ -4872,6 +5699,17 @@ const Sidebar = (() => {
         inner.querySelectorAll('script').forEach(s => {
             try { eval(s.textContent); } catch (_) {}
         });
+        if (fillMode) {
+            // ★ 填满容器模式：自适应缩放内容到预览框内，并等图片/字体加载完成后自动重算
+            requestAnimationFrame(() => {
+                if (typeof WailsBridge !== 'undefined' && WailsBridge.fitHtmlTagContentAfterImages) {
+                    const cw = container.clientWidth || 120;
+                    const ch = container.clientHeight || 40;
+                    WailsBridge.fitHtmlTagContentAfterImages(inner, cw, ch);
+                }
+            });
+            return;
+        }
 
         const doScale = () => {
             const rect = inner.getBoundingClientRect();
@@ -5268,6 +6106,16 @@ const Sidebar = (() => {
         }
     }
 
+    /**
+     * ★ 右侧详情面板的配置选择器变更时调用：同步左侧下拉选中，保持两侧一致。
+     * 只更新选中状态，不触发 loadApiConfigToForm（避免覆盖用户在左侧表单里的未保存编辑）。
+     */
+    function syncApiConfigSelection(id) {
+        if (!apiConfigSelect) return;
+        currentApiConfigId = id || null;
+        apiConfigSelect.value = id || '';
+    }
+
     function loadApiConfigToForm(id) {
         const config = apiConfigs.find(c => c.id === id);
         if (!config) return;
@@ -5285,8 +6133,14 @@ const Sidebar = (() => {
         document.getElementById('apiStripThinking').checked = config.stripThinking || false;
         document.getElementById('apiIsDefault').checked = config.isDefault || false;
 
+        // ★ 恢复该配置上次检测到的模型列表（重启后免重新检测）
+        cachedModelList = Array.isArray(config.models) ? config.models.slice() : [];
+
         if (config.proxy) {
             document.getElementById('apiProxyEnabled').checked = config.proxy.enabled || false;
+            if (document.getElementById('apiProxyProtocol')) {
+                document.getElementById('apiProxyProtocol').value = config.proxy.protocol || 'http';
+            }
             document.getElementById('apiProxyHost').value = config.proxy.host || '';
             document.getElementById('apiProxyPort').value = config.proxy.port || '';
         }
@@ -5306,8 +6160,12 @@ const Sidebar = (() => {
         document.getElementById('apiStripThinking').checked = false;
         document.getElementById('apiIsDefault').checked = false;
         document.getElementById('apiProxyEnabled').checked = false;
+        if (document.getElementById('apiProxyProtocol')) {
+            document.getElementById('apiProxyProtocol').value = 'http';
+        }
         document.getElementById('apiProxyHost').value = '';
         document.getElementById('apiProxyPort').value = '';
+        cachedModelList = [];
     }
 
     function newApiConfig() {
@@ -5333,9 +6191,11 @@ const Sidebar = (() => {
             userPrompt: document.getElementById('apiUserPrompt').value.trim(),
             stripThinking: document.getElementById('apiStripThinking').checked,
             isDefault: document.getElementById('apiIsDefault').checked,
+            // ★ 保存当前检测到的模型列表，重启后免重新检测
+            models: cachedModelList,
             proxy: {
                 enabled: document.getElementById('apiProxyEnabled').checked,
-                protocol: 'http',
+                protocol: document.getElementById('apiProxyProtocol').value || 'http',
                 host: document.getElementById('apiProxyHost').value.trim(),
                 port: parseInt(document.getElementById('apiProxyPort').value) || 0
             },
@@ -5460,7 +6320,7 @@ const Sidebar = (() => {
             baseUrl: document.getElementById('apiBaseUrl').value.trim(),
             apiKey: document.getElementById('apiKey').value.trim(),
             proxyEnabled: document.getElementById('apiProxyEnabled').checked,
-            proxyProtocol: 'http',
+            proxyProtocol: document.getElementById('apiProxyProtocol').value || 'http',
             proxyHost: document.getElementById('apiProxyHost').value.trim(),
             proxyPort: parseInt(document.getElementById('apiProxyPort').value) || 0
         };
@@ -5803,6 +6663,7 @@ const Sidebar = (() => {
         refreshTagTree,
         updateIndexStatusUI,
         refreshApiConfigSelect,
+        syncApiConfigSelection,
         invalidateFolderTree,
         invalidateTagTree,
         showBatchActions,

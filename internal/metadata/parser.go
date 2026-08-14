@@ -373,6 +373,67 @@ func universalParse(textChunks map[string]string) *ImageMetadata {
 		result.Raw[k] = v
 	}
 
+	// ★ 优先走 ParseTextChunks 专门解析（ComfyUI 递归追踪 / SD / SwarmUI / XMP），
+	//   它比泛化 flatten 更准确。拿不到有效参数时才回退到泛化解析。
+	if pp := ParseTextChunks(textChunks); pp != nil && (pp.Prompt != "" || pp.NegativePrompt != "" || len(pp.LoRAs) > 0) {
+		result.Prompt = pp.Prompt
+		result.NegativePrompt = pp.NegativePrompt
+		if result.Params == nil {
+			result.Params = make(map[string]string)
+		}
+		// 复制 params（ParsedParams 无直接方法，这里手动转）
+		if pp.Steps != 0 {
+			result.Params["Steps"] = fmt.Sprintf("%d", pp.Steps)
+		}
+		if pp.Sampler != "" {
+			result.Params["Sampler"] = pp.Sampler
+		}
+		if pp.Scheduler != "" {
+			result.Params["Scheduler"] = pp.Scheduler
+		}
+		if pp.CFGScale != 0 {
+			result.Params["CFG Scale"] = fmt.Sprintf("%.1f", pp.CFGScale)
+		}
+		if pp.Seed != 0 {
+			result.Params["Seed"] = fmt.Sprintf("%d", pp.Seed)
+		}
+		if pp.Width != 0 && pp.Height != 0 {
+			result.Params["Size"] = fmt.Sprintf("%dx%d", pp.Width, pp.Height)
+			result.Params["Width"] = fmt.Sprintf("%d", pp.Width)
+			result.Params["Height"] = fmt.Sprintf("%d", pp.Height)
+		}
+		if pp.Model != "" {
+			result.Params["Model"] = pp.Model
+		}
+		if pp.VAE != "" {
+			result.Params["VAE"] = pp.VAE
+		}
+		if pp.ClipSkip != 0 {
+			result.Params["Clip Skip"] = fmt.Sprintf("%d", pp.ClipSkip)
+		}
+		if pp.DenoisingStr != 0 {
+			result.Params["Denoising strength"] = fmt.Sprintf("%.2f", pp.DenoisingStr)
+		}
+		if len(pp.LoRAs) > 0 {
+			var parts []string
+			for _, l := range pp.LoRAs {
+				if l.Weight != 0 {
+					parts = append(parts, l.Name+":"+fmt.Sprintf("%.2f", l.Weight))
+				} else {
+					parts = append(parts, l.Name)
+				}
+			}
+			result.Params["LoRA"] = strings.Join(parts, ", ")
+		}
+		for k, v := range pp.Extra {
+			result.Params[k] = v
+		}
+		if pp.SourceTool != "" {
+			result.Params["SourceTool"] = pp.SourceTool
+		}
+		return result
+	}
+
 	// 构建数据池
 	var dataPool []dataItem
 
@@ -792,13 +853,227 @@ func ParseTextChunks(textChunks map[string]string) *ParsedParams {
 
 	// 3. SD/JSON/XMP 路径
 	if paramText != "" {
-		return parseParamText(paramText)
+		parsed := parseParamText(paramText)
+		// ★ ComfyUI 增强：用 workflow chunk 的 widgets_values 补全缺失参数。
+		//   prompt 节点图往往缺少 Size / 模型路径目录 / 部分采样参数，
+		//   workflow 里存有完整的 UI widgets_values（有序数组），可精确补全。
+		if parsed != nil && parsed.SourceTool == "ComfyUI" {
+			if wfRaw, ok := textChunks["workflow"]; ok && wfRaw != "" {
+				mergeWorkflowParams(parsed, wfRaw)
+			}
+		}
+		return parsed
 	}
 	if xmpText != "" {
 		return parseXMPText(xmpText)
 	}
 
 	return nil
+}
+
+// parseWorkflowWidgets 解析 ComfyUI workflow chunk 的 widgets_values，
+// 返回按节点 ID 索引的 {nodeType, widgets} 映射。
+func parseWorkflowWidgets(wfRaw string) (map[string]workflowNode, bool) {
+	var wf struct {
+		Nodes []struct {
+			ID    json.RawMessage `json:"id"`
+			Type  string          `json:"type"`
+			Wvals json.RawMessage `json:"widgets_values"`
+		} `json:"nodes"`
+	}
+	if err := json.Unmarshal([]byte(wfRaw), &wf); err != nil {
+		return nil, false
+	}
+	nodes := make(map[string]workflowNode, len(wf.Nodes))
+	for _, n := range wf.Nodes {
+		id := strings.Trim(string(n.ID), `"`)
+		if id == "" {
+			continue
+		}
+		var widgets []json.RawMessage
+		if err := json.Unmarshal(n.Wvals, &widgets); err != nil {
+			widgets = nil
+		}
+		nodes[id] = workflowNode{Type: n.Type, Widgets: widgets}
+	}
+	return nodes, len(nodes) > 0
+}
+
+type workflowNode struct {
+	Type    string
+	Widgets []json.RawMessage
+}
+
+// wfStr 读取 workflow widgets 数组中指定下标的字符串值。
+func wfStr(w []json.RawMessage, idx int) string {
+	if idx < 0 || idx >= len(w) {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(w[idx], &s) == nil {
+		return s
+	}
+	return ""
+}
+
+// wfNum 读取 workflow widgets 数组中指定下标的数值（int 或 float）。
+func wfNum(w []json.RawMessage, idx int) float64 {
+	if idx < 0 || idx >= len(w) {
+		return 0
+	}
+	var f float64
+	if json.Unmarshal(w[idx], &f) == nil {
+		return f
+	}
+	var i int
+	if json.Unmarshal(w[idx], &i) == nil {
+		return float64(i)
+	}
+	return 0
+}
+
+// mergeWorkflowParams 用 workflow 的 widgets_values 补全 ComfyUI 解析结果中
+// 缺失的字段。只补缺失，不覆盖已有值，避免覆盖 prompt 节点图的精确结果。
+func mergeWorkflowParams(p *ParsedParams, wfRaw string) {
+	nodes, ok := parseWorkflowWidgets(wfRaw)
+	if !ok {
+		return
+	}
+	for _, node := range nodes {
+		w := node.Widgets
+		switch node.Type {
+		case "EmptyLatentImage", "EmptySD3LatentImage", "EmptyHunyuanLatentVideo", "EmptyFluxLatentImage":
+			// widgets_values: [width, height, batch_size]
+			if p.Width == 0 {
+				if v := int(wfNum(w, 0)); v > 0 {
+					p.Width = v
+				}
+			}
+			if p.Height == 0 {
+				if v := int(wfNum(w, 1)); v > 0 {
+					p.Height = v
+				}
+			}
+		case "CheckpointLoaderSimple", "UNETLoader", "LoaderGGUF", "CheckpointLoader":
+			// [ckpt_name, ...] 或 [unet_name, ...]
+			if p.Model == "" {
+				if s := wfStr(w, 0); s != "" {
+					p.Model = loraDisplayName(s)
+				}
+			}
+		case "CLIPLoader", "DualCLIPLoader", "TripleCLIPLoader":
+			// [clip_name, type, ...] / [clip_name1, clip_name2, type, ...]
+			if p.Extra["CLIP"] == "" {
+				if s := wfStr(w, 0); s != "" {
+					p.Extra["CLIP"] = loraDisplayName(s)
+				}
+			}
+		case "VAELoader":
+			if p.VAE == "" {
+				if s := wfStr(w, 0); s != "" {
+					p.VAE = loraDisplayName(s)
+				}
+			}
+		case "KSampler", "KSamplerAdvanced", "KSamplerWithNAG", "SamplerCustomAdvanced":
+			// [seed, control_after_generate, steps, cfg, sampler, scheduler, denoise]
+			if p.Seed == 0 {
+				if v := wfNum(w, 0); v != 0 {
+					p.Seed = int64(v)
+				}
+			}
+			if p.Steps == 0 {
+				if v := int(wfNum(w, 2)); v > 0 {
+					p.Steps = v
+				}
+			}
+			if p.CFGScale == 0 {
+				if v := wfNum(w, 3); v != 0 {
+					p.CFGScale = v
+				}
+			}
+			if p.Sampler == "" {
+				if s := wfStr(w, 4); s != "" {
+					p.Sampler = s
+				}
+			}
+			if p.Scheduler == "" {
+				if s := wfStr(w, 5); s != "" {
+					p.Scheduler = s
+				}
+			}
+			if p.DenoisingStr == 0 {
+				if v := wfNum(w, 6); v != 0 {
+					p.DenoisingStr = v
+				}
+			}
+		case "LoraLoader", "LoraLoaderModelOnly", "HunyuanVideoLoraLoader":
+			// [lora_name, strength_model, strength_clip]
+			if s := wfStr(w, 0); s != "" {
+				sm := wfNum(w, 1)
+				sc := wfNum(w, 2)
+				weight := sm
+				if weight == 0 {
+					weight = sc
+				}
+				p.LoRAs = append(p.LoRAs, LoRAEntry{Name: loraDisplayName(s), Weight: weight})
+			}
+		case "Power Lora Loader (rgthree)":
+			// widgets_values 里 lora_1.. 以对象形式存在
+			for _, raw := range w {
+				var obj map[string]json.RawMessage
+				if json.Unmarshal(raw, &obj) == nil {
+					var lora struct {
+						On       bool    `json:"on"`
+						Lora     string  `json:"lora"`
+						Strength float64 `json:"strength"`
+					}
+					if json.Unmarshal(raw, &lora) == nil && lora.On && lora.Lora != "" {
+						p.LoRAs = append(p.LoRAs, LoRAEntry{
+							Name:   loraDisplayName(lora.Lora),
+							Weight: lora.Strength,
+						})
+					}
+				}
+			}
+		case "NunchakuQwenImageLoraStack":
+			// widgets_values: [count, cpu_offload, name1, w1, name2, w2, ...]
+			for i := 2; i+1 < len(w); i += 2 {
+				if s := wfStr(w, i); s != "" && s != "None" {
+					p.LoRAs = append(p.LoRAs, LoRAEntry{Name: loraDisplayName(s), Weight: wfNum(w, i+1)})
+				}
+			}
+		case "NunchakuQwenImageLoraStackV3":
+			// widgets_values: ["1", 1, true, "disable", true, name, weight, ...]
+			// 成对的 name/weight 从 index 5 开始
+			for i := 5; i+1 < len(w); i += 2 {
+				if s := wfStr(w, i); s != "" && s != "None" {
+					p.LoRAs = append(p.LoRAs, LoRAEntry{Name: loraDisplayName(s), Weight: wfNum(w, i+1)})
+				}
+			}
+		case "RandomNoise":
+			// [noise_seed, ...]
+			if p.Seed == 0 {
+				if v := wfNum(w, 0); v != 0 {
+					p.Seed = int64(v)
+				}
+			}
+		}
+	}
+
+	// ★ 去重：prompt 节点图与 workflow widgets 可能重复解析同一批 LoRA，
+	// 按 (名称, 权重) 去重，保持 prompt 解析的顺序优先。
+	if len(p.LoRAs) > 1 {
+		seen := make(map[string]bool, len(p.LoRAs))
+		dedup := p.LoRAs[:0]
+		for _, l := range p.LoRAs {
+			key := fmt.Sprintf("%s|%.3f", l.Name, l.Weight)
+			if !seen[key] {
+				seen[key] = true
+				dedup = append(dedup, l)
+			}
+		}
+		p.LoRAs = dedup
+	}
 }
 
 // parseParamText 解析 parameters 或 prompt chunk 的文本内容，
@@ -973,7 +1248,25 @@ func parseComfyUIJSONNodes(nodes map[string]json.RawMessage) *ParsedParams {
 	p := &ParsedParams{SourceTool: "ComfyUI", Extra: map[string]string{}}
 	classTypes := map[string]int{}
 
-	// First pass: identify positive/negative node IDs from KSampler connections
+	// 保存所有节点的 inputs（按字段名），供递归追踪提示词/连接使用
+	allInputs := make(map[string]map[string]json.RawMessage)
+	classByID := make(map[string]string)
+	for nodeID, nodeRaw := range nodes {
+		var node struct {
+			ClassType string                     `json:"class_type"`
+			Inputs    map[string]json.RawMessage `json:"inputs"`
+		}
+		if json.Unmarshal(nodeRaw, &node) != nil {
+			continue
+		}
+		classByID[nodeID] = node.ClassType
+		allInputs[nodeID] = node.Inputs
+	}
+
+	// First pass: identify positive/negative node IDs from sampler connections.
+	// Check ALL nodes for positive/negative inputs instead of matching specific class
+	// names, so KSampler, KSamplerAdvanced, KSamplerWithNAG, SamplerCustomAdvanced
+	// and any future variants are all handled.
 	posNodeID := ""
 	negNodeID := ""
 	for _, nodeRaw := range nodes {
@@ -984,17 +1277,82 @@ func parseComfyUIJSONNodes(nodes map[string]json.RawMessage) *ParsedParams {
 		if json.Unmarshal(nodeRaw, &node) != nil {
 			continue
 		}
-		if node.ClassType == "KSampler" || node.ClassType == "KSamplerAdvanced" || node.ClassType == "SamplerCustomAdvanced" {
-			var inputs struct {
-				Positive json.RawMessage `json:"positive"`
-				Negative json.RawMessage `json:"negative"`
+		var inputs struct {
+			Positive json.RawMessage `json:"positive"`
+			Negative json.RawMessage `json:"negative"`
+		}
+		if json.Unmarshal(node.Inputs, &inputs) != nil {
+			continue
+		}
+		if posNodeID == "" {
+			if id := extractNodeID(inputs.Positive); id != "" {
+				posNodeID = id
 			}
-			if json.Unmarshal(node.Inputs, &inputs) == nil {
-				posNodeID = extractNodeID(inputs.Positive)
-				negNodeID = extractNodeID(inputs.Negative)
+		}
+		if negNodeID == "" {
+			if id := extractNodeID(inputs.Negative); id != "" {
+				negNodeID = id
 			}
+		}
+		if posNodeID != "" && negNodeID != "" {
 			break
 		}
+	}
+
+	// resolveText 沿节点连接递归追踪，返回叶子文本节点中的提示词文本。
+	// ComfyUI 的 positive/negative 可能不直接连到 CLIPTextEncode，而是经过
+	// easy ifElse / ConditioningCombine / ConditioningSetArea 等中间节点，
+	// 需要沿 on_true/on_false/positive/conditioning 等字段层层解引用。
+	var resolveText func(nodeID string, depth int) string
+	resolveText = func(nodeID string, depth int) string {
+		if nodeID == "" || depth > 12 {
+			return ""
+		}
+		inputs, ok := allInputs[nodeID]
+		if !ok {
+			return ""
+		}
+		// 1. 节点自身是文本节点：text / prompt 字段直接取值
+		var textVal string
+		if raw, ok := inputs["text"]; ok {
+			json.Unmarshal(raw, &textVal)
+		}
+		if textVal == "" {
+			if raw, ok := inputs["prompt"]; ok {
+				json.Unmarshal(raw, &textVal)
+			}
+		}
+		if textVal != "" {
+			return textVal
+		}
+
+		// 2. 沿连接字段递归：先试语义明确的文本连接，再试通用字段
+		candidates := []string{
+			"positive", "negative", "conditioning", "conditioning_positive",
+			"conditioning_negative", "on_true", "on_false", "text", "prompt",
+			"clip", "conditioning_to", "base_conditioning", "refiner_conditioning",
+		}
+		for _, field := range candidates {
+			raw, ok := inputs[field]
+			if !ok {
+				continue
+			}
+			if id := extractNodeID(raw); id != "" {
+				if txt := resolveText(id, depth+1); txt != "" {
+					return txt
+				}
+			}
+		}
+
+		// 3. 兜底：任意字段里是数组连接 ["id", idx] 的，逐一尝试
+		for _, raw := range inputs {
+			if id := extractNodeID(raw); id != "" {
+				if txt := resolveText(id, depth+1); txt != "" {
+					return txt
+				}
+			}
+		}
+		return ""
 	}
 
 	// Collect CLIPTextEncode texts, keyed by node ID
@@ -1026,7 +1384,7 @@ func parseComfyUIJSONNodes(nodes map[string]json.RawMessage) *ParsedParams {
 				}
 			}
 
-		case "KSampler", "KSamplerAdvanced", "SamplerCustomAdvanced":
+		case "KSampler", "KSamplerAdvanced", "KSamplerWithNAG", "SamplerCustomAdvanced":
 			var inputs struct {
 				Seed      int64   `json:"seed"`
 				NoiseSeed int64   `json:"noise_seed"`
@@ -1080,16 +1438,36 @@ func parseComfyUIJSONNodes(nodes map[string]json.RawMessage) *ParsedParams {
 				CkptName string `json:"ckpt_name"`
 			}
 			if json.Unmarshal(node.Inputs, &inputs) == nil && inputs.CkptName != "" {
-				p.Model = inputs.CkptName
+				p.Model = loraDisplayName(inputs.CkptName)
 			}
 
-		case "UNETLoader", "LoaderGGUF":
-			var inputs struct {
-				UnetName string `json:"unet_name"`
-			}
-			if json.Unmarshal(node.Inputs, &inputs) == nil && inputs.UnetName != "" {
-				p.Model = loraDisplayName(inputs.UnetName)
-			}
+			case "UNETLoader", "LoaderGGUF":
+				var inputs struct {
+					UnetName string `json:"unet_name"`
+				}
+				if json.Unmarshal(node.Inputs, &inputs) == nil && inputs.UnetName != "" {
+					p.Model = loraDisplayName(inputs.UnetName)
+				}
+
+			case "NunchakuQwenImageDiTLoader", "DiTLoader", "FluxDiTLoader":
+				var inputs struct {
+					ModelName string `json:"model_name"`
+					UnetName  string `json:"unet_name"`
+					Model     string `json:"model"`
+				}
+				if json.Unmarshal(node.Inputs, &inputs) == nil {
+					name := inputs.ModelName
+					if name == "" {
+						name = inputs.UnetName
+					}
+					if name == "" {
+						name = inputs.Model
+					}
+					if name != "" {
+						p.Model = loraDisplayName(name)
+					}
+				}
+
 
 		case "DualCLIPLoader":
 			var inputs struct {
@@ -1163,6 +1541,71 @@ func parseComfyUIJSONNodes(nodes map[string]json.RawMessage) *ParsedParams {
 				p.LoRAs = append(p.LoRAs, LoRAEntry{Name: loraDisplayName(inputs.LoraName), Weight: w})
 			}
 
+			case "Power Lora Loader (rgthree)":
+				// rgthree Power Lora Loader stores loras as lora_1, lora_2, ...
+				// Each value is {on: bool, lora: string, strength: float}.
+				var inputs map[string]json.RawMessage
+				if json.Unmarshal(node.Inputs, &inputs) == nil {
+					keys := make([]string, 0, len(inputs))
+					for k := range inputs {
+						if strings.HasPrefix(k, "lora_") {
+							keys = append(keys, k)
+						}
+					}
+					sort.Strings(keys)
+					for _, key := range keys {
+						var lora struct {
+							On       bool    `json:"on"`
+							Lora     string  `json:"lora"`
+							Strength float64 `json:"strength"`
+						}
+						if json.Unmarshal(inputs[key], &lora) == nil && lora.On && lora.Lora != "" {
+							p.LoRAs = append(p.LoRAs, LoRAEntry{
+								Name:   loraDisplayName(lora.Lora),
+								Weight: lora.Strength,
+							})
+						}
+					}
+				}
+
+			case "NunchakuQwenImageLoraStack", "NunchakuQwenImageLoraStackV3":
+				// Nunchaku 系 Lora 堆叠节点：lora_name_N + lora_strength_N + enabled_N(V3)
+				// "None" 表示空槽位，跳过；V3 用 enabled_N 控制开关。
+				var inputs map[string]json.RawMessage
+				if json.Unmarshal(node.Inputs, &inputs) == nil {
+					// 收集序号 1..N，按 lora_name_N 判定槽位
+					var idxs []int
+					for k := range inputs {
+						var n int
+						if _, err := fmt.Sscanf(k, "lora_name_%d", &n); err == nil {
+							idxs = append(idxs, n)
+						}
+					}
+					sort.Ints(idxs)
+					for _, n := range idxs {
+						var name string
+						if err := json.Unmarshal(inputs[fmt.Sprintf("lora_name_%d", n)], &name); err != nil || name == "" || name == "None" {
+							continue
+						}
+						// V3 的 enabled_N 若为 false 则跳过
+						if raw, ok := inputs[fmt.Sprintf("enabled_%d", n)]; ok {
+							var enabled bool
+							if json.Unmarshal(raw, &enabled) == nil && !enabled {
+								continue
+							}
+						}
+						weight := 1.0
+						if raw, ok := inputs[fmt.Sprintf("lora_strength_%d", n)]; ok {
+							json.Unmarshal(raw, &weight)
+						}
+						p.LoRAs = append(p.LoRAs, LoRAEntry{
+							Name:   loraDisplayName(name),
+							Weight: weight,
+						})
+					}
+				}
+
+
 		case "ModelSamplingSD3":
 			var inputs struct {
 				Shift float64 `json:"shift"`
@@ -1174,14 +1617,15 @@ func parseComfyUIJSONNodes(nodes map[string]json.RawMessage) *ParsedParams {
 
 	}
 
-	// Resolve positive/negative prompts using KSampler wiring
+	// Resolve positive/negative prompts using KSampler wiring.
+	// ★ 支持中间节点（easy ifElse / ConditioningCombine 等）：递归追踪到叶子文本节点。
 	if posNodeID != "" {
-		if txt, ok := textNodes[posNodeID]; ok {
+		if txt := resolveText(posNodeID, 0); txt != "" {
 			p.Prompt = txt
 		}
 	}
 	if negNodeID != "" {
-		if txt, ok := textNodes[negNodeID]; ok {
+		if txt := resolveText(negNodeID, 0); txt != "" {
 			p.NegativePrompt = txt
 		}
 	}
@@ -1488,6 +1932,8 @@ func applyLoraHashes(hashesStr string, p *ParsedParams) {
 }
 
 func loraDisplayName(path string) string {
+	// 兼容 Windows 反斜杠与 Unix 斜杠路径分隔
+	path = strings.ReplaceAll(path, "\\", "/")
 	parts := strings.Split(path, "/")
 	name := parts[len(parts)-1]
 	if idx := strings.LastIndex(name, "."); idx != -1 {

@@ -55,6 +55,7 @@ const Settings = (() => {
                         <div class="settings-dir-row" style="margin-top: 4px;">
                             <input type="text" id="settingsThumbDir" class="settings-dir-input" readonly />
                             <button id="settingsBrowseThumbDir" class="btn-small" title="${t("settings.select_thumb_dir")}"><span class="icon icon-browse"></span></button>
+                            <button id="settingsNewThumbDir" class="btn-small" title="${t("settings.new_thumb_dir")}"><span class="icon icon-add"></span></button>
                             <button id="settingsResetThumbDir" class="btn-small" title="${t("settings.reset_default")}"><span class="icon icon-reset"></span></button>
                         </div>
                         <span class="input-hint" id="settingsThumbDirHint"></span>
@@ -173,6 +174,15 @@ const Settings = (() => {
                         <span style="color: var(--accent);" id="settingsLanURLText"></span>
                     </div>
                 </div>
+
+                <!-- 7. 项目主页 -->
+                <div class="settings-section" style="border-top: 1px solid var(--border-light); padding-top: 14px;">
+                    <h4><span class="icon icon-web"></span> ${t("settings.project_home")}</h4>
+                    <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 8px;">${t("settings.project_home_hint")}</div>
+                    <button id="settingsCopyGithub" class="btn-small" style="width: 100%; justify-content: flex-start; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                        <span class="icon icon-link"></span> <span id="settingsGithubUrl">https://github.com/SamLiu1000/Local-Gallery</span>
+                    </button>
+                </div>
             </div>
             <div class="modal-actions">
                 <button id="btnCloseSettings" class="btn-primary">${t("settings.close")}</button>
@@ -193,6 +203,8 @@ const Settings = (() => {
         initColorPickers();
 
         document.getElementById('settingsBrowseThumbDir').addEventListener('click', browseThumbDir);
+        const newThumbBtn = document.getElementById('settingsNewThumbDir');
+        if (newThumbBtn) newThumbBtn.addEventListener('click', newThumbDir);
         document.getElementById('settingsResetThumbDir').addEventListener('click', resetThumbDir);
         document.getElementById('settingsBrowseUserDataDir').addEventListener('click', browseUserDataDir);
         document.getElementById('settingsResetUserDataDir').addEventListener('click', resetUserDataDir);
@@ -203,6 +215,19 @@ const Settings = (() => {
         document.getElementById('settingsClearFolderThumbs').addEventListener('click', clearSelectedFolderThumbs);
         document.getElementById('settingsStartLAN').addEventListener('click', startLANServer);
         document.getElementById('settingsStopLAN').addEventListener('click', stopLANServer);
+        // ★ 项目主页链接：点击复制完整 URL
+        const githubBtn = document.getElementById('settingsCopyGithub');
+        if (githubBtn) {
+            githubBtn.addEventListener('click', async function() {
+                const url = 'https://github.com/SamLiu1000/Local-Gallery';
+                try {
+                    await copyToClipboardText(url);
+                    showSettingsToast(t('settings.copied'));
+                } catch (e) {
+                    showSettingsToast(t('settings.copy_failed') + ': ' + e.message, true);
+                }
+            });
+        }
         // 复选框即时保存到 localStorage
         document.getElementById('settingsLanAutoStart').addEventListener('change', function() {
             localStorage.setItem('lanAutoStart', String(this.checked));
@@ -361,6 +386,36 @@ const Settings = (() => {
 
     async function browseThumbDir() {
         try {
+            // ★ 直接选择 thumbnails.db 文件（而非文件夹），路径天然指向真实缩略图库，
+            //   避免"选错目录导致空库重新生成"的问题
+            const filePath = await WailsBridge.selectThumbDBFile();
+            if (!filePath) return;
+
+            await syncSettingsCache('thumbDir', filePath);
+
+            const result = await WailsBridge.setThumbDir(filePath);
+            if (result && result.success) {
+                _settingsChanged = true;
+                document.getElementById('settingsThumbDir').value = result.thumbDir;
+                // ★ 显示后端的具体提示（含目标库数量/空库警告）
+                const hint = document.getElementById('settingsThumbDirHint');
+                hint.innerHTML = '<span class="icon icon-check"></span> ' + (result.message || t('settings.cache_dir_updated'));
+                hint.style.color = 'var(--green)';
+                App.showToast(result.message || t('settings.cache_dir_updated'), 'success');
+                // ★ 保存后立即热切换，无需退出重启
+                await applyDataDirSwitch();
+            } else {
+                await syncSettingsCache('thumbDir', await WailsBridge.getThumbDir());
+                App.showToast(t('settings.save_failed') + ': ' + (result.error || t('settings.unknown_error')), 'error');
+            }
+        } catch (e) {
+            App.showToast(t('settings.select_dir_failed') + ': ' + e.message, 'error');
+        }
+    }
+
+    // ★ 新建缩略图库目录：选择文件夹，程序将在其中创建 thumbnails.db（从空库开始）
+    async function newThumbDir() {
+        try {
             const folderPath = await WailsBridge.selectFolder();
             if (!folderPath) return;
 
@@ -371,10 +426,10 @@ const Settings = (() => {
                 _settingsChanged = true;
                 document.getElementById('settingsThumbDir').value = result.thumbDir;
                 const hint = document.getElementById('settingsThumbDirHint');
-                hint.innerHTML = '<span class="icon icon-check"></span> ' + t('settings.cache_dir_updated');
+                hint.innerHTML = '<span class="icon icon-check"></span> ' + (result.message || t('settings.cache_dir_updated'));
                 hint.style.color = 'var(--green)';
-                App.showToast(t('settings.cache_dir_updated'), 'success');
-                loadCacheStats();
+                App.showToast(result.message || t('settings.cache_dir_updated'), 'success');
+                await applyDataDirSwitch();
             } else {
                 await syncSettingsCache('thumbDir', await WailsBridge.getThumbDir());
                 App.showToast(t('settings.save_failed') + ': ' + (result.error || t('settings.unknown_error')), 'error');
@@ -396,7 +451,8 @@ const Settings = (() => {
                 hint.innerHTML = '<span class="icon icon-check"></span> ' + t('settings.cache_dir_reset');
                 hint.style.color = 'var(--green)';
                 App.showToast(t('settings.cache_dir_reset'), 'success');
-                loadCacheStats();
+                // ★ 方案A：保存后立即热切换
+                await applyDataDirSwitch();
             } else {
                 App.showToast(t('settings.reset_failed') + ': ' + (result.error || t('settings.unknown_error')), 'error');
             }
@@ -445,6 +501,8 @@ const Settings = (() => {
                 hint.innerHTML = '<span class="icon icon-check"></span> ' + t('settings.user_dir_set_hint');
                 hint.style.color = 'var(--green)';
                 App.showToast(t('settings.user_dir_set'), 'success');
+                // ★ 方案A：保存后立即热切换
+                await applyDataDirSwitch();
             } else {
                 App.showToast(t('settings.save_failed') + ': ' + (result.error || t('settings.unknown_error')), 'error');
             }
@@ -463,6 +521,8 @@ const Settings = (() => {
                 hint.innerHTML = '<span class="icon icon-check"></span> ' + t('settings.user_dir_reset_hint');
                 hint.style.color = 'var(--green)';
                 App.showToast(t('settings.user_dir_reset'), 'success');
+                // ★ 方案A：保存后立即热切换
+                await applyDataDirSwitch();
             } else {
                 App.showToast(t('settings.reset_failed') + ': ' + (result.error || t('settings.unknown_error')), 'error');
             }
@@ -482,6 +542,42 @@ const Settings = (() => {
         }
         await loadCurrentDirs();
         await loadCacheStats();
+    }
+
+    /**
+     * ★ 方案A：保存用户/缓存路径后立即热切换（无需退出重启）。
+     *   后端 RestartWithNewPaths 会：关旧 DB → 并行开新 DB → 原子替换内存 →
+     *   清理旧缓存。切换成功后再刷新前端缓存。
+     */
+    async function applyDataDirSwitch() {
+        if (typeof WailsBridge === 'undefined' || !WailsBridge.isWails()) {
+            await refreshAfterDataDirChange();
+            return;
+        }
+        try {
+            const result = await WailsBridge.restartWithNewPaths();
+            if (result && result.success) {
+                console.log('[设置] 数据目录已热切换:', result.userDataDir);
+                // ★ 路径已生效，不再需要关闭时 Quit 重启
+                _settingsChanged = false;
+                await refreshAfterDataDirChange();
+                if (typeof Gallery !== 'undefined' && Gallery.refreshRootFromServer) {
+                    const roots = Gallery.getImportedRoots ? Gallery.getImportedRoots() : [];
+                    for (const r of roots) {
+                        try { await Gallery.refreshRootFromServer(r.rootId || r.path); } catch (e) {}
+                    }
+                }
+            } else {
+                console.warn('[设置] 热切换失败:', result && result.error);
+                App.showToast((result && result.error) || t('settings.switch_failed'), 'error');
+                // 失败时维持旧数据，前端只刷新缓存
+                await refreshAfterDataDirChange();
+            }
+        } catch (e) {
+            console.warn('[设置] 热切换异常:', e.message);
+            App.showToast(t('settings.switch_failed') + ': ' + e.message, 'error');
+            await refreshAfterDataDirChange();
+        }
     }
 
     // ==================== 缩略图生成设置 ====================
@@ -605,10 +701,10 @@ const Settings = (() => {
                     name.textContent = node.name;
                     row.appendChild(name);
 
-                    // 刷新按钮：重新扫描该文件夹
+                    // 刷新按钮：重新扫描该文件夹（图标用小锤子，与右键刷新区分开，避免误导）
                     const refreshBtn = document.createElement('button');
                     refreshBtn.className = 'thumb-folder-tree-refresh';
-                    refreshBtn.innerHTML = '<span class="icon icon-refresh"></span>';
+                    refreshBtn.innerHTML = '<span class="icon icon-hammer"></span>';
                     refreshBtn.title = t('settings.rescan_folder');
                     let isRefreshing = false;
                     refreshBtn.addEventListener('click', async (e) => {
@@ -652,7 +748,7 @@ const Settings = (() => {
                         } finally {
                             isRefreshing = false;
                             refreshBtn.disabled = false;
-                            refreshBtn.innerHTML = '<span class="icon icon-refresh"></span>';
+                            refreshBtn.innerHTML = '<span class="icon icon-hammer"></span>';
                         }
                     });
 
@@ -1029,6 +1125,31 @@ const Settings = (() => {
             }
         } catch (e) {
             App.showToast((t("settings.wifi_stop_failed") || 'Failed to stop') + ': ' + (e.message || String(e)), 'error');
+        }
+    }
+
+    // ==================== 复制与提示辅助 ====================
+
+    async function copyToClipboardText(text) {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(text);
+            return;
+        }
+        // 兜底：execCommand 方案
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        if (!ok) throw new Error('复制失败');
+    }
+
+    function showSettingsToast(msg, isError) {
+        if (typeof App !== 'undefined' && App.showToast) {
+            App.showToast(msg, isError ? 'error' : 'success');
         }
     }
 

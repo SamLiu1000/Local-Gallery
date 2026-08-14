@@ -246,7 +246,7 @@ func (a *App) generateThumbnail(srcPath string, imageID string) error {
 	// 视频文件：存储黑色占位 JPEG（无需帧提取）
 	if isVideoFile(filepath.Base(srcPath)) {
 		placeholder := createVideoPlaceholderJPEG()
-		return a.thumbDB.Update(func(tx *bbolt.Tx) error {
+		return a.thumbDB.Batch(func(tx *bbolt.Tx) error {
 			b := tx.Bucket(thumbBucket)
 			return b.Put([]byte(imageID), placeholder)
 		})
@@ -277,8 +277,8 @@ func (a *App) generateThumbnail(srcPath string, imageID string) error {
 		return fmt.Errorf("vips 导出 JPEG 失败: %w", err)
 	}
 
-	// 写入 BoltDB
-	err = a.thumbDB.Update(func(tx *bbolt.Tx) error {
+	// 写入 BoltDB（★ Batch：高并发时合并写事务 + 只 fsync 一次，缓解写锁瓶颈）
+	err = a.thumbDB.Batch(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(thumbBucket)
 		return b.Put([]byte(imageID), jpegBytes)
 	})
@@ -514,6 +514,7 @@ var (
 	thumbNotifyTimer  *time.Timer
 	thumbNotifyMu     sync.Mutex
 	thumbNotifyDirty  bool // 冷却期内有新的增量，冷却结束后需要补发
+	thumbFolderCounts map[string]int // folderKey → 最新缓存缩略图计数（增量通知缓冲，前端定向更新徽章）
 )
 
 const thumbNotifyThrottle = 300 * time.Millisecond
@@ -836,7 +837,95 @@ func (a *App) computeThumbCounts() map[string]int {
 
 	cachedThumbCounts = result
 	thumbCountsValid = true
+	// ★ 持久化到磁盘，供下次冷启动直接恢复（避免每次启动全量扫 8.6GB BoltDB + SQLite）
+	a.persistThumbCountsLocked()
 	return copyCounts(result)
+}
+
+// ==================== thumbCounts 持久化 ====================
+
+// thumbCountsFile 持久化的缩略图计数，附带 BoltDB key 数用于启动时校验
+type thumbCountsFile struct {
+	Counts    map[string]int `json:"counts"`
+	TotalKeys int            `json:"totalKeys"` // 保存时 BoltDB thumbs bucket 的 key 数
+	SavedAt   int64          `json:"savedAt"`
+}
+
+const thumbCountsFileName = "thumb-counts.json"
+
+// thumbDBKeyCount 返回 BoltDB thumbs bucket 的 key 数；不可用时返回 -1
+func (a *App) thumbDBKeyCount() int {
+	if a.thumbDB == nil {
+		// 启动流程中 thumbDB 在 NewApp 已打开；此处不主动打开，避免锁顺序问题
+		return -1
+	}
+	var n int
+	err := a.thumbDB.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(thumbBucket)
+		if b == nil {
+			return nil
+		}
+		n = b.Stats().KeyN
+		return nil
+	})
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+// persistThumbCountsLocked 写入磁盘（调用方需已持 thumbCountsMu）
+func (a *App) persistThumbCountsLocked() {
+	counts := copyCounts(cachedThumbCounts)
+	keyCount := a.thumbDBKeyCount()
+	if keyCount < 0 || a.userDataDir == "" {
+		return
+	}
+	data := thumbCountsFile{Counts: counts, TotalKeys: keyCount, SavedAt: time.Now().Unix()}
+	if b, err := json.Marshal(data); err == nil {
+		path := filepath.Join(a.userDataDir, thumbCountsFileName)
+		tmp := path + ".tmp"
+		if os.WriteFile(tmp, b, 0644) == nil {
+			os.Rename(tmp, path)
+		}
+	}
+}
+
+// persistThumbCounts 供关闭流程调用（自持锁）
+func (a *App) persistThumbCounts() {
+	thumbCountsMu.RLock()
+	defer thumbCountsMu.RUnlock()
+	if !thumbCountsValid {
+		return
+	}
+	a.persistThumbCountsLocked()
+}
+
+// loadThumbCountsFromDisk 启动时尝试恢复 thumbCounts。
+// 仅当 BoltDB 的 key 数与保存时一致（即缩略图库无变化）才采用，否则触发重算。
+func (a *App) loadThumbCountsFromDisk() {
+	if a.userDataDir == "" {
+		return
+	}
+	path := filepath.Join(a.userDataDir, thumbCountsFileName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var f thumbCountsFile
+	if err := json.Unmarshal(data, &f); err != nil || f.Counts == nil {
+		return
+	}
+	keyCount := a.thumbDBKeyCount()
+	if keyCount < 0 || keyCount != f.TotalKeys {
+		fmt.Printf("[缩略图] 缩略图库有变化（key %d != %d），跳过缓存的 thumbCounts，稍后重算\n", keyCount, f.TotalKeys)
+		return
+	}
+	thumbCountsMu.Lock()
+	cachedThumbCounts = f.Counts
+	thumbCountsValid = true
+	thumbCountsMu.Unlock()
+	fmt.Printf("[缩略图] 从磁盘恢复 thumbCounts（%d 个文件夹）\n", len(f.Counts))
 }
 
 func copyCounts(src map[string]int) map[string]int {
@@ -907,17 +996,50 @@ func (a *App) incrementThumbCount(imageID string) {
 		thumbCountsMu.Unlock()
 		return
 	}
+	// 记录本次变化的文件夹新计数（含所有上级），供 thumb:progress 增量定向通知
+	updated := map[string]int{}
 	cachedThumbCounts[rootPath]++
+	updated[rootPath] = cachedThumbCounts[rootPath]
 	if folder != "" {
 		parts := strings.Split(folder, "/")
 		for i := 1; i <= len(parts); i++ {
 			subPath := rootPath + "/" + strings.Join(parts[:i], "/")
 			cachedThumbCounts[subPath]++
+			updated[subPath] = cachedThumbCounts[subPath]
 		}
 	}
 	thumbCountsMu.Unlock()
 
+	// 合并进通知缓冲
+	thumbNotifyMu.Lock()
+	if thumbFolderCounts == nil {
+		thumbFolderCounts = make(map[string]int)
+	}
+	for k, v := range updated {
+		thumbFolderCounts[k] = v
+	}
+	thumbNotifyMu.Unlock()
+
 	a.throttleThumbProgress()
+}
+
+// takeThumbFolderCountsLocked 取出并清空待通知的文件夹缩略图计数（调用方需持有 thumbNotifyMu）
+func takeThumbFolderCountsLocked() map[string]int {
+	if len(thumbFolderCounts) == 0 {
+		return nil
+	}
+	folders := thumbFolderCounts
+	thumbFolderCounts = nil
+	return folders
+}
+
+// emitThumbProgressPayload 发送 thumb:progress 事件，携带本次变化的文件夹计数（前端据此定向更新徽章）
+func (a *App) emitThumbProgressPayload() {
+	payload := map[string]interface{}{}
+	if folders := takeThumbFolderCountsLocked(); len(folders) > 0 {
+		payload["folders"] = folders
+	}
+	wailsruntime.EventsEmit(a.ctx, "thumb:progress", payload)
 }
 
 // throttleThumbProgress 节流通知前端：首次立即发射，冷却期内置脏标记，冷却结束补发
@@ -928,15 +1050,16 @@ func (a *App) throttleThumbProgress() {
 		thumbNotifyMu.Unlock()
 		return
 	}
-	wailsruntime.EventsEmit(a.ctx, "thumb:progress", map[string]interface{}{})
 	thumbNotifyDirty = false
+	// 立即发射（携带已累计的文件夹计数）
+	a.emitThumbProgressPayload()
 	thumbNotifyTimer = time.AfterFunc(thumbNotifyThrottle, func() {
 		thumbNotifyMu.Lock()
 		if thumbNotifyDirty {
-			wailsruntime.EventsEmit(a.ctx, "thumb:progress", map[string]interface{}{})
+			thumbNotifyDirty = false
+			a.emitThumbProgressPayload()
 		}
 		thumbNotifyTimer = nil
-		thumbNotifyDirty = false
 		thumbNotifyMu.Unlock()
 	})
 	thumbNotifyMu.Unlock()
@@ -944,7 +1067,9 @@ func (a *App) throttleThumbProgress() {
 
 // emitThumbProgress 立即通知前端刷新（预生成定时器/完成时使用，不走防抖）
 func (a *App) emitThumbProgress() {
-	wailsruntime.EventsEmit(a.ctx, "thumb:progress", map[string]interface{}{})
+	thumbNotifyMu.Lock()
+	a.emitThumbProgressPayload()
+	thumbNotifyMu.Unlock()
 }
 
 // CleanOrphanedThumbs 清理 BoltDB 中孤立缩略图（没有对应 images 记录的 key）
@@ -1086,6 +1211,8 @@ func (a *App) RestartWithNewPaths() map[string]interface{} {
 		return map[string]interface{}{"success": false, "error": "切换正在进行中，请稍后重试"}
 	}
 	defer a.switchMu.Unlock()
+	// ★ 切换期间暂停后台，无论成功/失败都必须恢复，否则扫描/预生成一直停摆。
+	defer a.bgPaused.Store(0)
 
 	execDir, _ := os.Getwd()
 	defaultDir := filepath.Join(execDir, "user")
@@ -1249,7 +1376,7 @@ func (a *App) RestartWithNewPaths() map[string]interface{} {
 		return map[string]interface{}{"success": false, "error": fmt.Sprintf("无法创建缩略图目录: %v", err)}
 	}
 	time.Sleep(50 * time.Millisecond)
-	newThumb, err := bbolt.Open(newThumbDBPath, 0644, &bbolt.Options{Timeout: 3 * time.Second})
+	newThumb, err := bbolt.Open(newThumbDBPath, 0644, &bbolt.Options{Timeout: 3 * time.Second, NoSync: true})
 	if err != nil {
 		a.thumbDBMu.Unlock()
 		return map[string]interface{}{"success": false, "error": fmt.Sprintf("无法打开缩略图数据库: %v", err)}
@@ -1342,7 +1469,46 @@ func (a *App) SetThumbDir(path string) map[string]interface{} {
 	if err := writeGlobalSettings(current); err != nil {
 		return map[string]interface{}{"success": false, "error": "保存设置失败: " + err.Error()}
 	}
-	return map[string]interface{}{"success": true, "thumbDir": path, "message": "路径已保存（重启后生效）"}
+	// ★ 防乌龙：检查目标缩略图库状态，明确提示用户将指向什么。
+	//   避免误指向空目录后重启，出现"数量 0 + 全量重新生成"的困惑。
+	//   thumbDir 支持两种形式：文件夹（自动补 thumbnails.db）或 .db 文件直接指定。
+	msg := "路径已保存（重启后生效）"
+	if path != "" {
+		targetPath := path
+		if filepath.Ext(path) != ".db" {
+			targetPath = filepath.Join(path, "thumbnails.db")
+		}
+		if targetPath != a.GetThumbDir() { // 目标与当前打开的库不同才统计
+			if n := countThumbKeysInFile(targetPath); n < 0 {
+				msg = "路径已保存（重启后生效）。注意：目标位置没有缩略图库，切换后将从空库开始，已有缩略图不会丢失但需要时重新生成"
+			} else if n == 0 {
+				msg = "路径已保存（重启后生效）。注意：目标库为空（0 张缩略图）"
+			} else {
+				msg = fmt.Sprintf("路径已保存（重启后生效）。目标库已有 %d 张缩略图", n)
+			}
+		}
+	}
+	return map[string]interface{}{"success": true, "thumbDir": path, "message": msg}
+}
+
+// countThumbKeysInFile 只读统计指定 BoltDB 文件的缩略图 key 数；文件不存在/无法打开返回 -1
+func countThumbKeysInFile(path string) int {
+	if path == "" {
+		return -1
+	}
+	db, err := bbolt.Open(path, 0600, &bbolt.Options{ReadOnly: true, Timeout: 2 * time.Second})
+	if err != nil {
+		return -1
+	}
+	defer db.Close()
+	var n int
+	_ = db.View(func(tx *bbolt.Tx) error {
+		if b := tx.Bucket(thumbBucket); b != nil {
+			n = b.Stats().KeyN
+		}
+		return nil
+	})
+	return n
 }
 func (a *App) saveUserDataDirToDefault(userDataDir string) {
 	execDir, err := os.Getwd()
@@ -1421,10 +1587,13 @@ func (a *App) GetThumbCacheInfo() map[string]interface{} {
 	var count int
 	var dbFileSize int64
 
-	// 获取 BoltDB 文件大小
-	dbPath := filepath.Join(a.userDataDir, "thumbnails.db")
-	if info, err := os.Stat(dbPath); err == nil {
-		dbFileSize = info.Size()
+	// 获取 BoltDB 文件大小（★ 统计实际打开的库，而非 userDataDir 下的同名文件——
+	//   thumbDir 可配置到其它目录，读错文件会出现"数量 0 占用 10GB"的矛盾显示）
+	dbPath := a.GetThumbDir()
+	if dbPath != "" {
+		if info, err := os.Stat(dbPath); err == nil {
+			dbFileSize = info.Size()
+		}
 	}
 
 	// 统计 key 数量

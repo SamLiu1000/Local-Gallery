@@ -84,6 +84,14 @@ func (a *App) PreloadThumbCounts() {}
 
 func (a *App) getCachedThumbCounts() map[string]int { return nil }
 
+func (a *App) thumbDBKeyCount() int { return -1 }
+
+func (a *App) persistThumbCountsLocked() {}
+
+func (a *App) persistThumbCounts() {}
+
+func (a *App) loadThumbCountsFromDisk() {}
+
 func (a *App) GetUserDataDir() string { return "" }
 
 func (a *App) SetUserDataDir(path string) map[string]interface{} {
@@ -107,5 +115,7 @@ func readJSONFile(path string) map[string]interface{} {
 func writeJSONFile(path string, data map[string]interface{}) {}
 
 func formatThumbSize(bytes int64) string { return "0 B" }
+
+func countThumbKeysInFile(path string) int { return -1 }
 
 func GetImageDimensionsVips(filePath string) (int, int) { return 0, 0 }

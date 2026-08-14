@@ -18,8 +18,16 @@ export function AppendReverseLog(arg1, arg2, arg3) {
   return window['go']['main']['App']['AppendReverseLog'](arg1, arg2, arg3);
 }
 
+export function BackfillContentHashes() {
+  return window['go']['main']['App']['BackfillContentHashes']();
+}
+
 export function CancelProxyRequest(arg1) {
   return window['go']['main']['App']['CancelProxyRequest'](arg1);
+}
+
+export function CleanDuplicateImages() {
+  return window['go']['main']['App']['CleanDuplicateImages']();
 }
 
 export function CleanOrphanedThumbs() {
@@ -128,6 +136,10 @@ export function GetImportedRoots() {
 
 export function GetLANInfo() {
   return window['go']['main']['App']['GetLANInfo']();
+}
+
+export function GetParamTags(arg1) {
+  return window['go']['main']['App']['GetParamTags'](arg1);
 }
 
 export function GetPreGenStatus() {
@@ -304,6 +316,10 @@ export function SearchImages(arg1, arg2, arg3, arg4) {
 
 export function SelectFolder() {
   return window['go']['main']['App']['SelectFolder']();
+}
+
+export function SelectThumbDBFile() {
+  return window['go']['main']['App']['SelectThumbDBFile']();
 }
 
 export function SetContext(arg1) {
