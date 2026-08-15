@@ -36,6 +36,47 @@ const Gallery = (() => {
     const DOM_KEEP = 250;           // IntersectionObserver 预加载前后各覆盖的图片张数
     let currentFavoriteFilter = false; // 当前是否在收藏视图
     let isFilteringActive = false;
+
+    // ★ 内存优化：全局 images 数组软上限（LRU 式淘汰旧文件夹的服务端图片）。
+    //   images 跨文件夹切换只增不减（用于快速缓存切换），大库浏览久了会膨胀。
+    //   超过上限时保留"当前视图 + 最近访问"的文件夹，淘汰更早的 _fromServer 图片。
+    const IMAGES_CACHE_MAX = 20000;
+    const IMAGES_KEEP_RECENT_FOLDERS = 10; // 最近访问的文件夹数量
+    let recentFolderKeys = [];              // MRU 在前
+
+    // 记录一次文件夹访问（切换视图时调用）
+    function noteFolderVisited(normalizedFolder) {
+        const key = normalizedFolder || '__root__';
+        recentFolderKeys = [key, ...recentFolderKeys.filter(k => k !== key)].slice(0, IMAGES_KEEP_RECENT_FOLDERS);
+    }
+
+    // 超过上限时淘汰最旧文件夹的服务端图片（保留当前/最近访问的文件夹）
+    function pruneImagesCache() {
+        if (images.length <= IMAGES_CACHE_MAX) return;
+        const keepKeys = new Set(recentFolderKeys);
+        const removable = [];
+        for (let i = 0; i < images.length; i++) {
+            const img = images[i];
+            if (!img._fromServer) continue;
+            const imgRoot = (img.rootPath || '').replace(/\\/g, '/');
+            const imgFolder = (img.folder || '').replace(/\\/g, '/');
+            const folderKey = imgFolder ? `${imgRoot}/${imgFolder}` : imgRoot;
+            if (!keepKeys.has(folderKey)) {
+                removable.push(img);
+            }
+        }
+        if (removable.length === 0) return;
+        // 数组顺序近似"先访问的在前"，从最早的开始淘汰到上限以下
+        const overflow = images.length - IMAGES_CACHE_MAX;
+        const removeCount = Math.min(removable.length, overflow);
+        const removePaths = new Set();
+        for (let i = 0; i < removeCount; i++) {
+            removePaths.add(removable[i].path);
+        }
+        images = images.filter(img => !removePaths.has(img.path));
+        invalidatePathIndex();
+        console.log(`[Gallery] 内存优化：淘汰 ${removeCount} 张旧文件夹图片（上限 ${IMAGES_CACHE_MAX}），当前 ${images.length}`);
+    }
     let folderAbortController = null; // 问题一：文件夹切换中断控制器
     let folderLoadTotal = 0;          // 当前文件夹服务器的图片总数
     let folderLoadOffset = 0;         // 已加载偏移量
@@ -54,7 +95,6 @@ const Gallery = (() => {
     let favLoadOffset = 0;            // 已加载偏移量
     let importedRoots = [];         // [{ rootId, path, name, handleName, displayName }]
     let importedRootsLoaded = false; // ★ 启动时 importedRoots 是否已从后端恢复（防止未就绪时保存不完整列表）
-    let directoryHandles = [];      // [{ id, name, handle }] 用于 File System Access API 持久化
     let isEditMode = false;         // 编辑模式：单击选择，双击预览
     let onEditModeChange = null;    // 编辑模式变化回调
 
@@ -876,7 +916,7 @@ const Gallery = (() => {
      *   浏览器连接池导致可见区域图片排队等待。
      */
     let _prewarmActive = 0;
-    const _prewarmMaxConcurrent = 6; // 与单 origin 连接数持平，给可见区域留连接
+    const _prewarmMaxConcurrent = 10; // 两个缩略图 origin 共 12 连接，预取留 2 给可见区域
     let _prewarmPending = [];
 
     function _prewarmThumbnails(displayImages, currentStart, currentEnd) {
@@ -973,6 +1013,7 @@ const Gallery = (() => {
      */
     // ★ Bug 4b: 缓存 httpBaseURL，避免每次加载都重新获取
     let cachedHttpBaseURL = '';
+    let cachedThumbBaseURL2 = ''; // 缩略图第二 origin（每 origin 独立 6 连接池，轮询分流）
     let cachedImageBaseURL = ''; // ★ 原图独立 origin
     let cachedThumbGen = 0;
 
@@ -985,6 +1026,12 @@ const Gallery = (() => {
                 try { cachedHttpBaseURL = await WailsBridge.getHTTPBaseURL(); } catch (e) {}
             }
         }
+        if (!cachedThumbBaseURL2) {
+            cachedThumbBaseURL2 = WailsBridge._httpBaseURL2 || '';
+            if (!cachedThumbBaseURL2) {
+                try { cachedThumbBaseURL2 = await WailsBridge.getThumbBaseURL2(); } catch (e) {}
+            }
+        }
         if (!cachedImageBaseURL) {
             cachedImageBaseURL = WailsBridge._imageBaseURL || '';
             if (!cachedImageBaseURL) {
@@ -993,8 +1040,22 @@ const Gallery = (() => {
         }
     }
 
+    // ★ 缩略图 URL 按图片 ID 哈希在 2 个 origin 间轮询分流：
+    //   浏览器为每个 origin 分配独立 6 连接池，两个 origin 共 12 连接，
+    //   大幅缓解大图库批量加载时的连接排队（同一张图始终走同一 origin，缓存命中稳定）。
     function makeThumbURL(imgID, lastModified) {
-        return cachedHttpBaseURL + '/thumb/' + imgID + '?t=' + lastModified + '&g=' + cachedThumbGen;
+        let base = cachedHttpBaseURL;
+        if (cachedThumbBaseURL2 && imgID) {
+            // 取 ID 首字符散列值判断奇偶，同一 ID 恒定落在同一 origin
+            let h = 0;
+            for (let i = 0; i < imgID.length; i++) {
+                h = (h * 31 + imgID.charCodeAt(i)) | 0;
+            }
+            if ((h & 1) !== 0) {
+                base = cachedThumbBaseURL2;
+            }
+        }
+        return base + '/thumb/' + imgID + '?t=' + lastModified + '&g=' + cachedThumbGen;
     }
 
     async function refreshThumbGen() {
@@ -1279,14 +1340,13 @@ const Gallery = (() => {
         return { count: rootImages.length, rootPath };
     }
 
-    // ==================== File System Access API 导入 ====================
+    // ==================== 浏览器回退导入（仅非 Wails 环境） ====================
 
     /**
-     * 使用 showDirectoryPicker() 选择文件夹并导入
-     * 优先将真实目录注册到后端 user/registered-roots.json，再由后端扫描并持久化
-     * ★ 所有数据只通过后端 user-data.json 持久化，不依赖 IndexedDB
-     * ★ 如果浏览器暴露了绝对路径，由 Go 后端扫描文件系统
-     * ★ 如果浏览器未暴露绝对路径，由前端遍历 FileSystemDirectoryHandle 获取 File 对象
+     * 浏览器回退：showDirectoryPicker() 导入。
+     * ★ 桌面版(Wails)不使用此函数——添加文件夹走 openSystemFolderPicker 的
+     *   Go 原生对话框（SelectFolder），直接拿到真实路径并注册到后端扫描。
+     *   此分支仅当程序运行在纯浏览器环境时才会触发。
      */
     async function importFromDirectoryPicker() {
         try {
@@ -1304,24 +1364,12 @@ const Gallery = (() => {
             let possiblePath = handle.path || handle.fullPath || null;
 
             if (!possiblePath) {
-                // ★ 浏览器不暴露绝对路径：让用户输入/确认路径
-                //    这是 Web 浏览器的安全限制，无法自动获取绝对路径
-                //    必须由用户手动提供路径，后端才能扫描文件系统并持久化
+                // ★ 桌面版(Wails)不进入此分支：添加文件夹走 openSystemFolderPicker 的
+                //   Go 原生对话框（SelectFolder），直接拿到真实路径。
+                //   浏览器拿不到真实路径是 Web 安全限制，不再要求用户手动输入路径。
                 showLoading(false);
-                const userPath = prompt(
-                    `浏览器安全限制无法自动获取文件夹的绝对路径。\n` +
-                    `请输入您刚才选择的 "${rootName}" 文件夹的完整路径：\n\n` +
-                    `例如：D:\\images\\${rootName} 或 /home/user/${rootName}\n\n` +
-                    `（输入路径后，后端会扫描该文件夹并持久化，刷新不会消失）`
-                );
-                if (userPath && userPath.trim()) {
-                    possiblePath = userPath.trim();
-                    showLoading(true);
-                } else {
-                    // 用户取消了输入，不导入
-                    App.showToast(t('toast.no_path_cancelled'), 'info');
-                    return null;
-                }
+                App.showToast('浏览器无法获取文件夹真实路径。桌面版请通过 Wails 原生对话框添加文件夹。', 'error');
+                return null;
             }
 
             // ★ 有路径（自动获取或用户输入）：由 Go 后端扫描文件系统
@@ -1395,159 +1443,10 @@ const Gallery = (() => {
     }
 
     /**
-     * 从已保存的 FileSystemDirectoryHandle 恢复图片列表
-     * 刷新页面后调用，用户只需授权一次
+     * 已删除：restoreFromDirectoryHandles（File System Access API 目录句柄恢复）。
+     * 目录句柄是浏览器私有的"授权凭证"，不是真实路径，且该函数从未被调用。
+     * 路径唯一来源 = 后端真实路径（GetFolders / importedRoots），句柄机制整体废弃。
      */
-    async function restoreFromDirectoryHandles() {
-        try {
-            const savedHandles = await Storage.getAllDirectoryHandles();
-            if (!savedHandles || savedHandles.length === 0) {
-                console.log('[Gallery] IndexedDB 中没有已保存的目录句柄');
-                return 0;
-            }
-
-            let totalRestored = 0;
-            let restoredRootCount = 0;
-            let deniedCount = 0;
-            let invalidCount = 0;
-
-            console.log(`[Gallery] 发现 ${savedHandles.length} 个已保存的目录句柄，开始恢复`);
-
-            for (const saved of savedHandles) {
-                try {
-                    const handle = saved.handle;
-                    if (!handle) {
-                        invalidCount++;
-                        console.warn(`[Gallery] 目录句柄无效，已跳过: ${saved.name}`);
-                        continue;
-                    }
-
-                    // 请求权限（用户只需点一次"允许"）
-                    const options = { mode: 'read' };
-                    let permission = await handle.queryPermission(options);
-                    if (permission !== 'granted') {
-                        permission = await handle.requestPermission(options);
-                    }
-                    if (permission !== 'granted') {
-                        deniedCount++;
-                        console.warn(`[Gallery] 用户未授权访问目录: ${saved.name}`);
-                        continue;
-                    }
-
-                    const rootId = saved.id;
-                    const rootName = saved.name;
-
-                    // 检查是否已导入
-                    if (importedRoots.some(r => r.rootId === rootId)) continue;
-
-                    const importedImages = [];
-
-                    async function traverseDir(dirHandle, currentPath = '') {
-                        const entries = [];
-                        try {
-                            for await (const entry of dirHandle.values()) {
-                                entries.push(entry);
-                            }
-                        } catch (err) {
-                            console.warn(`[Gallery] 无法读取目录 ${currentPath}:`, err.message);
-                            return;
-                        }
-
-                        for (const entry of entries) {
-                            if (entry.kind === 'file') {
-                                const ext = '.' + (entry.name.split('.').pop() || '').toLowerCase();
-                                if (IMAGE_EXTENSIONS.has(ext)) {
-                                    try {
-                                        const file = await entry.getFile();
-                                        const folder = currentPath ? currentPath : '';
-                                        const fullPath = folder ? `${rootName}/${folder}/${entry.name}` : `${rootName}/${entry.name}`;
-                                        const relativePath = folder ? `${folder}/${entry.name}` : entry.name;
-
-                                        const imgEntry = {
-                                            id: 'local_' + Math.abs(hashString(fullPath + '::' + file.size + '::' + file.lastModified)),
-                                            path: fullPath,
-                                            relativePath: relativePath,
-                                            name: entry.name,
-                                            size: file.size || 0,
-                                            lastModified: file.lastModified || Date.now(),
-                                            folder: folder,
-                                            rootPath: rootId,
-                                            rootId: rootId,
-                                            displayName: rootName,
-                                            url: null,
-                                            thumbnailUrl: null,
-                                            metadata: null,
-                                            file: file,
-                                            _loaded: false,
-                                            _directoryHandle: handle,
-                                            _fileHandle: entry
-                                        };
-
-                                        importedImages.push(imgEntry);
-                                    } catch (err) {
-                                        console.warn(`[Gallery] 读取文件失败: ${entry.name}`, err.message);
-                                    }
-                                }
-                            } else if (entry.kind === 'directory') {
-                                const subPath = currentPath ? `${currentPath}/${entry.name}` : entry.name;
-                                await traverseDir(entry, subPath);
-                            }
-                        }
-                    }
-
-                    await traverseDir(handle);
-
-                    if (importedImages.length > 0) {
-                        images.push(...importedImages);
-                        importedRoots.push({
-                            rootId: rootId,
-                            path: rootId,
-                            name: rootName,
-                            handleName: rootName,
-                            displayName: rootName
-                        });
-                        totalRestored += importedImages.length;
-                        restoredRootCount++;
-                        console.log(`[Gallery] 已恢复目录: ${rootName} (${importedImages.length} 张图片)`);
-                    } else {
-                        console.warn(`[Gallery] 目录中未找到可恢复图片: ${rootName}`);
-                    }
-                } catch (err) {
-                    invalidCount++;
-                    console.warn(`[Gallery] 恢复目录句柄失败: ${saved.name}`, err.message);
-                }
-            }
-
-            if (totalRestored > 0) {
-                applyCurrentFilter();
-                sortImages();
-                updateImageCount();
-                console.log(`[Gallery] 共恢复 ${restoredRootCount} 个目录，${totalRestored} 张图片`);
-            } else {
-                console.warn(`[Gallery] 未恢复任何目录。已保存句柄: ${savedHandles.length}，未授权: ${deniedCount}，无效/失败: ${invalidCount}`);
-                if (deniedCount > 0) {
-                    showToast(t('toast.handle_not_authorized').replace('{n}', savedHandles.length), 'warning');
-                } else if (invalidCount > 0) {
-                    showToast(t('toast.handle_invalid'), 'warning');
-                }
-            }
-
-            return totalRestored;
-        } catch (err) {
-            console.warn('[Gallery] 从 directory handles 恢复失败:', err.message);
-            showToast(t('toast.read_folder_failed') + ': ' + err.message, 'warning');
-            return 0;
-        }
-    }
-
-    function hashString(str) {
-        let hash = 0;
-        for (let i = 0; i < str.length; i++) {
-            hash = ((hash << 5) - hash) + str.charCodeAt(i);
-            hash |= 0;
-        }
-        return hash;
-    }
 
     // ==================== 本地文件夹导入（兼容旧版 webkitdirectory） ====================
 
@@ -2353,6 +2252,11 @@ const Gallery = (() => {
     }
 
     function abortFolderSwitch() {
+        // ★ 文件夹切换取消：通知后端"遗弃"当前离开的文件夹，
+        //   取消其排队中的缩略图生成（避免为已不看的内容读盘生成）
+        if (currentFolderFilter && typeof WailsBridge !== 'undefined' && WailsBridge.abandonFolder) {
+            try { WailsBridge.abandonFolder(currentFolderFilter); } catch (e) { /* 静默 */ }
+        }
         if (folderAbortController) {
             folderAbortController.abort();
             folderAbortController = null;
@@ -2466,6 +2370,14 @@ const Gallery = (() => {
         currentTagFilter = null;
         currentFavoriteFilter = false;
         isFilteringActive = !!currentFolderFilter;
+
+        // ★ 内存优化：记录本次访问的文件夹（LRU 淘汰时保留最近访问）
+        noteFolderVisited(currentFolderFilter);
+
+        // ★ 文件夹切换：通知后端当前聚焦的文件夹（从"遗弃集合"恢复其缩略图生成）
+        if (currentFolderFilter && typeof WailsBridge !== 'undefined' && WailsBridge.focusFolder) {
+            try { WailsBridge.focusFolder(currentFolderFilter); } catch (e) { /* 静默 */ }
+        }
 
         // ★ 修复：切换文件夹时退出搜索模式。否则 isSearchMode/searchResults 残留，
         //   配合异步续体可能把搜索结果数组渲染进文件夹视图（显示成其它文件夹的内容）。
@@ -2952,6 +2864,12 @@ const Gallery = (() => {
             case 'name-desc':
                 arr.sort((a, b) => b.name.localeCompare(a.name));
                 break;
+            case 'folder-asc':
+                arr.sort((a, b) => (a.folder || '').localeCompare(b.folder || '') || a.name.localeCompare(b.name));
+                break;
+            case 'folder-desc':
+                arr.sort((a, b) => (b.folder || '').localeCompare(a.folder || '') || a.name.localeCompare(b.name));
+                break;
             case 'date-desc':
                 arr.sort((a, b) => (b.lastModified || 0) - (a.lastModified || 0));
                 break;
@@ -3011,6 +2929,8 @@ const Gallery = (() => {
         // ★ auto-dedup: remove duplicate entries by id/path
         images = _dedupImages(images);
         filteredImages = _dedupImages(filteredImages);
+        // ★ 内存优化：超上限时淘汰旧文件夹的服务端图片（保留当前/最近访问的文件夹）
+        pruneImagesCache();
         const displayImages = isFilteringActive ? filteredImages : images;
         console.log('[render] 被调用，displayImages.length:', displayImages.length, 'isFilteringActive:', isFilteringActive);
 
@@ -5487,7 +5407,6 @@ const Gallery = (() => {
         refreshThumbGen,              // ★ 清缓存后刷新缩略图版本号
         makeThumbURL,                 // ★ 缩略图 URL 构造（侧边栏子文件夹预览复用同一方法）
         ensureBaseURLs,               // ★ 确保 http 基地址已初始化（侧边栏预览复用）
-        restoreFromDirectoryHandles,
         saveImportedRootsToServer,    // ★ 跨浏览器持久化保存
         loadImportedRootsFromServer,  // ★ 跨浏览器持久化恢复
         reloadImportedRoot,

@@ -101,6 +101,23 @@ const WailsBridge = (() => {
         return getApp().RefreshFolder(folderPath);
     }
 
+    // ★ 文件夹切换取消：通知后端"遗弃"离开的文件夹，取消其排队中的缩略图生成
+    async function abandonFolder(folderPath) {
+        if (!isWailsEnv || !folderPath) return;
+        try {
+            await getApp().AbandonFolder(folderPath);
+        } catch (e) { console.warn('[worker] 通知遗弃失败:', e.message); }
+    }
+
+    // ★ 通知后端当前聚焦的文件夹（从遗弃集合恢复）
+    async function focusFolder(folderPath) {
+        if (!isWailsEnv || !folderPath) return;
+        try {
+            await getApp().FocusFolder(folderPath);
+            console.log('[worker] 已通知后端聚焦文件夹:', folderPath);
+        } catch (e) { console.warn('[worker] 通知聚焦失败:', e.message); }
+    }
+
     async function removeFolder(path) {
         if (!isWailsEnv) {
             const response = await fetch('/api/remove-folder', {
@@ -422,6 +439,7 @@ const WailsBridge = (() => {
 
     // getHTTPBaseURL 的同步缓存
     let _httpBaseURL = '';
+    let _httpBaseURL2 = ''; // 缩略图第二 origin（浏览器为每个 origin 分配独立 6 连接池）
 
     async function getHTTPBaseURL() {
         if (!isWailsEnv) {
@@ -436,7 +454,9 @@ const WailsBridge = (() => {
         if (!isWailsEnv) {
             return '';
         }
-        return getApp().GetThumbBaseURL2();
+        const url = await getApp().GetThumbBaseURL2();
+        _httpBaseURL2 = url || '';
+        return _httpBaseURL2;
     }
 
     // getImageBaseURL 的同步缓存
@@ -1091,6 +1111,8 @@ const WailsBridge = (() => {
         removeImages,
         refresh,
         refreshFolder,
+        abandonFolder,
+        focusFolder,
         getImages,
         getImagesByPaths,
         getFolders,

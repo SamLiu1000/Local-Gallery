@@ -1,6 +1,6 @@
 /* ============================================================
    storage.js - 持久化存储层（v5 - Wails 适配）
-    管理：标签、收藏、API配置、提示词版本、图片-标签关联、FileSystemDirectoryHandle
+    管理：标签、收藏、API配置、提示词版本、图片-标签关联
     Wails 环境：通过 WailsBridge 调用 Go 后端
     浏览器环境：通过 fetch 调用 HTTP API，回退到 IndexedDB
    ============================================================ */
@@ -136,11 +136,6 @@ const Storage = (() => {
 
                 if (!database.objectStoreNames.contains('settings')) {
                     database.createObjectStore('settings', { keyPath: 'key' });
-                }
-
-                if (!database.objectStoreNames.contains('directoryHandles')) {
-                    const dhStore = database.createObjectStore('directoryHandles', { keyPath: 'id' });
-                    dhStore.createIndex('name', 'name', { unique: false });
                 }
             };
 
@@ -291,28 +286,6 @@ const Storage = (() => {
         if (!db) throw new Error('数据库未初始化');
         const tx = db.transaction(storeName, mode);
         return tx.objectStore(storeName);
-    }
-
-    // ==================== FileSystemDirectoryHandle 操作 ====================
-
-    async function saveDirectoryHandle(id, name, handle) {
-        const store = getStore('directoryHandles', 'readwrite');
-        await promisify(store, 'put', { id, name, handle, savedAt: new Date().toISOString() });
-    }
-
-    async function getAllDirectoryHandles() {
-        const store = getStore('directoryHandles');
-        return await promisify(store, 'getAll');
-    }
-
-    async function removeDirectoryHandle(id) {
-        const store = getStore('directoryHandles', 'readwrite');
-        await promisify(store, 'delete', id);
-    }
-
-    async function clearDirectoryHandles() {
-        const store = getStore('directoryHandles', 'readwrite');
-        await promisify(store, 'clear');
     }
 
     // ==================== 扫描目录 roots 操作 ====================
@@ -994,10 +967,6 @@ const Storage = (() => {
         isServerAvailable: () => serverAvailable,
         getRegisteredRoots,
         setRegisteredRoots,
-        saveDirectoryHandle,
-        getAllDirectoryHandles,
-        removeDirectoryHandle,
-        clearDirectoryHandles,
         getAllTags, addTag, updateTag, deleteTag, getChildTags,
         getTagsForImage, addTagToImage, removeTagFromImage, getImagesForTag,
         isFavorite, toggleFavorite, getAllFavorites, setFavorite,

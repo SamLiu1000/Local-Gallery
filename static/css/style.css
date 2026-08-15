@@ -1239,7 +1239,7 @@ body.is-resizing .panel-resizer {
 .tree-preview img {
     width: 100%;
     aspect-ratio: 1;
-    object-fit: cover;
+    object-fit: contain;
     border-radius: var(--radius-sm);
     background: var(--bg-tertiary);
     border: 1px solid var(--border-color);

@@ -470,6 +470,8 @@
   "sort.newest_first": "新しい順",
   "sort.oldest_first": "古い順",
   "sort.smallest_first": "小さい順",
+  "sort.folder_asc": "フォルダ A-Z",
+  "sort.folder_desc": "フォルダ Z-A",
   "toast.api_deleted": "API設定を削除しました",
   "toast.api_saved": "API設定を保存しました",
   "toast.api_test_failed": "API接続に失敗しました",

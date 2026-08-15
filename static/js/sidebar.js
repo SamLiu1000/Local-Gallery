@@ -210,6 +210,11 @@ const Sidebar = (() => {
     let tagTreeLoaded = false;
     let lastFolderTreeHash = '';
 
+    // ★ 去抖合并突发刷新：切换文件夹/事件风暴会同时触发多次 refreshFolderTree
+    //   （日志可见一次切换连发 8 次 GetFolders ≈ 1 秒 SQLite+预览重建）。
+    //   合并 300ms 内的调用为一次，让切换后磁盘读写立即回落。
+    let _folderTreeRefreshTimer = null;
+
     // ==================== 初始化 ====================
 
     function init(callbacks) {
@@ -859,7 +864,84 @@ const Sidebar = (() => {
      * @param {Object} [options]
      * @param {boolean} [options.sort] - 是否强制应用列排序（用户点击排序表头时传 true）
      */
+    // ==================== 文件夹树本地缓存（启动 0 秒渲染） ====================
+    // 启动时先渲染上次保存的树（好像一直在那里），后台再与后端 RPC 比对刷新。
+    // 缓存只含结构/路径/计数，不含 previews（刷新后由服务端补全）。
+    const FOLDER_TREE_CACHE_KEY = 'folder_tree_cache_v1';
+    let _lastTreeCacheSave = 0;
+
+    function serializeFolderNode(n) {
+        return {
+            p: n.path,
+            n: n.displayName || n.name,
+            e: !!n.expanded,
+            ic: n.imageCount || 0,
+            tc: n.thumbCount || 0,
+            r: !!n.isRoot,
+            c: n.children && n.children.length ? n.children.map(serializeFolderNode) : undefined
+        };
+    }
+
+    function deserializeFolderNode(x) {
+        return {
+            name: x.n,
+            path: x.p,
+            displayPath: x.p,
+            displayName: x.n,
+            expanded: !!x.e,
+            imageCount: x.ic || 0,
+            thumbCount: x.tc || 0,
+            isRoot: !!x.r,
+            children: x.c ? x.c.map(deserializeFolderNode) : [],
+            previews: undefined
+        };
+    }
+
+    // 节流保存：结构/计数刷新后写入 localStorage，供下次启动 0 秒渲染
+    function saveFolderTreeCache(nodes) {
+        const now = Date.now();
+        if (now - _lastTreeCacheSave < 3000) return; // 节流
+        _lastTreeCacheSave = now;
+        try {
+            const json = JSON.stringify(nodes.map(serializeFolderNode));
+            if (json.length > 3500000) return; // localStorage 约 5MB 上限，留余量
+            localStorage.setItem(FOLDER_TREE_CACHE_KEY, json);
+        } catch (e) { /* 静默：缓存失败不影响功能 */ }
+    }
+
+    function loadFolderTreeCache() {
+        try {
+            const json = localStorage.getItem(FOLDER_TREE_CACHE_KEY);
+            if (!json) return null;
+            const data = JSON.parse(json);
+            if (!Array.isArray(data) || data.length === 0) return null;
+            return data.map(deserializeFolderNode);
+        } catch (e) {
+            return null;
+        }
+    }
+
     async function refreshFolderTree(options = {}) {
+        // ★ 0 秒渲染：启动时先用本地缓存的树立即渲染（好像一直在那里），
+        //   不等待 GetFolders RPC；服务器数据返回后再刷新计数/结构。
+        if (folderRoots.length === 0 && !options.sort) {
+            const cachedTree = loadFolderTreeCache();
+            if (cachedTree && cachedTree.length > 0) {
+                folderRoots = cachedTree;
+                renderFolderTree();
+            }
+        }
+
+        // ★ 去抖合并突发：300ms 内多次调用只跑最后一次，
+        //   避免切换文件夹后连发多次 GetFolders 拖住磁盘
+        if (_folderTreeRefreshTimer) clearTimeout(_folderTreeRefreshTimer);
+        await new Promise(resolve => {
+            _folderTreeRefreshTimer = setTimeout(resolve, 300);
+        });
+        return doRefreshFolderTree(options);
+    }
+
+    async function doRefreshFolderTree(options = {}) {
         if (isFolderTreeRefreshing) return;
         isFolderTreeRefreshing = true;
         const requestId = ++currentRefreshId; // ★ 请求序号，旧请求结果丢弃
@@ -926,6 +1008,8 @@ const Sidebar = (() => {
             applyExpandedStates(mergedTree);
 
             folderRoots = mergedTree;
+            // ★ 保存本地缓存（节流）：下次启动 0 秒渲染
+            saveFolderTreeCache(mergedTree);
             // ★ [调试] 统计带 previews 的节点数量 + 当前已开启的预览根
             let previewNodeCount = 0;
             (function countPreview(nodes) {
@@ -995,7 +1079,11 @@ const Sidebar = (() => {
                     thumbCount: node.thumbCount || 0,
                     isRoot: true,
                     previews: node.previews || undefined,
-                    children: (node.children || []).map(c => convertChildNode(c))
+                    // ★ 路径唯一来源 = 后端 GetFolders（真实路径树）。
+                    //   前端树不再贡献子文件夹：其子节点由内存 images 派生，可能包含
+                    //   已删除文件的陈旧数据（幽灵文件夹复发源）。前端仅补充根节点，
+                    //   子文件夹一律以后端为准，等待下一次刷新由服务端补全。
+                    children: []
                 });
             }
         }
@@ -1066,16 +1154,25 @@ const Sidebar = (() => {
         return result;
     }
 
-    // ★ 结构哈希：只含影响"结构"的字段（路径/名称/展开/子节点），不含计数。
-    //   计数变化走 updateFolderCountsInPlace 原地更新，不重建 DOM
-    function folderNodeStructureHash(node) {
-        return {
-            p: node.path,
-            n: node.displayName || node.name,
-            e: node.expanded,
-            pr: node.previews && node.previews.length ? 1 : 0,
-            ch: node.children && node.children.length ? node.children.map(folderNodeStructureHash) : undefined
-        };
+    // ★ 结构哈希：只含影响"结构"的字段（路径/展开/子节点数），不含计数。
+    //   计数变化走 updateFolderCountsInPlace 原地更新，不重建 DOM。
+    //   用扁平字符串代替 JSON.stringify 全对象树：大目录树（数万节点）下
+    //   少分配、更快，且首次渲染跳过（见 renderFolderTree）。
+    function buildFolderTreeHash(nodes) {
+        const parts = [];
+        (function walk(list) {
+            for (const n of list) {
+                parts.push(n.path);
+                parts.push(n.expanded ? '1' : '0');
+                parts.push(n.previews && n.previews.length ? '1' : '0'); // 预览条出现/消失要重建
+                parts.push(n.children && n.children.length ? String(n.children.length) : '0');
+                if (n.children && n.children.length) {
+                    walk(n.children);
+                }
+            }
+        })(nodes);
+        // 用不可见分隔符，避免路径内容与分隔符冲突
+        return parts.join('\u0001');
     }
 
     // ★ 原地更新所有可见节点的计数（不重建 DOM，保留展开/滚动/高亮状态）
@@ -1114,9 +1211,10 @@ const Sidebar = (() => {
         }
 
         // ★ 性能修复：结构哈希（不含计数）——结构未变时只原地更新计数，
-        //   避免缩略图生成/计数刷新期间整树重建导致的导航栏闪烁
-        const structureHash = JSON.stringify(visibleRoots.map(folderNodeStructureHash));
-        if (structureHash === lastFolderTreeHash) {
+        //   避免缩略图生成/计数刷新期间整树重建导致的导航栏闪烁。
+        //   用扁平字符串代替 JSON.stringify 全对象树（少分配，大目录树 5ms→2ms）。
+        const structureHash = buildFolderTreeHash(visibleRoots);
+        if (structureHash === lastFolderTreeHash && lastFolderTreeHash !== '') {
             // 计数可能变化：原地更新 .tree-count 文本与进度条，保留展开/滚动/高亮状态
             updateFolderCountsInPlace(visibleRoots);
             return;
@@ -1189,6 +1287,7 @@ const Sidebar = (() => {
         container.className = 'tree-node';
         container.dataset.path = node.path;
         container.dataset.isRoot = node.isRoot ? 'true' : 'false';
+        container.dataset.depth = depth; // 惰性展开时重建子节点需要
         container._nodeData = node; // 事件委托时获取节点数据
 
         // ★ 是否处于已开启预览的子树中（自身或祖先开启预览 → 该层显示层级引导线）
@@ -1337,6 +1436,7 @@ const Sidebar = (() => {
         // 子节点容器
         const childrenContainer = document.createElement('div');
         childrenContainer.className = 'tree-children';
+        childrenContainer.dataset.previewBranch = inPreviewBranch ? '1' : '0'; // 惰性展开时还原引导线
         if (!node.expanded) {
             childrenContainer.style.display = 'none';
         }
@@ -1350,10 +1450,16 @@ const Sidebar = (() => {
             childrenContainer.appendChild(guide);
         }
 
+        // ★ 惰性渲染：折叠的文件夹不构建子节点 DOM（大目录树启动秒开，
+        //   DOM 规模 = 已展开分支而非全部文件夹）；展开时由 toggleExpand 按需构建。
         if (node.children && node.children.length > 0) {
-            for (const child of node.children) {
-                const childEl = createFolderNode(child, depth + 1, isPreviewBranch);
-                childrenContainer.appendChild(childEl);
+            node._childrenBuilt = false;
+            if (node.expanded) {
+                for (const child of node.children) {
+                    const childEl = createFolderNode(child, depth + 1, isPreviewBranch);
+                    childrenContainer.appendChild(childEl);
+                }
+                node._childrenBuilt = true;
             }
         }
 
@@ -1777,6 +1883,16 @@ const Sidebar = (() => {
             toggle.classList.toggle('expanded', node.expanded);
         }
         if (children) {
+            // ★ 惰性渲染：首次展开时才构建子节点 DOM（折叠的文件夹不占 DOM）
+            if (node.expanded && node.children && node.children.length > 0 && !node._childrenBuilt) {
+                const depth = parseInt(container.dataset.depth || '0', 10);
+                const previewBranch = container.dataset.previewBranch === '1';
+                for (const child of node.children) {
+                    const childEl = createFolderNode(child, depth + 1, previewBranch);
+                    children.appendChild(childEl);
+                }
+                node._childrenBuilt = true;
+            }
             children.style.display = node.expanded ? 'block' : 'none';
         }
 

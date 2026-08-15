@@ -470,6 +470,8 @@
   "sort.newest_first": "Сначала новые",
   "sort.oldest_first": "Сначала старые",
   "sort.smallest_first": "Сначала мелкие",
+  "sort.folder_asc": "Папка A-Z",
+  "sort.folder_desc": "Папка Z-A",
   "toast.api_deleted": "Конфигурация API удалена",
   "toast.api_saved": "Конфигурация API сохранена",
   "toast.api_test_failed": "Ошибка подключения к API",

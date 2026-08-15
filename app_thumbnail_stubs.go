@@ -8,11 +8,11 @@ import (
 )
 
 var (
-	thumbGenLocks sync.Map
-	thumbSemMu    sync.RWMutex
-	thumbSem      = make(chan struct{}, 2)
-	thumbSemSize  int32
-	preGenCancel  chan struct{}
+	thumbGenLocks  sync.Map
+	thumbSemMu     sync.RWMutex
+	thumbSem       = make(chan struct{}, 2)
+	thumbSemSize   int32
+	preGenCancel   chan struct{}
 	preGenCancelMu sync.Mutex
 )
 
@@ -75,6 +75,18 @@ func (a *App) CleanOrphanedThumbs() map[string]interface{} {
 }
 
 func (a *App) removeThumbsByIDs(ids []string) {}
+
+func (a *App) triggerAutoPreGen(label string, entries []*ImageEntry) {}
+
+func (a *App) stopAutoPreGen() bool { return false }
+
+func (a *App) AbandonFolder(folderPath string) {}
+
+func (a *App) FocusFolder(folderPath string) {}
+
+func (a *App) killThumbWorker() {}
+
+func runThumbGenWorker(port string, concurrency int) {}
 
 func (a *App) computeThumbCounts() map[string]int {
 	return make(map[string]int)

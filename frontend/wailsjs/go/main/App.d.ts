@@ -4,6 +4,8 @@ import {main} from '../models';
 import {database} from '../models';
 import {context} from '../models';
 
+export function AbandonFolder(arg1:string):Promise<void>;
+
 export function AddImageTag(arg1:string,arg2:string):Promise<Record<string, any>>;
 
 export function AddPromptVersion(arg1:string,arg2:string,arg3:string,arg4:string):Promise<Record<string, any>>;
@@ -29,6 +31,8 @@ export function DebugPagination(arg1:string):Promise<Record<string, any>>;
 export function DebugScanRoot(arg1:string):Promise<main.DebugScanResult>;
 
 export function DeletePromptVersion(arg1:string):Promise<Record<string, any>>;
+
+export function FocusFolder(arg1:string):Promise<void>;
 
 export function FullRescanFolder(arg1:string):Promise<main.ScanResult>;
 

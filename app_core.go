@@ -311,15 +311,19 @@ func (a *App) startHTTPServer() {
 				return
 			}
 			imageID := strings.TrimPrefix(r.URL.Path, "/image/")
-			imagePath := a.resolveImagePath(imageID)
-			if imagePath == "" {
-				http.NotFound(w, r)
-				return
-			}
-			w.Header().Set("Cache-Control", "public, max-age=600")
-			w.Header().Set("Content-Type", getMIMEType(filepath.Ext(imagePath)))
-			w.Header().Set("Accept-Ranges", "bytes")
-			http.ServeFile(w, r, imagePath)
+			// ★ 高优先级队列：大图读取在独立 goroutine 中执行，
+			//   永远先于排队中的缩略图生成（LOW）被调度。
+			enqueueHighWait(func() {
+				imagePath := a.resolveImagePath(imageID)
+				if imagePath == "" {
+					http.NotFound(w, r)
+					return
+				}
+				w.Header().Set("Cache-Control", "public, max-age=600")
+				w.Header().Set("Content-Type", getMIMEType(filepath.Ext(imagePath)))
+				w.Header().Set("Accept-Ranges", "bytes")
+				http.ServeFile(w, r, imagePath)
+			})
 		})
 		a.imageServer = &http.Server{Handler: imageMux}
 		go func() {
@@ -1113,6 +1117,24 @@ func (a *App) GetImages(folder string, offset int, limit int, sortOrder string) 
 	if folder != "" {
 		normalizedFolder := strings.ReplaceAll(folder, "\\", "/")
 
+		// ★ 自愈：打开的文件夹在磁盘上已不存在 → 立即清理整棵子树并返回空，
+		//   避免图廊显示一堆指向不存在文件的破图（导航栏残留的幽灵文件夹被点击时触发）。
+		if info, err := os.Stat(normalizedFolder); err != nil || !info.IsDir() {
+			a.mu.RLock()
+			var deadKeys []string
+			for k := range a.folderIndex {
+				if k == normalizedFolder || strings.HasPrefix(k, normalizedFolder+"/") {
+					deadKeys = append(deadKeys, k)
+				}
+			}
+			a.mu.RUnlock()
+			if len(deadKeys) > 0 {
+				fmt.Printf("[幽灵清理] 打开的文件夹已不存在，自动清理子树: %s\n", normalizedFolder)
+				a.pruneFolderKeys(deadKeys)
+			}
+			return &ImageListResult{Items: []SafeImage{}, Total: 0, Offset: offset, Limit: limit}
+		}
+
 		// ★ 共存修复：按绝对路径前缀查询，不依赖"记录归属哪个根"。
 		//   嵌套根与父根覆盖同一批文件时都能查到同一批记录（记录存的是完整路径），
 		//   两者可共存浏览；也消除了 map 随机遍历匹配根目录带来的不确定性。
@@ -1397,6 +1419,20 @@ func sortImageEntries(results []*ImageEntry, sortOrder string) {
 		sort.SliceStable(results, func(i, j int) bool {
 			return results[i].Path > results[j].Path
 		})
+	case "folder-asc":
+		sort.SliceStable(results, func(i, j int) bool {
+			if results[i].Folder != results[j].Folder {
+				return results[i].Folder < results[j].Folder
+			}
+			return results[i].Path < results[j].Path
+		})
+	case "folder-desc":
+		sort.SliceStable(results, func(i, j int) bool {
+			if results[i].Folder != results[j].Folder {
+				return results[i].Folder > results[j].Folder
+			}
+			return results[i].Path < results[j].Path
+		})
 	case "size-desc":
 		sort.SliceStable(results, func(i, j int) bool {
 			if results[i].Size != results[j].Size {
@@ -1672,18 +1708,24 @@ func (a *App) GetImageFile(imageID string) *FileData {
 			return nil
 		}
 	}
-	data, err := os.ReadFile(entry.Path)
-	if err != nil {
-		fmt.Printf("[GetImageFile] 读取文件失败 %s: %v\n", entry.Path, err)
-		return nil
-	}
-	return &FileData{
-		ID:       imageID,
-		Name:     entry.Name,
-		MimeType: getMIMEType(filepath.Ext(entry.Name)),
-		Size:     int64(len(data)),
-		Data:     data,
-	}
+	// ★ 高优先级队列：大图文件读取在独立 goroutine 中执行，
+	//   不会被排队中的缩略图生成（LOW）拖住。
+	var result *FileData
+	enqueueHighWait(func() {
+		data, err := os.ReadFile(entry.Path)
+		if err != nil {
+			fmt.Printf("[GetImageFile] 读取文件失败 %s: %v\n", entry.Path, err)
+			return
+		}
+		result = &FileData{
+			ID:       imageID,
+			Name:     entry.Name,
+			MimeType: getMIMEType(filepath.Ext(entry.Name)),
+			Size:     int64(len(data)),
+			Data:     data,
+		}
+	})
+	return result
 }
 
 func (a *App) GetThumbnail(imageID string) *FileData {
@@ -2303,10 +2345,32 @@ func (a *App) startup(ctx context.Context) {
 	// 后台执行：补扫缺失 → 修复搜索索引（跳过增量刷新，由用户手动触发）
 	go func() {
 		a.ensureImageIndex()
+
+		// ★ 启动速度优化：幽灵清理（全库 os.Stat，慢盘上数千次约 2-3 秒）延迟到
+		//   首次 GetFolders 之后，避免与侧边栏初始加载抢磁盘 IO。
+		go func() {
+			time.Sleep(3 * time.Second)
+			a.pruneDeadFolders()
+		}()
+
+		// ★ 启动速度优化：预热"子文件夹缩略图预览"缓存。用户开启了预览的根目录
+		//   （如 K:/bid）在首次 GetFolders 时会逐个文件夹 SQLite 查询取预览，
+		//   提前后台算好让首次 GetFolders 直接命中内存缓存。
+		go func() {
+			time.Sleep(2 * time.Second)
+			if previewRoots := a.loadPreviewRoots(); len(previewRoots) > 0 {
+				a.collectPreviewData(previewRoots)
+			}
+		}()
+
+		// ★ 启动速度优化：两个重后台任务（全库 SHA256 / 元数据回填）延迟启动，
+		//   不抢占启动期与首次浏览的磁盘/CPU；且各自限速（见各函数内部 pacing）。
+		time.Sleep(20 * time.Second)
 		// 后台回填 content_hash，用于图片去重
 		go a.BackfillContentHashes()
 		// ★ 后台回填搜索索引缺失的生成参数元数据（Model/LoRA/CFG 等），
 		//   旧扫描写入的 params_json 为空导致按参数搜索不到；分批节流，不阻塞启动
+		time.Sleep(10 * time.Second)
 		go a.backfillImageMetadata()
 		// a.startupIncrementalRefresh() // 禁用启动时自动扫描，由用户手动触发
 		// a.repairSearchIndex()
@@ -2320,6 +2384,15 @@ func (a *App) beforeClose(ctx context.Context) bool {
 	x, y := wailsruntime.WindowGetPosition(ctx)
 	maximised := wailsruntime.WindowIsMaximised(ctx)
 	a.SaveWindowState(w, h, x, y, maximised)
+	// ★ 计数持久化修复：先停掉后台自动预生成（避免生成到一半被截断），
+	//   再把当前缩略图计数写盘。否则新导入文件夹的计数只在内存里涨，
+	//   重启后 loadThumbCountsFromDisk 因 bbolt key 数变化而跳过缓存 → 计数短暂错误/为 0。
+	//   若预生成被打断（生成未完成），则不持久化——保留旧文件，
+	//   重启时 key 数不匹配 → 触发重算自愈，避免"部分计数被当成有效"。
+	interrupted := a.stopAutoPreGen()
+	if !interrupted {
+		a.persistThumbCounts()
+	}
 	return false
 }
 

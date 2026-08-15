@@ -470,6 +470,8 @@
   "sort.newest_first": "최신순",
   "sort.oldest_first": "오래된 것부터",
   "sort.smallest_first": "작은 것부터",
+  "sort.folder_asc": "폴더 A-Z",
+  "sort.folder_desc": "폴더 Z-A",
   "toast.api_deleted": "API 구성이 삭제되었습니다.",
   "toast.api_saved": "API 구성이 저장되었습니다.",
   "toast.api_test_failed": "API 연결 실패",

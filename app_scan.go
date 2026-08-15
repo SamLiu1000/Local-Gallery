@@ -475,6 +475,195 @@ func (a *App) rebuildFolderIndex() {
 	a.folderIndex = idx
 }
 
+// pruneDeadFolders 清理磁盘上已删除、但索引/数据库仍残留的幽灵文件夹。
+// 根源：启动时不做全量增量刷新，文件夹被删除后其 image_cache 记录与 folderIndex key
+// 会一直残留 → 导航栏出现同名重复项、图廊/预览缩略图指向不存在的文件而无法显示。
+// 做法：对每个已注册根目录下的 folder key 做目录存在性检查（IO 阶段不持锁），
+// 目录已不存在的 key 连同其图片记录从内存、image_cache、缩略图库中一并移除。
+// 返回清理的文件夹数与图片数。
+func (a *App) pruneDeadFolders() (prunedFolders int, prunedImages int) {
+	a.mu.RLock()
+	roots := make([]string, 0, len(a.registeredRoots))
+	for r := range a.registeredRoots {
+		roots = append(roots, r)
+	}
+	a.mu.RUnlock()
+	if len(roots) == 0 {
+		return 0, 0
+	}
+
+	// 1. 收集目录已不存在的 folder key（IO 阶段不持锁）
+	var deadKeys []string
+	for _, root := range roots {
+		rootNorm := strings.ReplaceAll(root, "\\", "/")
+		prefix := rootNorm + "/"
+		a.mu.RLock()
+		var keys []string
+		for k := range a.folderIndex {
+			if k != rootNorm && strings.HasPrefix(k, prefix) {
+				keys = append(keys, k)
+			}
+		}
+		a.mu.RUnlock()
+		if len(keys) == 0 {
+			continue
+		}
+		for _, k := range keys {
+			rel := strings.TrimPrefix(k, prefix)
+			diskDir := filepath.Join(root, filepath.FromSlash(rel))
+			info, err := os.Stat(diskDir)
+			if err != nil || !info.IsDir() {
+				deadKeys = append(deadKeys, k)
+			}
+		}
+	}
+	if len(deadKeys) == 0 {
+		return 0, 0
+	}
+	return a.pruneFolderKeys(deadKeys)
+}
+
+// pruneFolderKeys 将一组已确认不存在的文件夹 key 连同其图片记录，从内存（a.images /
+// folderIndex / folderCount）、image_cache、搜索索引 images 表、缩略图库中一并移除，
+// 并从 SQL 重建计数；随后触发前端文件夹树刷新。
+// 供"启动幽灵清理""打开已删除文件夹"等场景复用（同一套清理逻辑，防止同类问题回归）。
+func (a *App) pruneFolderKeys(deadKeys []string) (prunedFolders int, prunedImages int) {
+	// 1. 收集死文件夹下的全部图片 ID（内存 folderIndex + SQLite 兜底：LRU 可能已逐出内存）
+	deadIDs := make(map[string]bool)
+	a.mu.RLock()
+	for _, k := range deadKeys {
+		for _, id := range a.folderIndex[k] {
+			deadIDs[id] = true
+		}
+	}
+	a.mu.RUnlock()
+	if a.imageDB != nil {
+		for _, k := range deadKeys {
+			if ids, err := a.imageDB.LoadImageCacheIDsUnderPath(k); err == nil {
+				for _, id := range ids {
+					deadIDs[id] = true
+				}
+			}
+		}
+	}
+
+	// 2. 持久化清理：image_cache（全集）+ images（搜索索引子集）+ 缩略图
+	if len(deadIDs) > 0 {
+		ids := make([]string, 0, len(deadIDs))
+		for id := range deadIDs {
+			ids = append(ids, id)
+		}
+		if a.imageDB != nil {
+			if err := a.imageDB.DeleteImageCacheBatch(ids); err != nil {
+				fmt.Printf("[幽灵清理] 删除 image_cache 失败 (%d 条): %v\n", len(ids), err)
+			}
+			if err := a.imageDB.DeleteImagesBatch(ids); err != nil {
+				fmt.Printf("[幽灵清理] 删除搜索索引记录失败 (%d 条): %v\n", len(ids), err)
+			}
+		}
+		a.removeThumbsByIDs(ids)
+	}
+
+	// 3. 内存清理 + 从 SQL 重建计数（此时 DB 已无死记录）
+	a.mu.Lock()
+	for _, k := range deadKeys {
+		delete(a.folderIndex, k)
+		delete(a.folderCount, k)
+	}
+	for id := range deadIDs {
+		delete(a.images, id)
+	}
+	a.evictLRU()
+	a.rebuildFolderCountsFromSQLLocked()
+	a.mu.Unlock()
+
+	prunedFolders = len(deadKeys)
+	prunedImages = len(deadIDs)
+	fmt.Printf("[幽灵清理] 移除 %d 个已不存在的文件夹、%d 张失效图片\n", prunedFolders, prunedImages)
+	a.saveImageIndex()
+
+	// 4. 通知前端刷新文件夹树（scan:complete 会触发 Sidebar.refreshFolderTree）
+	if a.ctx != nil {
+		rootSet := make(map[string]bool)
+		a.mu.RLock()
+		for _, k := range deadKeys {
+			for r := range a.registeredRoots {
+				rn := strings.ReplaceAll(r, "\\", "/")
+				if k == rn || strings.HasPrefix(k, rn+"/") {
+					rootSet[rn] = true
+				}
+			}
+		}
+		a.mu.RUnlock()
+		for rn := range rootSet {
+			wailsruntime.EventsEmit(a.ctx, "scan:complete", map[string]interface{}{
+				"rootPath":   rn,
+				"count":      0,
+				"added":      0,
+				"removed":    prunedImages,
+				"thumbCount": 0,
+			})
+		}
+	}
+	return prunedFolders, prunedImages
+}
+
+// purgeMissingImage 单张图片自愈：源文件已删除时移除其全部残留（内存索引、DB、缩略图）。
+// 由缩略图生成失败路径调用——文件夹仍在但其中文件被删的"文件级幽灵"，
+// 会在被浏览到的那一刻自动清除，图廊不再残留破图。
+func (a *App) purgeMissingImage(id string) {
+	a.mu.RLock()
+	entry := a.images[id]
+	a.mu.RUnlock()
+
+	if a.imageDB != nil {
+		a.imageDB.DeleteImage(id)
+		a.imageDB.DeleteImageCacheBatch([]string{id})
+	}
+	a.removeThumbsByIDs([]string{id})
+
+	a.mu.Lock()
+	delete(a.images, id)
+	if entry != nil {
+		rootNorm := strings.ReplaceAll(entry.RootPath, "\\", "/")
+		if a.folderCount[rootNorm] > 0 {
+			a.folderCount[rootNorm]--
+		}
+		// 定位该图片所属的 folder key 并移除其 ID
+		removeFromFolderKey := func(key string) {
+			if ids, ok := a.folderIndex[key]; ok {
+				var rem []string
+				for _, x := range ids {
+					if x != id {
+						rem = append(rem, x)
+					}
+				}
+				if len(rem) == 0 {
+					delete(a.folderIndex, key)
+				} else {
+					a.folderIndex[key] = rem
+				}
+			}
+		}
+		if entry.Folder != "" {
+			parts := strings.Split(strings.ReplaceAll(entry.Folder, "\\", "/"), "/")
+			for i := 1; i <= len(parts); i++ {
+				sub := rootNorm + "/" + strings.Join(parts[:i], "/")
+				if a.folderCount[sub] > 0 {
+					a.folderCount[sub]--
+				}
+				if i == len(parts) {
+					removeFromFolderKey(sub)
+				}
+			}
+		} else {
+			removeFromFolderKey(rootNorm)
+		}
+	}
+	a.mu.Unlock()
+	fmt.Printf("[幽灵清理] 单张图片自愈移除: %s\n", id)
+}
+
 // buildFolderTreeFromIndex 从 folderIndex 内存构建文件夹树，零磁盘 I/O
 // 比 buildFolderTreeRecursive（os.ReadDir）快几个数量级
 // previews：已开启"子文件夹缩略图预览"的文件夹 key → 预览条目（由 GetFolders 预取，内存优先/SQLite 兜底）
@@ -790,6 +979,16 @@ func (a *App) scanRootAsync(rootPath string) int {
 	a.evictLRU()
 	a.rebuildFolderCountsFromSQLLocked()
 	a.mu.Unlock()
+
+	// ★ 扫描完成：自动低优预生成缺失缩略图（后台 goroutine，不阻塞 scan:complete）。
+	//   新导入的文件夹在用户滚动前就补齐缩略图，避免首屏滚动卡顿。
+	if totalCount > 0 && len(localImages) > 0 {
+		entries := make([]*ImageEntry, 0, len(localImages))
+		for _, e := range localImages {
+			entries = append(entries, e)
+		}
+		go a.triggerAutoPreGen(filepath.Base(rootPath), entries)
+	}
 
 	// 再次确保 folderCount 正确后再通知完成
 	a.mu.Lock()
@@ -1129,6 +1328,22 @@ func (a *App) refreshFolderInternal(folderPath string) *FolderDiffResult {
 	}
 	a.mu.RUnlock()
 
+	// ★ 修复：以磁盘为权威补全 oldIDs —— 把 image_cache 表中属于此文件夹子树的记录也纳入对比。
+	//   此前 oldIDs 只来自内存 folderIndex：若某记录已从内存/搜索索引清出，但 image_cache 表里
+	//   仍残留（源文件删除后的孤儿），刷新永远检测不到它，计数与图廊会一直带着"指向不存在文件"
+	//   的记录（表现为刷新显示"移除 0"但计数/破图不变）。补上表里的 ID 后，下面 1c 的
+	//   removedIDs = oldIDs - currentIDs 就能识别出孤儿并交给 Phase 2/3/4 清理。
+	if a.imageDB != nil {
+		dbIDs, err := a.imageDB.LoadImageCacheIDsUnderPath(normalizedFolder)
+		if err != nil {
+			fmt.Printf("[增量刷新] 读取 image_cache 子树记录失败 %s: %v\n", normalizedFolder, err)
+		} else {
+			for _, id := range dbIDs {
+				oldIDs[id] = true
+			}
+		}
+	}
+
 	// 1b. Walk 文件夹，对每个图片文件计算 stableID 并做对比
 	// ★ 修复：用 os.ReadDir 递归替代 filepath.Walk（后者不跟随 Windows 目录联接、
 	//   长路径会静默跳过 → 每次刷新都只索引到一部分，计数对不上总数）。
@@ -1268,6 +1483,7 @@ func (a *App) refreshFolderInternal(folderPath string) *FolderDiffResult {
 
 	// 3a. 删除清理（数量通常较少，一次性持锁）
 	a.mu.Lock()
+	var emptiedKeys []string
 	for _, id := range removedIDs {
 		delete(a.images, id)
 	}
@@ -1284,12 +1500,37 @@ func (a *App) refreshFolderInternal(folderPath string) *FolderDiffResult {
 			}
 			if len(remaining) == 0 {
 				a.folderIndex[folderKey] = nil // 保留 key 占位
+				emptiedKeys = append(emptiedKeys, folderKey)
 			} else {
 				a.folderIndex[folderKey] = remaining
 			}
 		}
 	}
 	a.mu.Unlock()
+
+	// 3a2. ★ 幽灵文件夹清理：目录已不存在的空 folder key 彻底移除（IO 阶段不持锁）。
+	//   若只保留 nil 占位，磁盘上已删除的文件夹会一直以空节点留在导航栏（表现为重复项）。
+	if len(emptiedKeys) > 0 {
+		var deadEmptyKeys []string
+		for _, k := range emptiedKeys {
+			if k == normalizedFolder {
+				continue // 刷新目标自身目录已在上文校验存在，保留占位
+			}
+			rel := strings.TrimPrefix(k, normalizedFolder+"/")
+			diskDir := filepath.Join(folderPath, filepath.FromSlash(rel))
+			if info, err := os.Stat(diskDir); err != nil || !info.IsDir() {
+				deadEmptyKeys = append(deadEmptyKeys, k)
+			}
+		}
+		if len(deadEmptyKeys) > 0 {
+			a.mu.Lock()
+			for _, k := range deadEmptyKeys {
+				delete(a.folderIndex, k)
+				delete(a.folderCount, k)
+			}
+			a.mu.Unlock()
+		}
+	}
 
 	// 3b. 新增条目分批加入内存（每批 ~2000 条，之间释放 a.mu）
 	const memBatchSize = 2000
@@ -1330,6 +1571,14 @@ func (a *App) refreshFolderInternal(folderPath string) *FolderDiffResult {
 	//   导致落库时只写回残缺子集 → 计数永远对不上。与 scanRootAsync 一致：先落库再逐出。
 	if normalizedFolder == matchedRootNorm {
 		// 根目录：整体 DELETE-then-replace（原逻辑，统一处理删除+新增）
+		// ★ 修复：先显式删除本次识别出的孤儿（image_cache 表残留、磁盘已无源文件的记录）。
+		//   仅靠 saveImageIndexByRoot 的 DELETE-then-replace 依赖 a.images 完整；若 a.images
+		//   恰好为空导致其跳过落库，孤儿会继续残留。先删一次保证 root 刷新一定能清干净。
+		if a.imageDB != nil && len(removedIDs) > 0 {
+			if err := a.imageDB.DeleteImageCacheBatch(removedIDs); err != nil {
+				fmt.Printf("[增量存储] 根目录删除 image_cache 孤儿失败 (%d 条): %v\n", len(removedIDs), err)
+			}
+		}
 		a.saveImageIndexForRoot(folderPath)
 	} else {
 		// ★ 子文件夹：局部增量落库（upsert 新增 + 删除移除的），不触碰根目录其它文件夹
@@ -1364,6 +1613,11 @@ func (a *App) refreshFolderInternal(folderPath string) *FolderDiffResult {
 	a.evictLRU()
 	a.rebuildFolderCountsFromSQLLocked()
 	a.mu.Unlock()
+
+	// ★ 增量刷新完成：自动低优预生成新增图片的缺失缩略图（后台执行，不阻塞返回）
+	if len(addedEntries) > 0 {
+		go a.triggerAutoPreGen(filepath.Base(folderPath), addedEntries)
+	}
 
 	// 构造返回结果
 	addedSafe := make([]SafeImage, len(addedEntries))

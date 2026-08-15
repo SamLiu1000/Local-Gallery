@@ -37,6 +37,62 @@ var (
 
 var thumbBucket = []byte("thumbs")
 
+// ★ 缩略图内存缓存：把热门缩略图字节放 RAM，避免反复触发内核从 12GB bbolt(mmap)
+//   换页 —— Task Manager 里表现为 System 进程疯狂读盘（机械盘随机寻道）。
+//   key = imageID|thumbGeneration，缩略图重新生成时版本号递增 → 缓存自动失效。
+var (
+	thumbMemCacheMu   sync.Mutex
+	thumbMemCache     = map[string][]byte{}
+	thumbMemCacheKeys []string // FIFO 淘汰顺序
+)
+
+const thumbMemCacheMax = 2000 // 约 200MB（500px JPEG 平均 ~100KB）
+
+func thumbMemKey(imageID string) string {
+	return fmt.Sprintf("%s|%d", imageID, thumbGeneration.Load())
+}
+
+func thumbMemGet(imageID string) []byte {
+	thumbMemCacheMu.Lock()
+	defer thumbMemCacheMu.Unlock()
+	return thumbMemCache[thumbMemKey(imageID)]
+}
+
+func thumbMemSet(imageID string, b []byte) {
+	if len(b) == 0 {
+		return
+	}
+	key := thumbMemKey(imageID)
+	thumbMemCacheMu.Lock()
+	defer thumbMemCacheMu.Unlock()
+	if _, ok := thumbMemCache[key]; !ok {
+		thumbMemCacheKeys = append(thumbMemCacheKeys, key)
+	}
+	thumbMemCache[key] = b
+	// FIFO 淘汰最旧，防止无限增长
+	for len(thumbMemCacheKeys) > thumbMemCacheMax {
+		old := thumbMemCacheKeys[0]
+		thumbMemCacheKeys = thumbMemCacheKeys[1:]
+		delete(thumbMemCache, old)
+	}
+}
+
+func thumbMemRemove(imageID string) {
+	thumbMemCacheMu.Lock()
+	delete(thumbMemCache, thumbMemKey(imageID))
+	// 惰性清理失效 key：只在达到上限时压缩一次，避免每次删除都遍历
+	if len(thumbMemCache) < thumbMemCacheMax/2 {
+		newKeys := thumbMemCacheKeys[:0]
+		for _, k := range thumbMemCacheKeys {
+			if _, ok := thumbMemCache[k]; ok {
+				newKeys = append(newKeys, k)
+			}
+		}
+		thumbMemCacheKeys = newKeys
+	}
+	thumbMemCacheMu.Unlock()
+}
+
 // thumbFailSentinel 占位标记：图片无法生成缩略图（损坏/不支持的格式/已删除）
 var thumbFailSentinel = []byte{0}
 
@@ -101,6 +157,9 @@ func (a *App) SetThumbConcurrency(n int) map[string]interface{} {
 	current := readGlobalSettings()
 	current["thumbConcurrency"] = n
 	writeGlobalSettings(current)
+
+	// ★ 杀掉运行中的 worker：下次生成时按新并发重新 spawn，vips 线程池立即生效
+	a.killThumbWorker()
 
 	fmt.Printf("[缩略图] 并发数已更新为 %d\n", n)
 	return map[string]interface{}{"success": true, "thumbConcurrency": n}
@@ -235,7 +294,9 @@ func (a *App) generateThumbnail(srcPath string, imageID string) error {
 
 	// 跳过 0 字节文件，防止 vips 崩溃
 	if info, err := os.Stat(srcPath); err != nil {
-		// 文件不存在或无法访问，标记失败并返回
+		// ★ 自愈：源文件已被删除 → 清除该图片的所有残留（内存/DB/缩略图），
+		//   图廊不再残留破图（文件夹仍在但文件被删的"文件级幽灵"）。
+		a.purgeMissingImage(imageID)
 		a.markThumbFailed(imageID)
 		return fmt.Errorf("文件不存在或无法访问: %s", srcPath)
 	} else if info.Size() == 0 {
@@ -260,21 +321,19 @@ func (a *App) generateThumbnail(srcPath string, imageID string) error {
 		return fmt.Errorf("文件头魔数不匹配任何已知图片格式: %s", srcPath)
 	}
 
-	img, err := vips.NewThumbnailFromFile(srcPath, thumbMaxSize, thumbMaxSize, vips.InterestingNone)
+	// ★ 生成：优先经独立 worker 进程（可被杀 = 可立即停读原图）。
+	//   worker 失败时若文件夹已不再被关注（切换走了）则直接放弃、不回退；
+	//   仅当文件夹仍被关注才回退进程内 libvips（保证生成不中断）。
+	jpegBytes, err := a.generateViaWorker(srcPath)
 	if err != nil {
-		a.markThumbFailed(imageID)
-		return fmt.Errorf("vips 缩略图生成失败: %w", err)
-	}
-	defer img.Close()
-
-	ep := vips.NewJpegExportParams()
-	ep.Quality = thumbJPEGQuality
-	ep.StripMetadata = true
-
-	jpegBytes, _, err := img.ExportJpeg(ep)
-	if err != nil {
-		a.markThumbFailed(imageID)
-		return fmt.Errorf("vips 导出 JPEG 失败: %w", err)
+		if fk := a.imageFolderKey(srcPath); fk != "" && isFolderAbandoned(fk) {
+			return fmt.Errorf("文件夹已切换，取消缩略图生成: %s", imageID)
+		}
+		jpegBytes, err = generateThumbnailBytes(srcPath, thumbMaxSize, thumbJPEGQuality)
+		if err != nil {
+			a.markThumbFailed(imageID)
+			return fmt.Errorf("缩略图生成失败: %w", err)
+		}
 	}
 
 	// 写入 BoltDB（★ Batch：高并发时合并写事务 + 只 fsync 一次，缓解写锁瓶颈）
@@ -289,6 +348,70 @@ func (a *App) generateThumbnail(srcPath string, imageID string) error {
 
 	a.incrementThumbCount(imageID)
 	return nil
+}
+
+// generateThumbnailDirect 进程内直连生成（不经 worker）：供后台自动预生成使用，
+// 不会被文件夹切换的 kill 打断，保证预生成能跑完、浏览时缩略图已就位。
+func (a *App) generateThumbnailDirect(srcPath string, imageID string) error {
+	if err := a.ensureThumbDB(); err != nil {
+		return err
+	}
+	if srcPath == "" {
+		return fmt.Errorf("图片路径为空: %s", imageID)
+	}
+	if info, err := os.Stat(srcPath); err != nil {
+		a.purgeMissingImage(imageID)
+		a.markThumbFailed(imageID)
+		return fmt.Errorf("文件不存在或无法访问: %s", srcPath)
+	} else if info.Size() == 0 {
+		a.markThumbFailed(imageID)
+		return fmt.Errorf("文件为空: %s", srcPath)
+	}
+	if isVideoFile(filepath.Base(srcPath)) {
+		placeholder := createVideoPlaceholderJPEG()
+		return a.thumbDB.Batch(func(tx *bbolt.Tx) error {
+			b := tx.Bucket(thumbBucket)
+			return b.Put([]byte(imageID), placeholder)
+		})
+	}
+	if !isImageByMagic(srcPath) {
+		a.markThumbFailed(imageID)
+		return fmt.Errorf("文件头魔数不匹配任何已知图片格式: %s", srcPath)
+	}
+	jpegBytes, err := generateThumbnailBytes(srcPath, thumbMaxSize, thumbJPEGQuality)
+	if err != nil {
+		a.markThumbFailed(imageID)
+		return fmt.Errorf("缩略图生成失败: %w", err)
+	}
+	err = a.thumbDB.Batch(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(thumbBucket)
+		return b.Put([]byte(imageID), jpegBytes)
+	})
+	if err != nil {
+		a.markThumbFailed(imageID)
+		return fmt.Errorf("写入 BoltDB 失败: %w", err)
+	}
+	a.incrementThumbCount(imageID)
+	return nil
+}
+
+// generateThumbnailBytes 纯 libvips 生成（worker 进程与主进程 inline 回退共用）。
+func generateThumbnailBytes(srcPath string, maxSize, quality int) ([]byte, error) {
+	img, err := vips.NewThumbnailFromFile(srcPath, maxSize, maxSize, vips.InterestingNone)
+	if err != nil {
+		return nil, fmt.Errorf("vips 缩略图生成失败: %w", err)
+	}
+	defer img.Close()
+
+	ep := vips.NewJpegExportParams()
+	ep.Quality = quality
+	ep.StripMetadata = true
+
+	jpegBytes, _, err := img.ExportJpeg(ep)
+	if err != nil {
+		return nil, fmt.Errorf("vips 导出 JPEG 失败: %w", err)
+	}
+	return jpegBytes, nil
 }
 
 // isImageByMagic 读文件头魔数判断是否为已知图片格式
@@ -390,6 +513,12 @@ func (a *App) serveThumbnail(imageID string) ([]byte, error) {
 		return nil, err
 	}
 
+	// ★ 内存缓存优先：命中直接返回，不再触发内核从 12GB bbolt(mmap) 换页
+	//   （削减 Task Manager 里 System 进程的疯狂读盘）
+	if cached := thumbMemGet(imageID); cached != nil {
+		return cached, nil
+	}
+
 	// 先从 BoltDB 读取
 	if a.thumbDB != nil {
 		var jpegBytes []byte
@@ -419,9 +548,10 @@ func (a *App) serveThumbnail(imageID string) ([]byte, error) {
 						return nil, fmt.Errorf("缩略图不可用且原文件不存在: %s", imageID)
 					}
 				}
-			} else {
-				return jpegBytes, nil
-			}
+				} else {
+					thumbMemSet(imageID, jpegBytes)
+					return jpegBytes, nil
+				}
 		}
 	}
 
@@ -451,27 +581,45 @@ func (a *App) serveThumbnail(imageID string) ([]byte, error) {
 		}
 	}
 
-	// 信号量限制并发数
-	release := thumbSemAcquire()
-	defer release()
-
-	if err := a.generateThumbnail(imagePath, imageID); err != nil {
-		fmt.Printf("[缩略图] 生成失败 %s: %v\n", imageID, err)
-		a.markThumbFailed(imageID)
-		return nil, err
+	// ★ 文件夹切换取消：若该图片所属文件夹刚被"遗弃"（用户已切走），
+	//   跳过 on-demand 生成——排队中的请求在等信号量之前就放弃，
+	//   不再为已不看的内容读原图文件。已缓存缩略图不受影响（上面已返回）。
+	if fk := a.imageFolderKey(imagePath); fk != "" && isFolderAbandoned(fk) {
+		return nil, fmt.Errorf("文件夹已切换，取消缩略图生成: %s", imageID)
 	}
 
-	// 读取刚写入的数据
+	// ★ 低优先级队列：大图读取（HIGH）永远先于缩略图生成（LOW）被调度，
+	//   查看大图不会被排队的缩略图任务拖住。并发仍由 thumbSem 控制
+	//   （任务内部 acquire），并发设置语义不变。
 	var jpegBytes []byte
-	a.thumbDB.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(thumbBucket)
-		v := b.Get([]byte(imageID))
-		if v != nil {
-			jpegBytes = make([]byte, len(v))
-			copy(jpegBytes, v)
+	var genErr error
+	enqueueLowWait(func() {
+		// 信号量限制并发数
+		release := thumbSemAcquire()
+		defer release()
+
+		if err := a.generateThumbnail(imagePath, imageID); err != nil {
+			fmt.Printf("[缩略图] 生成失败 %s: %v\n", imageID, err)
+			a.markThumbFailed(imageID)
+			genErr = err
+			return
 		}
-		return nil
+
+		// 读取刚写入的数据
+		a.thumbDB.View(func(tx *bbolt.Tx) error {
+			b := tx.Bucket(thumbBucket)
+			v := b.Get([]byte(imageID))
+			if v != nil {
+				jpegBytes = make([]byte, len(v))
+				copy(jpegBytes, v)
+			}
+			return nil
+		})
+		thumbMemSet(imageID, jpegBytes)
 	})
+	if genErr != nil {
+		return nil, genErr
+	}
 	return jpegBytes, nil
 }
 
@@ -744,6 +892,245 @@ func (a *App) runPreGen(folder string, entries []*ImageEntry) {
 	}
 	close(tasks)
 	wg.Wait()
+}
+
+// ==================== 自动预生成（导入/扫描后后台低优补齐） ====================
+
+var (
+	autoPreGenCancel   chan struct{}
+	autoPreGenCancelMu sync.Mutex
+	autoPreGenRunning  int32 // 1=后台自动预生成进行中（关闭时用于判断是否被打断）
+)
+
+// stopAutoPreGen 停止后台自动预生成（关闭流程调用）。返回是否"被打断"（运行中强停）。
+// 幂等：重复调用安全。
+func (a *App) stopAutoPreGen() bool {
+	autoPreGenCancelMu.Lock()
+	defer autoPreGenCancelMu.Unlock()
+	running := atomic.LoadInt32(&autoPreGenRunning) == 1
+	if autoPreGenCancel != nil {
+		close(autoPreGenCancel)
+		autoPreGenCancel = nil
+	}
+	return running
+}
+
+// triggerAutoPreGen 在扫描/导入新增图片后调用：低优先级后台补齐缺失缩略图。
+// 与手动预生成（StartPreGenThumbs）互不干扰：独立取消通道、固定低并发、
+// 不写 preGenStatus（设置页进度条不会被自动任务污染）。
+// 生成是幂等的：bbolt 双重检查 + per-image 锁，与 on-demand / 手动预生成并发安全。
+func (a *App) triggerAutoPreGen(label string, entries []*ImageEntry) {
+	if len(entries) == 0 || a.thumbDB == nil {
+		return
+	}
+	// 只保留缺失缩略图的条目，避免无谓调度
+	todo := make([]*ImageEntry, 0, len(entries))
+	for _, e := range entries {
+		has := false
+		a.thumbDB.View(func(tx *bbolt.Tx) error {
+			if b := tx.Bucket(thumbBucket); b != nil && b.Get([]byte(e.ID)) != nil {
+				has = true
+			}
+			return nil
+		})
+		if !has {
+			todo = append(todo, e)
+		}
+	}
+	if len(todo) == 0 {
+		return
+	}
+	fmt.Printf("[自动预生成] 扫描新增 %d 张图片，后台低优生成缺失缩略图（%s）\n", len(todo), label)
+
+	// 新的扫描会取消旧的自动任务（避免堆积）
+	autoPreGenCancelMu.Lock()
+	if autoPreGenCancel != nil {
+		close(autoPreGenCancel)
+	}
+	autoPreGenCancel = make(chan struct{})
+	cancel := autoPreGenCancel
+	autoPreGenCancelMu.Unlock()
+
+	// ★ 标记进行中：关闭时若被打断，则不持久化计数（留旧文件 → 重启重算自愈）
+	atomic.StoreInt32(&autoPreGenRunning, 1)
+	defer atomic.StoreInt32(&autoPreGenRunning, 0)
+
+	// ★ 固定低并发（2）：不抢占交互式 on-demand 缩略图生成的 vips 额度，
+	//   导入后再怎么扫都不会拖慢前台浏览。
+	const workers = 2
+	jobs := make(chan *ImageEntry, workers*2)
+	var wg sync.WaitGroup
+	// ★★ 本轮已被用户"切走"的文件夹集合：一旦跳过则整轮不再读它（不受 5s 过期影响）
+	skippedFolders := make(map[string]bool)
+	var skippedMu sync.Mutex
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for e := range jobs {
+				select {
+				case <-cancel:
+					return
+				default:
+				}
+				// ★★ 切换中断：用户切走了该图片所属文件夹 → 本轮跳过，
+				//   不再读目标文件夹原图做缩略图（制作缩略图是读原图，必须随切换停）。
+				//   一旦跳过则整轮记住，避免过期后恢复读取。
+				fk := a.imageFolderKey(e.Path)
+				if fk != "" {
+					skippedMu.Lock()
+					skip := skippedFolders[fk]
+					skippedMu.Unlock()
+					if !skip && isFolderAbandoned(fk) {
+						skippedMu.Lock()
+						skippedFolders[fk] = true
+						skippedMu.Unlock()
+						skip = true
+					}
+					if skip {
+						continue
+					}
+				}
+				muI, _ := thumbGenLocks.LoadOrStore(e.ID, &sync.Mutex{})
+				mu := muI.(*sync.Mutex)
+				mu.Lock()
+				// 双重检查：可能已被 on-demand 生成
+				has := false
+				a.thumbDB.View(func(tx *bbolt.Tx) error {
+					if b := tx.Bucket(thumbBucket); b != nil && b.Get([]byte(e.ID)) != nil {
+						has = true
+					}
+					return nil
+				})
+				if has {
+					mu.Unlock()
+					continue
+				}
+				// ★ 走 worker 子进程生成（generateThumbnail）——切换文件夹杀 worker 时，
+				//   正在读原图的 vips 操作随进程被 OS 立即终止，读盘中断。
+				if err := a.generateThumbnail(e.Path, e.ID); err != nil {
+					fmt.Printf("[自动预生成] 失败 %s: %v\n", e.ID, err)
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	for _, e := range todo {
+		select {
+		case jobs <- e:
+		case <-cancel:
+			close(jobs)
+			wg.Wait()
+			return
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	fmt.Printf("[自动预生成] %s 完成（本轮生成 %d 张）\n", label, len(todo))
+}
+
+// ==================== 文件夹切换取消（遗弃集合） ====================
+// 前端切换文件夹时调用 AbandonFolder 把离开的文件夹记为"已遗弃"，
+// on-demand 缩略图生成（serveThumbnail）在真正读原图前检查该集合，
+// 排队中/未开始的生成直接放弃，避免为已不看的内容读盘。
+// 集合条目带 5 秒过期 + 重新聚焦时移除，不影响之后再次浏览该文件夹。
+
+var (
+	abandonedFoldersMu sync.Mutex
+	abandonedFolders   = map[string]int64{} // folderKey → 被遗弃时间戳(毫秒)
+)
+
+// ★ 遗弃永久有效：切换文件夹后，旧文件夹的缩略图生成彻底停止，
+//   直到用户重新聚焦（FocusFolder）该文件夹才恢复。
+//   之前用 5 秒过期，导致切换后 5 秒生成又恢复读原图——用户看到的"没停"就是它。
+
+// AbandonFolder 前端在离开某文件夹（切换视图）时调用：记录为"已遗弃"。
+// ★ 同时杀掉缩略图生成 worker 进程——OS 立即终止其在途的原图读取（等效"关闭程序"）。
+func (a *App) AbandonFolder(folderPath string) {
+	if folderPath == "" {
+		return
+	}
+	key := strings.ReplaceAll(folderPath, "\\", "/")
+	abandonedFoldersMu.Lock()
+	abandonedFolders[key] = time.Now().UnixMilli()
+	abandonedFoldersMu.Unlock()
+	// ★ kill worker：在途的原图读取立即终止
+	a.killThumbWorker()
+}
+
+// FocusFolder 前端进入某文件夹时调用：从遗弃集合移除该文件夹及其所有祖先，
+// 恢复该文件夹（及子孙）的生成。
+// ★ 必须同时清除祖先：若根/父文件夹此前被遗弃，前缀匹配会把其下所有子文件夹
+//   的生成全部拦截（浏览根目录后切走 → 整个树"Load failed"）。聚焦一个子文件夹
+//   时它的祖先自然也在用户视野内，不应再被遗弃拦截。
+func (a *App) FocusFolder(folderPath string) {
+	if folderPath == "" {
+		return
+	}
+	key := strings.ReplaceAll(folderPath, "\\", "/")
+	abandonedFoldersMu.Lock()
+	defer abandonedFoldersMu.Unlock()
+	for ab := range abandonedFolders {
+		if ab == key || strings.HasPrefix(key, ab+"/") {
+			delete(abandonedFolders, ab)
+		}
+	}
+}
+
+// isFolderAbandoned 判断文件夹是否已被遗弃（永久，直到 FocusFolder 清除）。
+// ★ 前缀匹配：遗弃了父文件夹（用户浏览的目录），其下所有子文件夹的图片
+//   做缩略图时也应被拦截——否则切走"截图存档"后，"截图存档/待处理"等子目录
+//   的图片仍在读原图制作缩略图（这正是"切换后读盘不停"的根因）。
+func isFolderAbandoned(key string) bool {
+	if key == "" {
+		return false
+	}
+	abandonedFoldersMu.Lock()
+	defer abandonedFoldersMu.Unlock()
+	if _, ok := abandonedFolders[key]; ok {
+		return true
+	}
+	for abandoned := range abandonedFolders {
+		if strings.HasPrefix(key, abandoned+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// imageFolderKey 由完整文件路径推导其所属的文件夹 key（最长前缀匹配已注册根）。
+func (a *App) imageFolderKey(filePath string) string {
+	if filePath == "" {
+		return ""
+	}
+	norm := strings.ReplaceAll(filePath, "\\", "/")
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	var bestNorm string
+	for r := range a.registeredRoots {
+		rn := strings.ReplaceAll(r, "\\", "/")
+		if norm == rn || strings.HasPrefix(norm, rn+"/") {
+			if len(rn) > len(bestNorm) {
+				bestNorm = rn
+			}
+		}
+	}
+	if bestNorm == "" {
+		return ""
+	}
+	if norm == bestNorm {
+		return bestNorm
+	}
+	rel := strings.TrimPrefix(norm, bestNorm+"/")
+	dir := filepath.Dir(rel)
+	// ★ 关键：filepath.Dir 在 Windows 返回反斜杠，必须转回正斜杠，
+	//   否则拼接出混合分隔符路径（如 "elsa/截图存档\Coronation Dress截图"），
+	//   与 AbandonFolder 标记的正斜杠路径前缀匹配永远失败 → 遗弃检查拦不住子文件夹。
+	dir = strings.ReplaceAll(dir, "\\", "/")
+	if dir == "." || dir == "" {
+		return bestNorm
+	}
+	return bestNorm + "/" + dir
 }
 
 // StopPreGenThumbs 停止预生成
@@ -1144,6 +1531,7 @@ func (a *App) removeThumbsByIDs(ids []string) {
 		b := tx.Bucket(thumbBucket)
 		for _, id := range ids {
 			b.Delete([]byte(id))
+			thumbMemRemove(id) // 同步清内存缓存
 		}
 		return nil
 	})

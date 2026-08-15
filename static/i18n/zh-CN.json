@@ -473,6 +473,8 @@
   "sort.newest_first": "新→旧",
   "sort.oldest_first": "旧→新",
   "sort.smallest_first": "小→大",
+  "sort.folder_asc": "文件夹 A-Z",
+  "sort.folder_desc": "文件夹 Z-A",
   "toast.api_deleted": "API 配置已删除",
   "toast.api_saved": "API 配置已保存",
   "toast.api_test_failed": "API 连接失败",

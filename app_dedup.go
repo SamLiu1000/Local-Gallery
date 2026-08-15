@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // isContentDuplicate 检查文件内容是否已在 image_cache 中存在。
@@ -24,12 +25,15 @@ func (a *App) isContentDuplicate(fullPath string, fileSize int64) (bool, string,
 }
 
 // BackfillContentHashes 分批回填 image_cache 中 content_hash 为空的记录。
-// 每批 100 条，间隔 100ms，避免影响主线程。
+// 每批 100 条，间隔 15ms 限速，避免全库 SHA256 长时间占满磁盘拖慢前台浏览。
 func (a *App) BackfillContentHashes() {
 	if a.imageDB == nil {
 		return
 	}
 	const batchSize = 100
+	// ★ 限速：每批之间休眠。单线程逐文件哈希本来就慢，
+	//   后台任务慢一点不要紧，但绝不能抢占前台 IO。
+	const pacing = 15 * time.Millisecond
 	for {
 		entries, err := a.imageDB.GetNullContentHashBatch(batchSize)
 		if err != nil {
@@ -49,6 +53,7 @@ func (a *App) BackfillContentHashes() {
 				fmt.Printf("[去重] 回填 content_hash 失败 %s: %v\n", e.ID, err)
 			}
 		}
+		time.Sleep(pacing)
 	}
 }
 

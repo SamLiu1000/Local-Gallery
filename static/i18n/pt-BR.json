@@ -470,6 +470,8 @@
   "sort.newest_first": "Mais recente primeiro",
   "sort.oldest_first": "Mais antigo primeiro",
   "sort.smallest_first": "Menor primeiro",
+  "sort.folder_asc": "Pasta A-Z",
+  "sort.folder_desc": "Pasta Z-A",
   "toast.api_deleted": "Configuração de API excluída",
   "toast.api_saved": "Configuração de API salva",
   "toast.api_test_failed": "Falha na conexão com a API",

@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/wailsapp/wails/v2"
@@ -20,6 +21,25 @@ import (
 var assets embed.FS
 
 func main() {
+	// ★ headless 缩略图生成 worker：由主程序 spawn，独立进程可被 kill，
+	//   杀进程 = OS 立即终止其在途的原图读取（等效"关闭程序"）。
+	if len(os.Args) > 1 && os.Args[1] == "--thumbgen" {
+		port := ""
+		concurrency := 0
+		for i := 2; i+1 < len(os.Args); i++ {
+			switch os.Args[i] {
+			case "--port":
+				port = os.Args[i+1]
+				i++
+			case "--concurrency":
+				concurrency, _ = strconv.Atoi(os.Args[i+1])
+				i++
+			}
+		}
+		runThumbGenWorker(port, concurrency)
+		return
+	}
+
 	// 获取用户数据目录（基于工作目录；wails dev 下为项目根目录，发布版双击运行时为 exe 所在目录）
 
 	execDir, err := os.Getwd()
@@ -123,6 +143,8 @@ func main() {
 		OnShutdown: func(ctx context.Context) {
 			// ★ 保存当前 thumbCounts，供下次冷启动直接恢复
 			app.persistThumbCounts()
+			// ★ 杀掉缩略图生成 worker 子进程，防止成为孤儿进程
+			app.killThumbWorker()
 			// ★ 释放单实例锁
 			if app.instanceLockRelease != nil {
 				app.instanceLockRelease()

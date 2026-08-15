@@ -75,15 +75,18 @@ func (a *App) startLANServerWithPort(port int) {
 			return
 		}
 		imageID := strings.TrimPrefix(r.URL.Path, "/image/")
-		imagePath := a.resolveImagePath(imageID)
-		if imagePath == "" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Cache-Control", "public, max-age=600")
-		w.Header().Set("Content-Type", getMIMEType(strings.ToLower(imagePath[strings.LastIndex(imagePath, "."):])))
-		w.Header().Set("Accept-Ranges", "bytes")
-		http.ServeFile(w, r, imagePath)
+		// ★ 高优先级队列：与本地大图读取一致，先于缩略图生成（LOW）被调度
+		enqueueHighWait(func() {
+			imagePath := a.resolveImagePath(imageID)
+			if imagePath == "" {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Cache-Control", "public, max-age=600")
+			w.Header().Set("Content-Type", getMIMEType(strings.ToLower(imagePath[strings.LastIndex(imagePath, "."):])))
+			w.Header().Set("Accept-Ranges", "bytes")
+			http.ServeFile(w, r, imagePath)
+		})
 	})
 
 	// 图标

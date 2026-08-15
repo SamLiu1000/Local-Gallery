@@ -2,5 +2,6 @@
 
 package main
 
-func initVips()     {}
-func shutdownVips() {}
+func initVips()                    {}
+func initVipsWithConcurrency(n int) {}
+func shutdownVips()                {}

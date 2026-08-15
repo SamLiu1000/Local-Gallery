@@ -470,6 +470,8 @@
   "sort.newest_first": "الأحدث أولاً",
   "sort.oldest_first": "الأقدم أولاً",
   "sort.smallest_first": "الأصغر أولاً",
+  "sort.folder_asc": "المجلد A-Z",
+  "sort.folder_desc": "المجلد Z-A",
   "toast.api_deleted": "تم حذف إعدادات API",
   "toast.api_saved": "تم حفظ إعدادات API",
   "toast.api_test_failed": "فشل اتصال API",

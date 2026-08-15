@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 import _ "modernc.org/sqlite"
@@ -61,7 +62,45 @@ func New(dbPath string) (*ImageDB, error) {
 		return nil, fmt.Errorf("初始化数据库 schema 失败: %w", err)
 	}
 
+	// ★ 后台重建 FTS 搜索索引：仅当 images 有数据但 images_fts 为空时执行
+	//   （旧库首次升级到 FTS5 时填充一次；之后由触发器增量维护）。
+	go idb.rebuildSearchFTSIfNeeded()
+
 	return idb, nil
+}
+
+// rebuildSearchFTSIfNeeded 若 FTS 索引尚未全量重建（search_meta 无 fts_rebuilt 标记），
+// 则从 images 重建。之后由触发器增量维护。
+// ★ 注意：external-content 的 images_fts COUNT(*) 返回的是内容表行数而非索引行数，
+//   因此用标记表判断，绝不能拿 images_fts 行数与 images 比较。
+// ★ 用独立连接执行重建：主池 MaxOpenConns=1，若在主连接上跑几十秒的重建
+//   会把整个应用的 DB 操作全部冻结；独立连接下 WAL 并发读不受影响。
+func (idb *ImageDB) rebuildSearchFTSIfNeeded() {
+	var marker string
+	if err := idb.db.QueryRow(`SELECT value FROM search_meta WHERE key='fts_rebuilt'`).Scan(&marker); err == nil && marker == "1" {
+		return
+	}
+	var imgCount int
+	if err := idb.db.QueryRow(`SELECT COUNT(*) FROM images`).Scan(&imgCount); err != nil || imgCount == 0 {
+		return
+	}
+
+	rebuildDB, err := sql.Open("sqlite", idb.dbPath+"?cache=shared&_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=60000")
+	if err != nil {
+		fmt.Printf("[搜索索引] FTS 重建连接失败: %v\n", err)
+		return
+	}
+	defer rebuildDB.Close()
+	start := time.Now()
+	if _, err := rebuildDB.Exec(`INSERT INTO images_fts(images_fts) VALUES('rebuild')`); err != nil {
+		fmt.Printf("[搜索索引] FTS 重建失败: %v\n", err)
+		return
+	}
+	if _, err := rebuildDB.Exec(`INSERT INTO search_meta(key, value) VALUES('fts_rebuilt','1')
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value`); err != nil {
+		fmt.Printf("[搜索索引] FTS 重建标记写入失败: %v\n", err)
+	}
+	fmt.Printf("[搜索索引] FTS 重建完成: %d 行，耗时 %s\n", imgCount, time.Since(start).Round(time.Millisecond))
 }
 
 // GetDB 暴露底层 *sql.DB 给高性能批量写入使用
@@ -116,6 +155,36 @@ func (idb *ImageDB) initSchema() error {
 	--   有索引后 1ms。一次性构建约 2-3s。
 	CREATE INDEX IF NOT EXISTS idx_image_cache_path ON image_cache(path);
 
+	-- ★ FTS5 全文搜索索引（trigram 分词器：支持子串匹配，语义接近 LIKE %kw%）。
+	--   external content：内容存 images 表，由触发器自动同步，Go 代码无需手动维护。
+	--   trigram 要求查询词 >=3 字符，短词查询回退 LIKE（见 SearchImagesBySubstring）。
+	CREATE VIRTUAL TABLE IF NOT EXISTS images_fts USING fts5(
+		name, prompt, negative_prompt, path, params_json,
+		content='images', content_rowid='rowid',
+		tokenize='trigram'
+	);
+	CREATE TRIGGER IF NOT EXISTS images_fts_ai AFTER INSERT ON images BEGIN
+		INSERT INTO images_fts(rowid, name, prompt, negative_prompt, path, params_json)
+		VALUES (new.rowid, new.name, new.prompt, new.negative_prompt, new.path, new.params_json);
+	END;
+	CREATE TRIGGER IF NOT EXISTS images_fts_ad AFTER DELETE ON images BEGIN
+		INSERT INTO images_fts(images_fts, rowid, name, prompt, negative_prompt, path, params_json)
+		VALUES ('delete', old.rowid, old.name, old.prompt, old.negative_prompt, old.path, old.params_json);
+	END;
+	CREATE TRIGGER IF NOT EXISTS images_fts_au AFTER UPDATE ON images BEGIN
+		INSERT INTO images_fts(images_fts, rowid, name, prompt, negative_prompt, path, params_json)
+		VALUES ('delete', old.rowid, old.name, old.prompt, old.negative_prompt, old.path, old.params_json);
+		INSERT INTO images_fts(rowid, name, prompt, negative_prompt, path, params_json)
+		VALUES (new.rowid, new.name, new.prompt, new.negative_prompt, new.path, new.params_json);
+	END;
+
+	-- ★ FTS 重建标记：external-content 表 COUNT(*) 返回内容表行数（≠已索引），
+	--   用标记记录"是否已完成一次全量 rebuild"，避免每次启动误判跳过重建。
+	CREATE TABLE IF NOT EXISTS search_meta (
+		key TEXT PRIMARY KEY,
+		value TEXT NOT NULL DEFAULT ''
+	);
+
 	CREATE TABLE IF NOT EXISTS prompt_versions (
 		id TEXT PRIMARY KEY,
 		image_path TEXT NOT NULL,
@@ -138,6 +207,12 @@ func (idb *ImageDB) initSchema() error {
 	// 迁移：添加 content_hash 列（用于扫描去重）
 	if _, err := idb.db.Exec(`ALTER TABLE image_cache ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''`); err != nil {
 		fmt.Printf("[数据库迁移] content_hash 列添加失败（可能已存在）: %v\n", err)
+	}
+	// ★ content_hash 索引：去重回填 GetNullContentHashBatch 每次启动查
+	//   "content_hash=''" 时不再全表扫描 1.5M 行（走索引覆盖）。
+	//   必须在列迁移之后创建。
+	if _, err := idb.db.Exec(`CREATE INDEX IF NOT EXISTS idx_image_cache_content_hash ON image_cache(content_hash)`); err != nil {
+		fmt.Printf("[数据库迁移] content_hash 索引创建失败: %v\n", err)
 	}
 	return nil
 }
@@ -324,6 +399,24 @@ func escapeLike(s string) string {
 
 // SearchImagesBySubstring 在 path、prompt、negative_prompt、params_json 中模糊搜索
 // 返回匹配的图片记录列表，按相关度打分 DESC、last_modified DESC 排序
+// buildTrigramMatch 将用户查询转成 FTS5 trigram MATCH 表达式：
+// 按空白分词、去掉引号/反斜杠等 FTS 特殊字符，仅保留 >=3 字符的词
+// （trigram 分词器无法索引 1-2 字符），每词用双引号包裹（短语子串匹配），
+// 词间空格 = AND。返回空串表示无法用 FTS（应回退 LIKE）。
+func buildTrigramMatch(query string) string {
+	fields := strings.Fields(query)
+	parts := make([]string, 0, len(fields))
+	for _, f := range fields {
+		f = strings.ReplaceAll(f, `"`, "")
+		f = strings.ReplaceAll(f, `\`, "")
+		if utf8.RuneCountInString(f) < 3 {
+			continue
+		}
+		parts = append(parts, `"`+f+`"`)
+	}
+	return strings.Join(parts, " ")
+}
+
 func (idb *ImageDB) SearchImagesBySubstring(query string, folder string, offset int, limit int) ([]SearchResult, int, error) {
 	idb.mu.RLock()
 	defer idb.mu.RUnlock()
@@ -331,15 +424,67 @@ func (idb *ImageDB) SearchImagesBySubstring(query string, folder string, offset 
 	// 转义通配符后再拼模糊模式
 	searchPattern := "%" + escapeLike(query) + "%"
 
-	// 相关度打分：命中字段越重要分越高
+	// 相关度打分：命中字段越重要分越高（单表 LIKE 路径用）
 	scoreExpr := `(CASE WHEN name LIKE ? ESCAPE '\' THEN 5 ELSE 0 END
 		+ CASE WHEN prompt LIKE ? ESCAPE '\' THEN 4 ELSE 0 END
 		+ CASE WHEN negative_prompt LIKE ? ESCAPE '\' THEN 2 ELSE 0 END
 		+ CASE WHEN path LIKE ? ESCAPE '\' THEN 2 ELSE 0 END
 		+ CASE WHEN params_json LIKE ? ESCAPE '\' THEN 1 ELSE 0 END)`
 	scoreArgs := []interface{}{searchPattern, searchPattern, searchPattern, searchPattern, searchPattern}
+	// 相关度打分（FTS JOIN 路径：images_fts 也暴露同名列，必须加 i. 前缀消除歧义）
+	scoreExprJoin := `(CASE WHEN i.name LIKE ? ESCAPE '\' THEN 5 ELSE 0 END
+		+ CASE WHEN i.prompt LIKE ? ESCAPE '\' THEN 4 ELSE 0 END
+		+ CASE WHEN i.negative_prompt LIKE ? ESCAPE '\' THEN 2 ELSE 0 END
+		+ CASE WHEN i.path LIKE ? ESCAPE '\' THEN 2 ELSE 0 END
+		+ CASE WHEN i.params_json LIKE ? ESCAPE '\' THEN 1 ELSE 0 END)`
 
-	// 构建 WHERE 条件（占位符顺序在 SELECT 之后）
+	// 文件夹过滤（FTS 与 LIKE 两路径共用）
+	folderClause := ""
+	folderArgs := []interface{}{}
+	if folder != "" {
+		normalizedFolder := strings.ReplaceAll(folder, "\\", "/")
+		folderClause = " AND (i.root_path = ? OR i.folder LIKE ? ESCAPE '\\')"
+		folderArgs = append(folderArgs, normalizedFolder, normalizedFolder+"/%")
+	}
+
+	// ★ FTS5(trigram) 快路径：查询 >=3 字符时走全文索引，命中行才做 LIKE 打分，
+	//   避免每次搜索全表扫描 57 万行（多列 OR LIKE）。
+	//   注意：MATCH 运算符必须直接作用在 FTS 表名上，不能使用表别名。
+	if matchExpr := buildTrigramMatch(query); matchExpr != "" {
+		countSQL := "SELECT COUNT(*) FROM images_fts JOIN images i ON i.rowid = images_fts.rowid WHERE images_fts MATCH ?" + folderClause
+		countArgs := append([]interface{}{matchExpr}, folderArgs...)
+		var total int
+		if err := idb.db.QueryRow(countSQL, countArgs...).Scan(&total); err != nil {
+			return nil, 0, fmt.Errorf("搜索计数失败: %w", err)
+		}
+		querySQL := `SELECT i.id, i.path, i.name, i.size, i.last_modified, i.created_at, i.folder, i.root_path,
+			i.prompt, i.negative_prompt, i.params_json, ` + scoreExprJoin + ` AS score
+			FROM images_fts JOIN images i ON i.rowid = images_fts.rowid
+			WHERE images_fts MATCH ?` + folderClause + `
+			ORDER BY score DESC, i.last_modified DESC LIMIT ? OFFSET ?`
+		// 占位符顺序：scoreExprJoin(5) + MATCH(1) + folderArgs(0|2) + limit/offset(2)
+		queryArgs := append([]interface{}{}, scoreArgs...)
+		queryArgs = append(queryArgs, matchExpr)
+		queryArgs = append(queryArgs, folderArgs...)
+		queryArgs = append(queryArgs, limit, offset)
+		rows, err := idb.db.Query(querySQL, queryArgs...)
+		if err != nil {
+			return nil, 0, fmt.Errorf("搜索查询失败: %w", err)
+		}
+		defer rows.Close()
+		var results []SearchResult
+		for rows.Next() {
+			var r SearchResult
+			var score int // score 列仅用于排序，不输出
+			if err := rows.Scan(&r.ID, &r.Path, &r.Name, &r.Size, &r.LastModified, &r.CreatedAt, &r.Folder, &r.RootPath, &r.Prompt, &r.NegativePrompt, &r.ParamsJSON, &score); err != nil {
+				return nil, 0, fmt.Errorf("扫描搜索结果失败: %w", err)
+			}
+			results = append(results, r)
+		}
+		return results, total, rows.Err()
+	}
+
+	// LIKE 回退路径（短词 <3 字符时 trigram 不可用）
 	where := "WHERE (path LIKE ? ESCAPE '\\' OR prompt LIKE ? ESCAPE '\\' OR negative_prompt LIKE ? ESCAPE '\\' OR params_json LIKE ? ESCAPE '\\')"
 	whereArgs := []interface{}{searchPattern, searchPattern, searchPattern, searchPattern}
 
@@ -534,7 +679,8 @@ func getFields(field string) []string {
 // json: 前缀的字段从 params_json 提取对应参数（键含空格时 JSON path 用双引号包裹），
 // 参数缺失时 COALESCE 为空字符串：contains 不命中、exclude 放行。
 // ★ 先 json_valid 防护：部分历史数据的 params_json 不是合法 JSON（空串/截断），
-//   直接 json_extract 会抛 "malformed JSON" 导致整条查询失败。
+//
+//	直接 json_extract 会抛 "malformed JSON" 导致整条查询失败。
 func fieldExpr(f string) string {
 	if strings.HasPrefix(f, "json:") {
 		key := strings.TrimPrefix(f, "json:")
@@ -1086,16 +1232,23 @@ func (idb *ImageDB) LoadImageCacheByRoot(rootPath string) ([]ImageCacheEntry, er
 // 同一批文件无论记录归属哪个根目录（嵌套根/父根），通过完整路径前缀都能查到，
 // 避免"root_path + 相对 folder"匹配随机根目录导致的空结果。
 // 用范围查询 (path >= ? AND path < ?) 命中 path 索引（LIKE 前缀无法可靠走索引）。
+// ★ 下界用路径分隔符限定 [prefix+'\', prefix+'\'+\uFFFF)：只匹配"该文件夹内或其子目录"的记录，
+//
+//	避免把"名称是前缀延伸"的兄弟文件夹（如 "A (1)" 之于 "A"）误算进来。
+//	原上界 prefix+\uFFFF 会把 "A (1)"（空格 0x20 < 0x5C）一并匹配，导致点击某文件夹时
+//	把全部同名变体文件夹的记录都查回来（如 Imageye 重复下载的 18 个文件夹合成上千条），
+//	而前端过滤按 "folder + /" 精确匹配又排除变体 → 图廊空、计数与图量对不上。
 func (idb *ImageDB) LoadImageCacheByPathPrefixPaged(pathPrefix string, offset, limit int, sortOrder string) ([]ImageCacheEntry, int, error) {
 	idb.mu.Lock()
 	defer idb.mu.Unlock()
 	if limit <= 0 {
 		limit = 500
 	}
-	// 上界：前缀 + U+FFFF，匹配所有以此前缀开头的路径
-	upper := pathPrefix + "\uFFFF"
+	// 下界：路径分隔符限定；上界：下界 + U+FFFF，匹配所有以此开头的路径
+	lower := pathPrefix + "\\"
+	upper := lower + "\uFFFF"
 	where := "path >= ? AND path < ?"
-	args := []interface{}{pathPrefix, upper}
+	args := []interface{}{lower, upper}
 	var total int
 	if err := idb.db.QueryRow("SELECT COUNT(*) FROM image_cache WHERE "+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
@@ -1123,12 +1276,43 @@ func (idb *ImageDB) LoadImageCacheByPathPrefixPaged(pathPrefix string, offset, l
 	return entries, total, rows.Err()
 }
 
+// LoadImageCacheIDsUnderPath 返回位于该文件夹"子树"内的全部 image_cache ID（不含该文件夹本身，
+// 文件夹路径不会是图片文件）。用于刷新时以磁盘为权威补全 oldIDs：
+// 内存 folderIndex 里已被清出的孤儿记录（源文件删除后 image_cache 表残留）也能被纳入差异对比。
+// ★ 用路径分隔符限定范围 [folder+'\', folder+'\'+\uFFFF)：只匹配"该文件夹内或其子目录"的记录，
+//
+//	避免把"名称是前缀延伸"的兄弟文件夹（如 "A (1)" 之于 "A"）误算进来（P+\uFFFF 上界会误吞）。
+func (idb *ImageDB) LoadImageCacheIDsUnderPath(folderPath string) ([]string, error) {
+	idb.mu.Lock()
+	defer idb.mu.Unlock()
+	lower := strings.ReplaceAll(folderPath, "/", "\\") + "\\"
+	upper := lower + "\uFFFF"
+	rows, err := idb.db.Query(`SELECT id FROM image_cache WHERE path >= ? AND path < ?`, lower, upper)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return ids, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 func imageCacheOrderBy(sortOrder string) string {
 	switch sortOrder {
 	case "name-asc", "name":
 		return "name ASC, path ASC"
 	case "name-desc":
 		return "name DESC, path ASC"
+	case "folder-asc":
+		return "folder ASC, name ASC, path ASC"
+	case "folder-desc":
+		return "folder DESC, name ASC, path ASC"
 	case "size-desc", "size":
 		return "size DESC, path ASC"
 	case "size-asc":

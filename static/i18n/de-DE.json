@@ -478,6 +478,8 @@
   "sort.newest_first": "Neueste zuerst",
   "sort.oldest_first": "Älteste zuerst",
   "sort.smallest_first": "Kleinste zuerst",
+  "sort.folder_asc": "Ordner A-Z",
+  "sort.folder_desc": "Ordner Z-A",
   "toast.api_config_cloned": "Konfiguration geklont",
   "toast.api_config_not_found": "Konfiguration nicht gefunden",
   "toast.api_deleted": "API-Konfiguration gelöscht",

@@ -473,6 +473,8 @@
   "sort.newest_first": "Newest first",
   "sort.oldest_first": "Oldest first",
   "sort.smallest_first": "Smallest first",
+  "sort.folder_asc": "Folder A-Z",
+  "sort.folder_desc": "Folder Z-A",
   "toast.api_deleted": "API config deleted",
   "toast.api_saved": "API config saved",
   "toast.api_test_failed": "API connection failed",

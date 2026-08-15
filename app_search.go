@@ -426,7 +426,8 @@ func (a *App) backfillImageMetadata() {
 		return
 	}
 	const batchSize = 400
-	const workers = 8
+	// ★ 启动速度优化：回填延迟启动 + 降低并发，避免 8 路并发读盘与前台浏览抢 IO
+	const workers = 4
 	jobs := make(chan database.ImageCacheEntry, workers*2)
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
@@ -462,6 +463,7 @@ func (a *App) backfillImageMetadata() {
 		if processed%20000 == 0 {
 			fmt.Printf("[元数据回填] 进度: %d 条\n", processed)
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	close(jobs)
 	wg.Wait()
