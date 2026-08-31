@@ -218,6 +218,10 @@ export function IsFavorite(arg1) {
   return window['go']['main']['App']['IsFavorite'](arg1);
 }
 
+export function LogStartupTiming(arg1) {
+  return window['go']['main']['App']['LogStartupTiming'](arg1);
+}
+
 export function OpenFileLocation(arg1) {
   return window['go']['main']['App']['OpenFileLocation'](arg1);
 }

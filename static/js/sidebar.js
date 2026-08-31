@@ -2332,6 +2332,14 @@ const Sidebar = (() => {
                     );
                 }
 
+                // ★ 立即切换到新导入的文件夹，不必等整个扫描完成才出图。
+                //   图廊先显示已扫到的内容（或空态占位），scan:batch 更新计数、
+                //   scan:complete 后再自动补全为完整列表。
+                if (typeof Gallery !== 'undefined' && Gallery.filterByFolder) {
+                    if (Gallery._beginScanLoad) Gallery._beginScanLoad(folderPath);
+                    Gallery.filterByFolder(folderPath, folderName);
+                }
+
                 // ★ 异步扫描：用 scan:complete 事件驱动后续操作
                 //    事件回调中会刷新树、更新 count、自动切换文件夹
                 pollScanProgress(folderPath, folderName);
@@ -3800,7 +3808,10 @@ const Sidebar = (() => {
         let imageCount = 0;
         try {
             const imagePaths = await Storage.getImagesForTag(tag.id);
-            imageCount = imagePaths.length;
+            // ★ 文件夹标签返回 { linkedFolder, manualPaths }，统计手动标记的图片数
+            imageCount = Array.isArray(imagePaths)
+                ? imagePaths.length
+                : ((imagePaths && imagePaths.manualPaths) ? imagePaths.manualPaths.length : 0);
         } catch (e) { /* ignore */ }
 
         // 检查子标签

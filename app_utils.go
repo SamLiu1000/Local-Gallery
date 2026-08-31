@@ -11,6 +11,8 @@ import (
 	"io"
 	"os"
 	"strings"
+
+	"local-gallery/internal/metadata"
 )
 
 func formatFileSize(bytes int64) string {
@@ -185,6 +187,7 @@ func extractMP4Comment(filePath string) string {
 	return ""
 }
 
+// findUDTAComment 在 moov/udta 子树中递归查找 iTunes 风格 comment 标签（©cmt）
 func findUDTAComment(data []byte, start, end int) string {
 	pos := start
 	for pos+8 <= end {
@@ -215,6 +218,164 @@ func findUDTAComment(data []byte, start, end int) string {
 		pos += int(size)
 	}
 	return ""
+}
+
+// ==================== MP4 QuickTime keyed metadata（ComfyUI / MiniMax 等） ====================
+
+// mp4KeyedMeta 收集 QuickTime keyed metadata：keys 盒中的键名（形如 "mdtaworkflow"）与
+// ilst 盒中按 1 基索引对应的 data 值。
+type mp4KeyedMeta struct {
+	keys   []string
+	values map[int][]byte
+}
+
+// extractMP4KeyedMetadata 解析 moov/udta/meta 下的 QuickTime keyed metadata
+// （keys + ilst 结构，键名形如 mdtaworkflow / mdtaprompt / mdtæncoder），
+// 返回去掉 "mdta" 前缀后的键值映射（如 {"workflow": ..., "prompt": ..., "encoder": ...}）。
+// ComfyUI / MiniMax H3 等工具将生成参数以该格式写入视频，当前 Gallery 也能读取。
+func extractMP4KeyedMetadata(filePath string) map[string]string {
+	data, err := os.ReadFile(filePath)
+	if err != nil || len(data) < 8 {
+		return nil
+	}
+	pos := 0
+	for pos+8 <= len(data) {
+		size := binary.BigEndian.Uint32(data[pos : pos+4])
+		if size < 8 {
+			break
+		}
+		if string(data[pos+4:pos+8]) == "moov" {
+			moovEnd := pos + int(size)
+			if moovEnd > len(data) {
+				moovEnd = len(data)
+			}
+			meta := &mp4KeyedMeta{values: make(map[int][]byte)}
+			collectMP4KeyedMeta(data, pos+8, moovEnd, meta)
+			if len(meta.keys) == 0 {
+				return nil
+			}
+			result := make(map[string]string, len(meta.keys))
+			for i, name := range meta.keys {
+				val, ok := meta.values[i+1] // ilst 索引 1 基
+				if !ok {
+					continue
+				}
+				key := strings.TrimPrefix(name, "mdta")
+				if key == "" {
+					key = name
+				}
+				result[key] = string(val)
+			}
+			if len(result) == 0 {
+				return nil
+			}
+			return result
+		}
+		pos += int(size)
+	}
+	return nil
+}
+
+// collectMP4KeyedMeta 递归遍历 box 树，收集 keys 键名与 ilst 值。
+func collectMP4KeyedMeta(data []byte, start, end int, meta *mp4KeyedMeta) {
+	pos := start
+	for pos+8 <= end {
+		size := binary.BigEndian.Uint32(data[pos : pos+4])
+		if size < 8 {
+			break
+		}
+		boxType := string(data[pos+4 : pos+8])
+		childStart := pos + 8
+		childEnd := pos + int(size)
+		if childEnd > end {
+			childEnd = end
+		}
+
+		switch boxType {
+		case "udta":
+			collectMP4KeyedMeta(data, childStart, childEnd, meta)
+
+		case "meta":
+			// full box：前 4 字节 version/flags，之后才是子 box
+			if childStart+4 <= childEnd {
+				collectMP4KeyedMeta(data, childStart+4, childEnd, meta)
+			}
+
+		case "keys":
+			// full box: version/flags(4) + entry_count(4) + entries
+			if childStart+8 <= childEnd {
+				cnt := int(binary.BigEndian.Uint32(data[childStart+4 : childStart+8]))
+				kpos := childStart + 8
+				for i := 0; i < cnt && kpos+4 <= childEnd; i++ {
+					ksz := int(binary.BigEndian.Uint32(data[kpos : kpos+4]))
+					if ksz < 4 || kpos+ksz > childEnd {
+						break
+					}
+					meta.keys = append(meta.keys, string(data[kpos+4:kpos+ksz]))
+					kpos += ksz
+				}
+			}
+
+		case "ilst":
+			// ilst 子项：box type 是 4 字节大端索引（如 00 00 00 01），内含 data box
+			ipos := childStart
+			for ipos+8 <= childEnd {
+				isize := int(binary.BigEndian.Uint32(data[ipos : ipos+4]))
+				if isize < 8 || ipos+isize > childEnd {
+					break
+				}
+				idx := int(binary.BigEndian.Uint32(data[ipos+4 : ipos+8]))
+				itemEnd := ipos + isize
+				dpos := ipos + 8
+				for dpos+8 <= itemEnd {
+					dsize := int(binary.BigEndian.Uint32(data[dpos : dpos+4]))
+					if dsize < 8 || dpos+dsize > itemEnd {
+						break
+					}
+					if string(data[dpos+4:dpos+8]) == "data" {
+						// data full box(4) + type(4) + locale(4) → value 从 +16 开始
+						valStart := dpos + 16
+						if valStart <= dpos+dsize {
+							meta.values[idx] = data[valStart : dpos+dsize]
+						}
+					}
+					dpos += dsize
+				}
+				ipos += isize
+			}
+		}
+		pos += int(size)
+	}
+}
+
+// parseKeyedVideoMetadata 将 QuickTime keyed metadata 交给统一的 metadata.ParseTextChunks
+// 解析（prompt/workflow 为 ComfyUI 节点图格式），并转为视频元数据的旧版 map 形状。
+func parseKeyedVideoMetadata(kv map[string]string) map[string]interface{} {
+	textChunks := make(map[string]string, len(kv))
+	for k, v := range kv {
+		textChunks[k] = v
+	}
+	parsed := metadata.ParseTextChunks(textChunks)
+	if parsed == nil {
+		return nil
+	}
+	legacy := parsed.ToLegacy()
+	prompt, _ := legacy["prompt"].(string)
+	negativePrompt, _ := legacy["negativePrompt"].(string)
+	params := make(map[string]string)
+	if m, ok := legacy["params"].(map[string]interface{}); ok {
+		for k, v := range m {
+			params[k] = fmt.Sprintf("%v", v)
+		}
+	}
+	if prompt == "" && negativePrompt == "" && len(params) == 0 {
+		return nil
+	}
+	return map[string]interface{}{
+		"prompt":         prompt,
+		"negativePrompt": negativePrompt,
+		"params":         params,
+	}
 }
 
 func readMP4DataAtom(data []byte, start, end int) string {
@@ -260,6 +421,10 @@ func extractVideoMetadata(filePath string) map[string]interface{} {
 	var comment string
 	switch ext {
 	case ".mp4":
+		// 优先 QuickTime keyed metadata（ComfyUI / MiniMax H3 等把 prompt/workflow 写在这里）
+		if kv := extractMP4KeyedMetadata(filePath); len(kv) > 0 {
+			return parseKeyedVideoMetadata(kv)
+		}
 		comment = extractMP4Comment(filePath)
 	case ".webm", ".mkv":
 		comment = extractWebMComment(filePath)

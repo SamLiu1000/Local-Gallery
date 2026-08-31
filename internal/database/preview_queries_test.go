@@ -1,6 +1,7 @@
 package database
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 )
@@ -63,5 +64,56 @@ func TestPreviewQueries(t *testing.T) {
 			t.Fatalf("expected distinct non-empty id at offset %d, got %q", off, id)
 		}
 		seen[id] = true
+	}
+}
+
+// TestDeleteByRootBatch 验证分批删除能删干净指定 root 的全部记录，且不影响其它 root。
+// 插入超过单批（1000）的行数，确保分批循环正确终止、无遗漏。
+func TestDeleteByRootBatch(t *testing.T) {
+	db, err := New(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("New 失败: %v", err)
+	}
+	defer db.Close()
+	sqlDB := db.GetDB()
+
+	const rootA = `A:\`
+	const rootB = `B:\`
+	// 根 A 插 2500 行（跨多批），根 B 插 5 行（验证不受影响）
+	for i := 0; i < 2500; i++ {
+		if _, err := sqlDB.Exec(`INSERT INTO image_cache (id, path, name, size, last_modified, created_at, folder, root_path, width, height, is_video)
+			VALUES (?, ?, ?, 0, 0, 0, '', ?, 0, 0, 0)`,
+			fmt.Sprintf("a%d", i), fmt.Sprintf("A:\\img%d.png", i), "x", rootA); err != nil {
+			t.Fatalf("插入 A 失败: %v", err)
+		}
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := sqlDB.Exec(`INSERT INTO image_cache (id, path, name, size, last_modified, created_at, folder, root_path, width, height, is_video)
+			VALUES (?, ?, ?, 0, 0, 0, '', ?, 0, 0, 0)`,
+			fmt.Sprintf("b%d", i), fmt.Sprintf("B:\\img%d.png", i), "x", rootB); err != nil {
+			t.Fatalf("插入 B 失败: %v", err)
+		}
+	}
+
+	n, err := db.DeleteImageCacheByRoot(rootA)
+	if err != nil {
+		t.Fatalf("DeleteImageCacheByRoot 失败: %v", err)
+	}
+	if n != 2500 {
+		t.Errorf("应删除 2500 行, got %d", n)
+	}
+
+	var cntA, cntB int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM image_cache WHERE root_path = ?`, rootA).Scan(&cntA); err != nil {
+		t.Fatalf("查询 A 失败: %v", err)
+	}
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM image_cache WHERE root_path = ?`, rootB).Scan(&cntB); err != nil {
+		t.Fatalf("查询 B 失败: %v", err)
+	}
+	if cntA != 0 {
+		t.Errorf("根 A 应清空, 剩 %d 行", cntA)
+	}
+	if cntB != 5 {
+		t.Errorf("根 B 应保留 5 行, 剩 %d 行", cntB)
 	}
 }

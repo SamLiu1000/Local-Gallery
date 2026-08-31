@@ -94,6 +94,8 @@ func (a *App) computeThumbCounts() map[string]int {
 
 func (a *App) PreloadThumbCounts() {}
 
+func (a *App) scheduleThumbCountPreload() {}
+
 func (a *App) getCachedThumbCounts() map[string]int { return nil }
 
 func (a *App) thumbDBKeyCount() int { return -1 }

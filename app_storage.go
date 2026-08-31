@@ -210,6 +210,14 @@ func (a *App) loadFolderIndexLight() {
 	if a.imageDB == nil {
 		return
 	}
+	// ★ 冷启动优化：优先读取上次保存的轻量索引快照（小 JSON，毫秒级），
+	//   避免对 4.5GB 的 images.db 做 GROUP BY 全量统计（冷缓存下实测 2-10s）。
+	//   快照在每次扫描/刷新后由 rebuildFolderCountsFromSQLLocked 同步更新，保证不过期。
+	if entries, ok := a.loadFolderIndexLightCache(); ok {
+		a.populateFolderIndexFromEntries(entries)
+		fmt.Printf("[缓存] 轻量索引从快照就绪: %d 个文件夹\n", len(a.folderIndex))
+		return
+	}
 	entries, err := a.imageDB.LoadFolderIndexLight()
 	if err != nil {
 		fmt.Printf("[缓存] 轻量索引加载失败 %v，回退全量\n", err)
@@ -220,6 +228,14 @@ func (a *App) loadFolderIndexLight() {
 		fmt.Printf("[缓存] 轻量索引为空，等待扫描填充\n")
 		return
 	}
+	a.populateFolderIndexFromEntries(entries)
+	a.saveFolderIndexLight(entries) // ★ 写快照，供下次冷启动直接读取
+	fmt.Printf("[缓存] 轻量索引就绪: %d 个文件夹\n", len(a.folderIndex))
+}
+
+// populateFolderIndexFromEntries 用 LoadFolderIndexLight 返回的条目重建轻量索引结构：
+// folderIndex（key→nil，"未加载"占位）、folderCount（根/子目录累加计数）。
+func (a *App) populateFolderIndexFromEntries(entries []database.ImageCacheEntry) {
 	a.mu.Lock()
 	a.images = make(map[string]*ImageEntry)   // 启动时空
 	a.folderIndex = make(map[string][]string) // key 存在，value=nil 标记"未加载"
@@ -253,7 +269,59 @@ func (a *App) loadFolderIndexLight() {
 	}
 	a.mu.Unlock()
 	a.fixDuplicatePathKeys()
-	fmt.Printf("[缓存] 轻量索引就绪: %d 个文件夹\n", len(a.folderIndex))
+}
+
+// 轻量索引快照缓存：启动时用本地 JSON 替代 SQLite 的 GROUP BY 全量统计。
+// 数据即 LoadFolderIndexLight() 返回的 (root_path, folder, count) 三元组列表。
+const folderIndexLightFileName = "folder-index-light.json"
+
+type folderIndexLightEntry struct {
+	RootPath string `json:"root_path"`
+	Folder   string `json:"folder"`
+	Count    int    `json:"count"`
+}
+
+// loadFolderIndexLightCache 尝试读取上次保存的轻量索引快照。
+// ok=false 表示无缓存/损坏/为空，调用方应回退到 SQL 查询。
+func (a *App) loadFolderIndexLightCache() ([]database.ImageCacheEntry, bool) {
+	if a.userDataDir == "" {
+		return nil, false
+	}
+	path := filepath.Join(a.userDataDir, folderIndexLightFileName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	var list []folderIndexLightEntry
+	if err := json.Unmarshal(data, &list); err != nil || len(list) == 0 {
+		return nil, false
+	}
+	entries := make([]database.ImageCacheEntry, 0, len(list))
+	for _, it := range list {
+		entries = append(entries, database.ImageCacheEntry{RootPath: it.RootPath, Folder: it.Folder, Size: int64(it.Count)})
+	}
+	return entries, true
+}
+
+// saveFolderIndexLight 原子写入轻量索引快照（临时文件+改名），避免半截 JSON。
+func (a *App) saveFolderIndexLight(entries []database.ImageCacheEntry) {
+	if a.userDataDir == "" {
+		return
+	}
+	list := make([]folderIndexLightEntry, 0, len(entries))
+	for _, e := range entries {
+		list = append(list, folderIndexLightEntry{RootPath: e.RootPath, Folder: e.Folder, Count: int(e.Size)})
+	}
+	data, err := json.MarshalIndent(list, "", "  ")
+	if err != nil {
+		return
+	}
+	path := filepath.Join(a.userDataDir, folderIndexLightFileName)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, path)
 }
 
 // rebuildFolderCountsFromSQL 从 SQL 重建 folderCount，覆盖所有根目录。
@@ -283,6 +351,8 @@ func (a *App) rebuildFolderCountsFromSQLLocked() {
 		}
 	}
 	a.folderCount = counts
+	// ★ 同步更新轻量索引快照，让下次冷启动读到最新统计，避免快照过期。
+	a.saveFolderIndexLight(entries)
 }
 
 // ensureFolderLoaded 同步加载某 folderKey 进缓存；带 double-check + LRU 淘汰。
@@ -636,6 +706,63 @@ func (a *App) getInterruptedScans() []string {
 		}
 	}
 	return roots
+}
+
+// ==================== 目录修改时间缓存（刷新跳过未变叶子目录） ====================
+
+const dirMtimesFileName = "dir-mtimes.json"
+
+type dirMtimesFile struct {
+	Dirs map[string]int64 `json:"dirs"` // 规范化目录路径 -> 目录 mtime(毫秒)
+}
+
+// loadDirMtimes 从磁盘加载目录 mtime 缓存；文件缺失/损坏时返回空 map（安全：不跳过=全扫）。
+func loadDirMtimes(path string) map[string]int64 {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return map[string]int64{}
+	}
+	var f dirMtimesFile
+	if err := json.Unmarshal(data, &f); err != nil || f.Dirs == nil {
+		return map[string]int64{}
+	}
+	return f.Dirs
+}
+
+func (a *App) dirMtimesPath() string {
+	return filepath.Join(a.userDataDir, dirMtimesFileName)
+}
+
+// saveDirMtimes 原子持久化目录 mtime 缓存（需持 a.mu 调用方自行处理；内部只读拷贝后写盘）。
+func (a *App) saveDirMtimes() {
+	a.mu.RLock()
+	m := make(map[string]int64, len(a.dirMtimes))
+	for k, v := range a.dirMtimes {
+		m[k] = v
+	}
+	a.mu.RUnlock()
+	b, err := json.Marshal(dirMtimesFile{Dirs: m})
+	if err != nil {
+		return
+	}
+	tmp := a.dirMtimesPath() + ".tmp"
+	if os.WriteFile(tmp, b, 0644) == nil {
+		os.Rename(tmp, a.dirMtimesPath())
+	}
+}
+
+// recordDirMtime 记录/更新单个目录的 mtime（需持 a.mu 写锁）。
+func (a *App) recordDirMtime(dirNorm string, mtimeMillis int64) {
+	if a.dirMtimes == nil {
+		a.dirMtimes = make(map[string]int64)
+	}
+	a.dirMtimes[dirNorm] = mtimeMillis
+}
+
+// dirMtimeUnchanged 判断目录 mtime 是否与缓存一致（需持 a.mu 读锁）。
+func (a *App) dirMtimeUnchanged(dirNorm string, mtimeMillis int64) bool {
+	prev, ok := a.dirMtimes[dirNorm]
+	return ok && prev == mtimeMillis
 }
 
 // migrateUserData 一次性迁移：从 user-data.json 迁移数据到 SQLite

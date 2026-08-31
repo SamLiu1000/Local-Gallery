@@ -45,8 +45,13 @@ func (a *App) scanAllFolders() int {
 	a.mu.Lock()
 	// 检查是否需要增量扫描：已有图片数据时，只扫描缺失的根目录
 	hasExistingData := len(a.images) > 0
+	// ★ 排除嵌套虚拟根：其内容已由父目录扫描持有，独立扫描会把同一批文件
+	//   重新挂到嵌套根下、破坏父目录计数（乙方案，浅层根持有所有权）。
 	roots := make([]string, 0, len(a.registeredRoots))
 	for r := range a.registeredRoots {
+		if a.isRootNestedLocked(r) {
+			continue
+		}
 		roots = append(roots, r)
 	}
 	a.mu.Unlock()
@@ -225,9 +230,10 @@ func (a *App) scanWalkDir(dirPath, rootPath string, res *walkScanResult, writeGl
 		}
 		isVideo := isVideoFile(entry.Name())
 		w, h := 0, 0
-		if !isVideo {
-			w, h = getImageDimensions(fullPath)
-		}
+		// ★ 扫描阶段不逐张读取图片尺寸：getImageDimensions 需解码头部 + 读整个文件解析
+		//   EXIF，在图片多/慢盘上会拖慢甚至卡住扫描（导致 scan:complete 迟迟不发、
+		//   图廊一直不出图）。尺寸改为 GetImages 按需懒加载（SQLite 与内存回退两条
+		//   取图路径均有 w/h==0 时的兜底）。
 		entryObj := &ImageEntry{
 			ID:           id,
 			Path:         fullPath,
@@ -275,6 +281,14 @@ func (a *App) scanWalkDirBatched(dirPath, rootPath, currentRel string, onBatch f
 	batchImages := make(map[string]*ImageEntry)
 	batchFolderIndex := make(map[string][]string)
 
+	// ★ 记录目录 mtime：扫描/导入时顺带把各目录修改时间记入缓存，
+	//   使"导入后第一次刷新"也能直接跳过未变的叶子目录，不必全量重扫。
+	if dInfo, err := os.Stat(dirPath); err == nil {
+		a.mu.Lock()
+		a.recordDirMtime(strings.ReplaceAll(dirPath, "\\", "/"), dInfo.ModTime().UnixMilli())
+		a.mu.Unlock()
+	}
+
 	for _, entry := range entries {
 		if entry.IsDir() {
 			subRel := entry.Name()
@@ -301,9 +315,10 @@ func (a *App) scanWalkDirBatched(dirPath, rootPath, currentRel string, onBatch f
 		}
 		isVideo := isVideoFile(entry.Name())
 		w, h := 0, 0
-		if !isVideo {
-			w, h = getImageDimensions(fullPath)
-		}
+		// ★ 扫描阶段不逐张读取图片尺寸：getImageDimensions 需解码头部 + 读整个文件解析
+		//   EXIF，在图片多/慢盘上会拖慢甚至卡住扫描（导致 scan:complete 迟迟不发、
+		//   图廊一直不出图）。尺寸改为 GetImages 按需懒加载（SQLite 与内存回退两条
+		//   取图路径均有 w/h==0 时的兜底）。
 		entryObj := &ImageEntry{
 			ID:           id,
 			Path:         fullPath,
@@ -667,6 +682,48 @@ func (a *App) purgeMissingImage(id string) {
 // buildFolderTreeFromIndex 从 folderIndex 内存构建文件夹树，零磁盘 I/O
 // 比 buildFolderTreeRecursive（os.ReadDir）快几个数量级
 // previews：已开启"子文件夹缩略图预览"的文件夹 key → 预览条目（由 GetFolders 预取，内存优先/SQLite 兜底）
+// isRootNested 判断 rootPath 是否位于另一个已注册根目录之内（嵌套虚拟根）。
+func (a *App) isRootNested(rootPath string) bool {
+	norm := strings.ToLower(strings.ReplaceAll(rootPath, "\\", "/"))
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.isRootNestedLockedNorm(norm)
+}
+
+// isRootNestedLocked 判断 rootPath 是否嵌套（调用方需已持有 a.mu 读锁或写锁）。
+func (a *App) isRootNestedLocked(rootPath string) bool {
+	norm := strings.ToLower(strings.ReplaceAll(rootPath, "\\", "/"))
+	return a.isRootNestedLockedNorm(norm)
+}
+
+// isRootNestedLockedNorm 按已规范化（小写 + 正斜杠）的路径判断是否嵌套。
+func (a *App) isRootNestedLockedNorm(norm string) bool {
+	for root := range a.registeredRoots {
+		rn := strings.ToLower(strings.ReplaceAll(root, "\\", "/"))
+		if rn != norm && strings.HasPrefix(norm, rn+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// rootSubtreeCount 返回 rootPath 目录下已索引的图片总数（含所有子目录）。
+// 嵌套根的图片由父目录扫描按完整路径索引，其 folderCount 键即真实目录路径，
+// 因此对前缀求和即可得到该根下全部图片数。
+func (a *App) rootSubtreeCount(rootPath string) int {
+	norm := strings.ReplaceAll(rootPath, "\\", "/")
+	prefix := norm + "/"
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	total := a.folderCount[norm]
+	for k, c := range a.folderCount {
+		if strings.HasPrefix(k, prefix) {
+			total += c
+		}
+	}
+	return total
+}
+
 func (a *App) buildFolderTreeFromIndex(rootPath string, thumbCounts map[string]int, previews map[string][]FolderPreview) []*FolderNode {
 	normalizedRoot := strings.ReplaceAll(rootPath, "\\", "/")
 	prefix := normalizedRoot + "/"
@@ -683,6 +740,23 @@ func (a *App) buildFolderTreeFromIndex(rootPath string, thumbCounts map[string]i
 	// 子文件夹会在后台扫描完成后通过 scan:batch 事件更新
 	if len(folderSet) == 0 {
 		return []*FolderNode{}
+	}
+
+	// ★ 乙方案：本根之内已注册的嵌套根（子目录被单独导入）在父目录树里渲染为
+	//   "折叠入口"——不再展开其子文件夹（避免与顶层独立入口重复显示一整棵子树），
+	//   其计数仍显示该嵌套根的全部图片数（folderCount 键与真实目录一致）。
+	var registeredUnder []string
+	a.mu.RLock()
+	for root := range a.registeredRoots {
+		rn := strings.ReplaceAll(root, "\\", "/")
+		if rn != normalizedRoot && strings.HasPrefix(rn, prefix) {
+			registeredUnder = append(registeredUnder, rn)
+		}
+	}
+	a.mu.RUnlock()
+	registeredSet := make(map[string]bool, len(registeredUnder))
+	for _, rn := range registeredUnder {
+		registeredSet[rn] = true
 	}
 
 	// 用 map 构建树节点，key 为规范化路径
@@ -725,6 +799,9 @@ func (a *App) buildFolderTreeFromIndex(rootPath string, thumbCounts map[string]i
 		parentPath := childPath[:idx]
 		if parentPath == normalizedRoot {
 			continue // 根节点的子节点，直接由 GetFolders 挂载
+		}
+		if registeredSet[parentPath] {
+			continue // 父级是已注册的嵌套根（折叠入口），不展开其子节点
 		}
 		if parent, ok := nodes[parentPath]; ok {
 			parent.Children = append(parent.Children, childNode)
@@ -1261,6 +1338,11 @@ func (a *App) RefreshAll() map[string]interface{} {
 		a.ensureImageIndex()
 		a.startupIncrementalRefresh()
 		fmt.Println("[RefreshAll] 全量刷新完成")
+		// ★ 通知前端刷新周期结束：可停止按钮旋转、提示完成。
+		//   刷新期间的增量变化已由各根目录的 scan:complete 事件逐条推送给前端。
+		if a.ctx != nil {
+			wailsruntime.EventsEmit(a.ctx, "refresh:complete", map[string]interface{}{})
+		}
 	}()
 	return map[string]interface{}{"success": true}
 }
@@ -1317,12 +1399,31 @@ func (a *App) refreshFolderInternal(folderPath string) *FolderDiffResult {
 	// === Phase 1: IO 阶段（无锁）===
 
 	// 1a. 快照：拷贝 folderIndex 中属于此文件夹树的 ID 集合（短暂读锁）
+	//   ★ 同时构建 "真实目录路径 -> id 集合" 的映射，供叶子目录 mtime 跳过时标记"文件仍在"。
 	a.mu.RLock()
 	oldIDs := make(map[string]bool)
+	dirIDMap := make(map[string]map[string]bool) // realDirNorm -> id set
+	mtRootNorm := strings.ReplaceAll(matchedRoot, "\\", "/")
 	for folderKey, ids := range a.folderIndex {
 		if folderKey == normalizedFolder || strings.HasPrefix(folderKey, normalizedFolder+"/") {
 			for _, id := range ids {
 				oldIDs[id] = true
+			}
+			// folderKey 形如 "rootNorm/rel" → 还原真实目录
+			rel := ""
+			if len(folderKey) > len(mtRootNorm) {
+				rel = folderKey[len(mtRootNorm)+1:]
+			}
+			realDir := matchedRoot
+			if rel != "" {
+				realDir = matchedRoot + "\\" + strings.ReplaceAll(rel, "/", "\\")
+			}
+			realDirNorm := strings.ReplaceAll(realDir, "\\", "/")
+			if dirIDMap[realDirNorm] == nil {
+				dirIDMap[realDirNorm] = make(map[string]bool)
+			}
+			for _, id := range ids {
+				dirIDMap[realDirNorm][id] = true
 			}
 		}
 	}
@@ -1358,6 +1459,44 @@ func (a *App) refreshFolderInternal(folderPath string) *FolderDiffResult {
 		if readErr != nil {
 			return
 		}
+
+		// ★ 目录 mtime 缓存：记录当前 mtime；若为"叶子目录（无子目录）"且 mtime 未变，
+		//   说明里面一个文件都没增删改 → 整目录跳过，不再对每个文件 stat/MD5，
+		//   把刷新从 O(所有文件) 降为 O(有变化的目录)。叶子目录无子目录，因此
+		//   "叶子 mtime 未变 ⇒ 其内文件未变"，跳过是安全的（不会漏掉子目录变化）。
+		dirNorm := strings.ReplaceAll(dir, "\\", "/")
+		var dm int64
+		if dInfo, err := os.Stat(dir); err == nil {
+			dm = dInfo.ModTime().UnixMilli()
+		}
+		hasSubdir := false
+		for _, it := range items {
+			if it.IsDir() {
+				hasSubdir = true
+				break
+			}
+		}
+		a.mu.Lock()
+		leafUnchanged := !hasSubdir && a.dirMtimeUnchanged(dirNorm, dm)
+		a.recordDirMtime(dirNorm, dm)
+		a.mu.Unlock()
+		if leafUnchanged {
+			// 叶子目录未变：其文件都还在，标记为 current（避免被当作删除）。
+			// 仅当能映射到该目录的已知文件时才跳过；映射不到（如嵌套根路径不一致）
+			// 则回退完整处理，保证不会误删。
+			// ★ 修复：folderIndex 键存在但值为 nil（"未加载"占位——重启后 loadFolderIndexLight
+			//   对每个键都设 nil）时，dirIDMap 里该目录映射到"空集合"。此时若跳过，会把
+			//   该目录的文件全部漏掉，SQL 侧 oldIDs（image_cache 残留）被当作"已删除"清掉，
+			//   表现为"刷新后整目录图片消失"。只有映射到已知文件（len(ids)>0）才可安全跳过；
+			//   映射为空则回退完整处理：文件仍在 a.images 会被标记 current 保留，否则重扫入库。
+			if ids, mapped := dirIDMap[dirNorm]; mapped && len(ids) > 0 {
+				for id := range ids {
+					currentIDs[id] = true
+				}
+				return
+			}
+		}
+
 		for _, item := range items {
 			if item.IsDir() {
 				subRel := item.Name()
@@ -1390,9 +1529,7 @@ func (a *App) refreshFolderInternal(folderPath string) *FolderDiffResult {
 			// 新文件 → 获取尺寸并创建条目
 			isVideo := isVideoFile(item.Name())
 			w, h := 0, 0
-			if !isVideo {
-				w, h = getImageDimensions(fullPath)
-			}
+			// ★ 扫描阶段不逐张读取图片尺寸（见上文注释，GetImages 懒加载兜底）
 			relFolder := rel
 			if relFolder == "." {
 				relFolder = ""
@@ -1421,6 +1558,9 @@ func (a *App) refreshFolderInternal(folderPath string) *FolderDiffResult {
 		relBase = normalizedFolder[len(matchedRootNorm)+1:]
 	}
 	walkFn(folderPath, relBase)
+
+	// ★ 持久化目录 mtime 缓存：本次刷新记录的 mtime 落盘，重启后不必重扫未变的叶子目录。
+	a.saveDirMtimes()
 
 	// 1c. 计算删除的 ID：oldIDs 中不在 currentIDs 里的
 	var removedIDs []string
@@ -1648,4 +1788,67 @@ func (a *App) refreshFolderInternal(folderPath string) *FolderDiffResult {
 		Unchanged: unchanged,
 		Success:   true,
 	}
+}
+
+// autoHealMissingFolder 自愈 GetImages 返回 0 的场景：目录在磁盘上仍存在且属于已注册
+// 根目录，但 image_cache / 内存索引都没有它的记录（历史 bug 误删、中断扫描残留等）。
+// 后台对该文件夹做一次增量刷新，把磁盘上的文件重新索引回来；有变化时发 scan:complete
+// 让前端自动重拉当前文件夹（无变化不发事件，避免空目录被反复点击造成重拉循环）。
+func (a *App) autoHealMissingFolder(normalizedFolder string) {
+	if a.bgPaused.Load() == 1 {
+		return
+	}
+	// 找到包含该文件夹的最长匹配根目录（GetImages 只关心"确实属于已导入范围"）
+	a.mu.RLock()
+	var matchedRoot string
+	for root := range a.registeredRoots {
+		rootNorm := strings.ReplaceAll(root, "\\", "/")
+		if normalizedFolder == rootNorm || strings.HasPrefix(normalizedFolder, rootNorm+"/") {
+			if len(rootNorm) > len(strings.ReplaceAll(matchedRoot, "\\", "/")) {
+				matchedRoot = root
+			}
+		}
+	}
+	a.mu.RUnlock()
+	if matchedRoot == "" {
+		return
+	}
+	// 并发去重：同一文件夹只允许一个自愈刷新在跑
+	a.scanMu.Lock()
+	if a.scanningRoots == nil {
+		a.scanningRoots = make(map[string]bool)
+	}
+	if a.scanningRoots[normalizedFolder] {
+		a.scanMu.Unlock()
+		return
+	}
+	a.scanningRoots[normalizedFolder] = true
+	a.scanMu.Unlock()
+
+	fmt.Printf("[自愈] GetImages=0 但目录存在，后台补扫: %s\n", normalizedFolder)
+	go func() {
+		defer func() {
+			a.scanMu.Lock()
+			delete(a.scanningRoots, normalizedFolder)
+			a.scanMu.Unlock()
+		}()
+		result := a.refreshFolderInternal(normalizedFolder)
+		if !result.Success {
+			fmt.Printf("[自愈] 后台补扫失败 %s: %s\n", normalizedFolder, result.Error)
+			return
+		}
+		if len(result.Added) == 0 && len(result.Removed) == 0 {
+			return // 目录确实为空，不发事件，避免前端反复重拉
+		}
+		fmt.Printf("[自愈] %s: 重新索引 %d 张、移除 %d 张\n",
+			normalizedFolder, len(result.Added), len(result.Removed))
+		if a.ctx != nil {
+			wailsruntime.EventsEmit(a.ctx, "scan:complete", map[string]interface{}{
+				"rootPath": matchedRoot,
+				"count":    len(result.Added) + result.Unchanged,
+				"added":    len(result.Added),
+				"removed":  len(result.Removed),
+			})
+		}
+	}()
 }

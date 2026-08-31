@@ -33,6 +33,7 @@ const Gallery = (() => {
     let promptCountMap = {};        // imagePath → count
     let currentFolderFilter = null; // 当前文件夹过滤路径
     let currentTagFilter = null;     // 当前标签过滤 ID（null 表示不在标签视图）
+    let folderTagExtraPaths = null;  // 文件夹标签：手动标记该标签、但不在文件夹内的图片路径集合（标签视图=文件夹内容∪手动标记）
     const DOM_KEEP = 250;           // IntersectionObserver 预加载前后各覆盖的图片张数
     let currentFavoriteFilter = false; // 当前是否在收藏视图
     let isFilteringActive = false;
@@ -1852,20 +1853,24 @@ const Gallery = (() => {
         // ★ 直接过滤，不先复制整个数组
         const len = images.length;
         const result = [];
-        
+        // ★ 文件夹标签：手动标记的图片也纳入视图（即使不在该文件夹路径下）
+        const extraSet = folderTagExtraPaths;
+
         for (let i = 0; i < len; i++) {
             const img = images[i];
             const imgRootId = (img.rootId || img.rootPath || '').replace(/\\/g, '/');
             const imgFolder = (img.folder || '').replace(/\\/g, '/');
             const imageFolderPath = imgFolder ? `${imgRootId}/${imgFolder}` : imgRootId;
 
+            const inExtra = !!extraSet && extraSet.has(img.path);
             if (includeDescendants) {
                 if (imageFolderPath === normalizedFilter ||
-                    imageFolderPath.startsWith(filterPrefix)) {
+                    imageFolderPath.startsWith(filterPrefix) ||
+                    inExtra) {
                     result.push(img);
                 }
             } else {
-                if (imageFolderPath === normalizedFilter) {
+                if (imageFolderPath === normalizedFilter || inExtra) {
                     result.push(img);
                 }
             }
@@ -1880,6 +1885,32 @@ const Gallery = (() => {
     async function refreshCurrentFilteredView() {
         if (currentTagFilter) {
             const taggedPaths = await Storage.getImagesForTag(currentTagFilter);
+            if (taggedPaths && taggedPaths.linkedFolder) {
+                // ★ 文件夹标签：重新计算"手动标记但不在文件夹内"的附加图片集合，
+                //   再按文件夹过滤重建视图（含附加图片）。
+                const manualPaths = taggedPaths.manualPaths || [];
+                const normFolder = String(taggedPaths.linkedFolder).replace(/\\/g, '/');
+                folderTagExtraPaths = new Set(manualPaths.filter(p => {
+                    const n = String(p).replace(/\\/g, '/');
+                    return !(n === normFolder || n.startsWith(normFolder + '/'));
+                }));
+                applyCurrentFilter();
+                sortImages();
+                if (filteredImages.length > 100) {
+                    if (currentLayout === 'masonry') {
+                        renderMasonry(filteredImages);
+                    } else if (currentLayout === 'pinterest') {
+                        renderPinterest(filteredImages);
+                    } else if (currentLayout === 'list') {
+                        renderList(filteredImages);
+                    } else {
+                        progressiveRender(filteredImages);
+                    }
+                } else {
+                    render();
+                }
+                return;
+            }
             const pathSet = new Set(taggedPaths);
             filteredImages = images.filter(img => pathSet.has(img.path));
             sortImages();
@@ -2370,6 +2401,8 @@ const Gallery = (() => {
         currentTagFilter = null;
         currentFavoriteFilter = false;
         isFilteringActive = !!currentFolderFilter;
+        // ★ 离开文件夹标签视图时清除附加图片集合（导航栏点文件夹时不应残留标签附加图）
+        folderTagExtraPaths = null;
 
         // ★ 内存优化：记录本次访问的文件夹（LRU 淘汰时保留最近访问）
         noteFolderVisited(currentFolderFilter);
@@ -2697,10 +2730,53 @@ const Gallery = (() => {
         try {
             const taggedPaths = await Storage.getImagesForTag(tagId);
 
-            // ★ 文件夹标签：直接走文件夹过滤逻辑
+            // ★ 文件夹标签：文件夹内容 ∪ 手动标记的图片（image_tags 关联）。
+            //   修复：把图片手动打上该标签后，标签视图也显示它们，而不仅是文件夹本身。
             if (taggedPaths && taggedPaths.linkedFolder) {
                 currentTagFilter = null;
+                // 先清除上次的附加图片集合，避免串台
+                folderTagExtraPaths = null;
+                const manualPaths = taggedPaths.manualPaths || [];
+                const normFolder = String(taggedPaths.linkedFolder).replace(/\\/g, '/');
+                // 手动标记中不在该文件夹路径下的图片，作为附加部分合并展示
+                const extraPaths = manualPaths.filter(p => {
+                    const n = String(p).replace(/\\/g, '/');
+                    return !(n === normFolder || n.startsWith(normFolder + '/'));
+                });
+                // 先把附加图片加载进 images，供 applyCurrentFilter 过滤保留
+                if (extraPaths.length > 0) {
+                    try {
+                        const extra = await loadImagesByPaths(extraPaths, 0, extraPaths.length);
+                        images.push(...(extra.images || []));
+                        invalidatePathIndex();
+                    } catch (err) {
+                        console.warn('[Gallery] 文件夹标签附加图片加载失败:', err);
+                    }
+                }
+                // 文件夹过滤（filterByFolder 会清除 folderTagExtraPaths，需在其后重建视图）
                 await filterByFolder(taggedPaths.linkedFolder, null, { forceRefresh: false });
+                // ★ 陈旧续体守卫：await 期间用户可能已切到其它视图，
+                //   此时当前文件夹不再是本标签的文件夹，放弃重建，避免覆盖新视图。
+                const normNow = String(currentFolderFilter || '').replace(/\\/g, '/');
+                if (normNow === normFolder && folderTagExtraPaths === null) {
+                    folderTagExtraPaths = new Set(extraPaths);
+                    applyCurrentFilter();
+                    sortImages();
+                    const displayImages = filteredImages;
+                    if (displayImages.length > 100) {
+                        if (currentLayout === 'masonry') {
+                            renderMasonry(displayImages);
+                        } else if (currentLayout === 'pinterest') {
+                            renderPinterest(displayImages);
+                        } else if (currentLayout === 'list') {
+                            renderList(displayImages);
+                        } else {
+                            progressiveRender(displayImages);
+                        }
+                    } else {
+                        render();
+                    }
+                }
                 currentTagFilter = tagId;
                 return;
             }
@@ -3539,7 +3615,20 @@ const Gallery = (() => {
             img.className = 'loading';
             img.alt = imgData.name;
             img.decoding = 'async';
+
+            // ★ 加载超时兜底：缩略图请求可能长时间挂起（后端排队生成、切换文件夹杀 worker 后
+            //   重新拉起等），既不发 load 也不发 error → img.loading 一直 opacity:0，
+            //   卡片永远不出图（表现为"一直加载中"）。超时后强制走重试，重试耗尽显示失败占位。
+            const armThumbTimeout = () => {
+                clearTimeout(img._thumbTimeout);
+                img._thumbTimeout = setTimeout(() => {
+                    if (img.complete && img.naturalWidth > 0) return; // 实际已加载，无需重试
+                    img.dispatchEvent(new Event('error'));
+                }, 15000);
+            };
+
             img.addEventListener('error', function retryLoad() {
+                clearTimeout(img._thumbTimeout);
                 let retries = parseInt(this.dataset.retryCount) || 0;
                 if (retries < 3) {
                     retries++;
@@ -3550,6 +3639,7 @@ const Gallery = (() => {
                         setTimeout(() => {
                             this.src = '';
                             this.src = baseUrl.replace(/[&?]_r=[^&]*/g, '') + (baseUrl.includes('?') ? '&' : '?') + '_r=' + Math.random().toString(36).slice(2);
+                            armThumbTimeout();
                         }, delay);
                     }
                 } else {
@@ -3560,9 +3650,11 @@ const Gallery = (() => {
                     if (this.parentNode) this.parentNode.insertBefore(errorDiv, this);
                 }
             });
+            img.addEventListener('load', () => clearTimeout(img._thumbTimeout));
             // ★ 直接赋 src：卡片插入时立刻开始下载，不等 Observer 异步回调
             //   对于虚拟滚动，只有视窗附近的卡片才会被创建，因此直接加载是正确的
             img.src = imgData.thumbnailUrl;
+            armThumbTimeout();
         } else {
             img.className = 'loading placeholder-loading';
             img.alt = imgData.name;
@@ -3902,15 +3994,11 @@ const Gallery = (() => {
             }
 
             // --- overlay（hover 覆盖层）---
+            // ★ 移除左下角多余的收藏星星：收藏状态已由右上角 fav-btn 高亮表达，
+            //   底部渐变层保留（提升底部文字可读性），不再叠加重复的星标。
             const overlay = document.createElement('div');
             overlay.className = 'card-overlay';
 
-            const favIcon = document.createElement('span');
-            favIcon.className = 'card-favorite-icon';
-            favIcon.innerHTML = '<span class="icon icon-favorite-on"></span>';
-            favIcon.style.display = isFavCached(imgData.path) ? 'block' : 'none';
-
-            overlay.appendChild(favIcon);
             wrapper.appendChild(overlay);
 
             // --- hoverActions（悬停操作按钮）---

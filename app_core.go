@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	goruntime "runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -66,6 +67,10 @@ type App struct {
 	switchMu       sync.Mutex // 防止 RestartWithNewPaths 重入
 	pendingUserDir string     // SetUserDataDir 设定的待切换路径，供 RestartWithNewPaths 优先读取
 
+	// ★ 目录修改时间缓存：refresh 时跳过"自身 mtime 未变"的叶子目录（其文件都未变），
+	//   把刷新从 O(所有文件) 降为 O(变化的目录)。持久化到磁盘，重启后不重扫未变部分。
+	dirMtimes map[string]int64 // 规范化目录路径(正斜杠) -> 目录 mtime(毫秒)
+
 	imageDB    *database.ImageDB
 	userDataDB *database.UserDataDB
 	thumbDB    *bbolt.DB // 缩略图 BoltDB 单文件存储
@@ -115,6 +120,7 @@ func NewApp(userDataDir, defaultUserDataDir string) *App {
 		proxyCancels:       make(map[string]context.CancelFunc),
 		indexingRoots:      make(map[string]context.CancelFunc),
 		previewCache:       make(map[string][]FolderPreview),
+		dirMtimes:          loadDirMtimes(filepath.Join(userDataDir, dirMtimesFileName)),
 	}
 	os.MkdirAll(userDataDir, 0755)
 
@@ -123,17 +129,23 @@ func NewApp(userDataDir, defaultUserDataDir string) *App {
 
 	// ★ 单实例保护：防止两个实例并发读写同一份用户数据（并发覆盖 = 数据丢失）
 	if lockRelease, lockErr := acquireInstanceLock(app.userDataDir); lockErr != nil {
+		// ★ 打点：只有"启动/WindowState/initVips"三行就消失的会话，多半是走到了这里
+		//   （互斥体冲突 → 弹窗 → 退出），与"在窗口创建阶段崩溃"的会话区分开。
+		logStartupf("NewApp: 单实例冲突（另一个实例正在运行），本进程退出")
 		fmt.Printf("[单实例] %v\n", lockErr)
 		showInstanceConflictMessage()
 		os.Exit(1)
 	} else {
 		app.instanceLockRelease = lockRelease
+		logStartupf("NewApp: 已获取单实例互斥体")
 	}
 
 	// 初始化 BoltDB 缩略图存储
+	logStartupf("NewApp: openThumbDB 开始")
 	if err := app.openThumbDB(); err != nil {
 		fmt.Printf("[缩略图] %v\n", err)
 	}
+	logStartupf("NewApp: openThumbDB 完成")
 
 	// 初始化 SQLite 图片元数据库
 	dbPath := filepath.Join(app.userDataDir, "images.db")
@@ -142,6 +154,7 @@ func NewApp(userDataDir, defaultUserDataDir string) *App {
 	} else {
 		app.imageDB = imageDB
 	}
+	logStartupf("NewApp: images.db 完成")
 
 	// 初始化 SQLite 用户数据库（设置数据）
 	udbPath := filepath.Join(app.userDataDir, "user-data.db")
@@ -150,17 +163,39 @@ func NewApp(userDataDir, defaultUserDataDir string) *App {
 	} else {
 		app.userDataDB = userDataDB
 	}
+	logStartupf("NewApp: user-data.db 完成")
 
+	// ★ 打点：这 6 步合计曾观测到 2.5~5s（偶发），逐步骤计时以定位瓶颈。
+	stepT0 := time.Now()
 	app.loadUserData()
+	logStartupf("NewApp: 步骤 loadUserData 完成（%s）", time.Since(stepT0).Round(time.Millisecond))
+	stepT0 = time.Now()
 	app.loadThumbSettings()     // 恢复缩略图并发数与缩放算法设置
+	logStartupf("NewApp: 步骤 loadThumbSettings 完成（%s）", time.Since(stepT0).Round(time.Millisecond))
+	stepT0 = time.Now()
 	app.loadThumbCountsFromDisk() // ★ 冷启动恢复上次的 thumbCounts，跳过 8.6GB 缩略图库重算
+	logStartupf("NewApp: 步骤 loadThumbCountsFromDisk 完成（%s）", time.Since(stepT0).Round(time.Millisecond))
+	stepT0 = time.Now()
 	app.migratePromptVersions() // migrate old promptVersions to SQLite
+	logStartupf("NewApp: 步骤 migratePromptVersions 完成（%s）", time.Since(stepT0).Round(time.Millisecond))
+	stepT0 = time.Now()
 	app.migrateUserData()       // migrate registeredRoots/imageTags/favorites to SQLite
+	logStartupf("NewApp: 步骤 migrateUserData 完成（%s）", time.Since(stepT0).Round(time.Millisecond))
+	stepT0 = time.Now()
 	app.loadFolderIndexLight()  // ★ 轻量索引启动：仅加载文件夹列表+count，图片按需加载
+	logStartupf("NewApp: 步骤 loadFolderIndexLight 完成（%s）", time.Since(stepT0).Round(time.Millisecond))
+	logStartupf("NewApp: 用户数据+轻量索引完成")
 
 	app.startHTTPServer()
+	logStartupf("NewApp: HTTP 服务完成")
 
 	return app
+}
+
+// LogStartupTiming 前端启动打点：由 JS 在关键节点调用（DOMContentLoaded / window-load / init-done），
+// 追加写入 startup.log，用于定位冷启动慢的瓶颈。
+func (a *App) LogStartupTiming(tag string) {
+	logStartupf("前端: %s", tag)
 }
 
 func (a *App) startHTTPServer() {
@@ -562,13 +597,35 @@ func (a *App) ScanFolderQuick(path, folderType string, quick bool) *ScanResult {
 	}
 	normalizedNew := strings.ToLower(strings.ReplaceAll(resolvedPath, "\\", "/"))
 	a.mu.RLock()
+	// ★ 允许父子嵌套导入（乙方案）：
+	//   数据层已按图片完整路径去重（image_cache 以 path 为索引、查询按路径前缀），
+	//   父根与嵌套根不会产生重复图片记录；侧栏按"嵌套根折叠进父目录 + 顶层保留
+	//   独立入口"展示，计数按真实目录统计。因此不再拦截父子嵌套，仅拒绝完全
+	//   相同的重复路径。
 	for root := range a.registeredRoots {
-		if strings.ToLower(strings.ReplaceAll(root, "\\", "/")) == normalizedNew {
+		normalizedRoot := strings.ToLower(strings.ReplaceAll(root, "\\", "/"))
+		if normalizedRoot == normalizedNew {
 			a.mu.RUnlock()
 			return &ScanResult{Success: false, Message: "该目录已在扫描列表中"}
 		}
 	}
 	a.mu.RUnlock()
+
+	// ★ 判断是否位于某个已注册父目录内（嵌套虚拟根）。
+	//   其内容由父目录扫描按完整路径持有（浅层根持有所有权），本根仅作为
+	//   侧栏的"虚拟入口"，不重复自建索引，否则会把同一批文件改挂到本根下、
+	//   破坏父目录计数。
+	a.mu.RLock()
+	isNested := false
+	for root := range a.registeredRoots {
+		normalizedRoot := strings.ToLower(strings.ReplaceAll(root, "\\", "/"))
+		if normalizedRoot != normalizedNew && strings.HasPrefix(normalizedNew, normalizedRoot+"/") {
+			isNested = true
+			break
+		}
+	}
+	a.mu.RUnlock()
+
 	a.mu.Lock()
 	a.registeredRoots[resolvedPath] = true
 	a.folderTypes[resolvedPath] = folderType
@@ -579,6 +636,31 @@ func (a *App) ScanFolderQuick(path, folderType string, quick bool) *ScanResult {
 	a.setScanInProgress(resolvedPath, true)
 	fmt.Printf("[导入] 已注册并写入扫描标记: %s（扫描中退出后下次启动会自动补扫）\n", resolvedPath)
 	a.saveRegisteredRoots()
+
+	// ★ 嵌套虚拟根：内容已由父目录扫描持有，不重复扫描/自建索引，
+	//   仅注册并在侧栏呈现（父目录内折叠入口 + 顶层独立入口）。
+	if isNested {
+		a.setScanInProgress(resolvedPath, false)
+		n := a.rootSubtreeCount(resolvedPath)
+		fmt.Printf("[导入] 嵌套虚拟根已注册（内容由父目录持有）: %s（当前已索引 %d 张）\n", resolvedPath, n)
+		if a.ctx != nil {
+			wailsruntime.EventsEmit(a.ctx, "folder:importing", map[string]interface{}{
+				"rootPath":   resolvedPath,
+				"folderType": folderType,
+				"rootName":   filepath.Base(resolvedPath),
+			})
+			wailsruntime.EventsEmit(a.ctx, "scan:complete", map[string]interface{}{
+				"rootPath":   resolvedPath,
+				"count":      n,
+				"thumbCount": 0,
+			})
+		}
+		return &ScanResult{
+			Success:    true,
+			FolderPath: resolvedPath,
+			Message:    fmt.Sprintf("已添加嵌套文件夹: %s", filepath.Base(resolvedPath)),
+		}
+	}
 
 	// 快速模式：立刻返回，后台 goroutine 扫描
 	if quick {
@@ -593,12 +675,18 @@ func (a *App) ScanFolderQuick(path, folderType string, quick bool) *ScanResult {
 		}
 
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Printf("[导入] 快速扫描 PANIC: %v\n%s\n", r, debug.Stack())
+				}
+			}()
+			fmt.Printf("[导入] 快速扫描开始: %s\n", resolvedPath)
 			imageCount := a.countFilesQuick(resolvedPath)
 			normalizedRoot := strings.ReplaceAll(resolvedPath, "\\", "/")
 			a.mu.Lock()
 			a.folderCount[normalizedRoot] = imageCount
 			a.mu.Unlock()
-			fmt.Printf("[快速导入] %s: 统计到 %d 个文件\n", resolvedPath, imageCount)
+			fmt.Printf("[导入] countFilesQuick 完成: %s = %d 个文件\n", resolvedPath, imageCount)
 
 			a.saveRegisteredRoots()
 
@@ -607,6 +695,7 @@ func (a *App) ScanFolderQuick(path, folderType string, quick bool) *ScanResult {
 			//   SQLite image_cache（LoadImageCacheByFolderTreePaged）。若此时缓存未写入，
 			//   图廊只会显示部分/空图片，需手动刷新 1~2 次才完整。
 			a.saveImageIndexForRoot(resolvedPath)
+			fmt.Printf("[导入] 索引已写入 image_cache: %s\n", resolvedPath)
 			// ★ 扫描完成，清除"扫描中"标记（中断退出时该标记残留，下次启动补扫）
 			a.setScanInProgress(resolvedPath, false)
 
@@ -620,8 +709,11 @@ func (a *App) ScanFolderQuick(path, folderType string, quick bool) *ScanResult {
 					"count":      imageCount,
 					"thumbCount": thumbCount,
 				})
+				fmt.Printf("[导入] scan:complete 已发出: %s (count=%d)\n", resolvedPath, imageCount)
+			} else {
+				fmt.Printf("[导入] 警告: a.ctx 为 nil，scan:complete 未发出: %s\n", resolvedPath)
 			}
-			fmt.Printf("[快速导入] 已保存数据到磁盘\n")
+			fmt.Printf("[导入] 快速扫描全部完成: %s\n", resolvedPath)
 		}()
 
 		return &ScanResult{
@@ -730,6 +822,11 @@ func (a *App) RemoveFolder(path string) *ScanResult {
 	}
 	a.mu.Unlock()
 	go a.saveRegisteredRoots()
+	// ★ 嵌套虚拟根：其图片由父目录扫描持有（RootPath 为父根），移除时仅注销本根，
+	//   不清空父目录的数据，否则会误删父根下的整棵子树。
+	if a.isRootNested(matchedPath) {
+		return &ScanResult{Success: true, Message: fmt.Sprintf("已移除嵌套目录: %s（父目录中的内容保留）", matchedPath)}
+	}
 	// 异步清理内存和数据库，避免大量文件时阻塞 UI
 	go a.removeByRoot(matchedPath)
 	return &ScanResult{Success: true, Message: fmt.Sprintf("已移除目录: %s", matchedPath)}
@@ -1145,15 +1242,25 @@ func (a *App) GetImages(folder string, offset int, limit int, sortOrder string) 
 			if err == nil && dbTotal > 0 {
 				safe := make([]SafeImage, len(entries))
 				loadedEntries := make(map[string]*ImageEntry, len(entries))
+				// ★ 懒尺寸（方案A）：只给前 maxLazyDim 张同步算尺寸，其余先用默认宽高比
+				//   占位，缩略图加载后瀑布流按真实尺寸自动修正——避免首次打开大文件夹时
+				//   一次性读几百张图文件头卡住（数据库作为缓存，而非首开前置）。
+				dimComputed := 0
+				const maxLazyDim = 250
 				for i, e := range entries {
 					w, h := e.Width, e.Height
 					if !e.IsVideo && (w == 0 || h == 0) {
-						w2, h2 := getImageDimensions(e.Path)
-						if w2 > 0 && h2 > 0 {
-							w, h = w2, h2
-							// ★ 写回数据库，避免每次点击文件夹都重新读文件取尺寸
-							if a.imageDB != nil {
-								a.imageDB.UpdateImageDimensions(e.ID, w2, h2)
+						if dimComputed < maxLazyDim {
+							dimComputed++
+							w2, h2 := getImageDimensions(e.Path)
+							if w2 > 0 && h2 > 0 {
+								w, h = w2, h2
+								// ★ 写回数据库，避免每次点击文件夹都重新读文件取尺寸
+								if a.imageDB != nil {
+									a.imageDB.UpdateImageDimensions(e.ID, w2, h2)
+								}
+							} else {
+								w, h = 400, 300
 							}
 						} else {
 							w, h = 400, 300
@@ -1260,6 +1367,9 @@ func (a *App) GetImages(folder string, offset int, limit int, sortOrder string) 
 			a.mu.RUnlock()
 			fmt.Printf("[GetImages] 查询无结果: normalizedFolder=%q folderIndexSamples=%v\n",
 				normalizedFolder, sampleKeys)
+			// ★ 自愈：目录存在但无任何记录（历史误删/中断扫描）→ 后台补扫该文件夹，
+			//   完成后 scan:complete 驱动前端自动重拉，标签点击无需手动刷新即可恢复。
+			a.autoHealMissingFolder(normalizedFolder)
 		}
 
 		total = len(results)
@@ -1276,12 +1386,20 @@ func (a *App) GetImages(folder string, offset int, limit int, sortOrder string) 
 		paged := results[offset:end]
 
 		safe := make([]SafeImage, len(paged))
+		// ★ 懒尺寸（方案A）：同 SQL 路径，只给前 250 张同步算尺寸，其余默认占位。
+		dimComputed := 0
+		const maxLazyDim = 250
 		for i, entry := range paged {
 			w, h := entry.Width, entry.Height
 			if !entry.IsVideo && (w == 0 || h == 0) {
-				w2, h2 := getImageDimensions(entry.Path)
-				if w2 > 0 && h2 > 0 {
-					w, h = w2, h2
+				if dimComputed < maxLazyDim {
+					dimComputed++
+					w2, h2 := getImageDimensions(entry.Path)
+					if w2 > 0 && h2 > 0 {
+						w, h = w2, h2
+					} else {
+						w, h = 400, 300
+					}
 				} else {
 					w, h = 400, 300
 				}
@@ -1467,9 +1585,9 @@ func sortImageEntries(results []*ImageEntry, sortOrder string) {
 func (a *App) GetFolders() []*FolderNode {
 	// ★ 直接读内存缓存的 thumbCounts，不触发 BoltDB 全表扫描
 	thumbCounts := a.getCachedThumbCounts()
-	// 如果缓存未就绪，后台异步重建（首次调用不阻塞）
+	// 如果缓存未就绪，延迟到启动渲染完成后异步重建（不阻塞、不抢首屏磁盘/CPU）
 	if thumbCounts == nil {
-		go a.PreloadThumbCounts()
+		a.scheduleThumbCountPreload()
 		thumbCounts = make(map[string]int) // 返回空计数，不阻塞前端
 	}
 	// ★ 已开启"子文件夹缩略图预览"的路径集合（读 SQLite，不放锁内）
@@ -1480,6 +1598,7 @@ func (a *App) GetFolders() []*FolderNode {
 	fmt.Printf("[预览] GetFolders: 开启 %d 个预览根, 预取到 %d 个文件夹的预览\n", len(previewRoots), len(previews))
 	a.mu.RLock()
 	defer a.mu.RUnlock()
+	fmt.Printf("[GetFolders] registeredRoots 数量 = %d\n", len(a.registeredRoots))
 	var roots []*FolderNode
 	for rootPath := range a.registeredRoots {
 		rootName := filepath.Base(rootPath)
@@ -1680,7 +1799,7 @@ func (a *App) GetFolderProgress(folderPath string) map[string]int {
 	thumbCount := 0
 	thumbCounts := a.getCachedThumbCounts()
 	if thumbCounts == nil {
-		go a.PreloadThumbCounts()
+		a.scheduleThumbCountPreload()
 	} else {
 		thumbCount = thumbCounts[normalized]
 	}
@@ -1922,6 +2041,27 @@ func (a *App) GetImportedRoots() []database.ImportedRoot {
 //   （启动时 importedRoots 未加载完、或过滤/删除操作后），全量替换会误删
 //   registeredRoots 与 DB 中已存在的注册根（真实库中已出现 4 个孤儿 root_path）。
 //   删除只应通过 RemoveFolder / RemoveRoot 显式进行。
+// existingNested 检查 rootKey（小写 + 正斜杠规范化）是否与 existing 集合中
+// 某个根目录构成父子嵌套。返回命中的根路径与是否嵌套。
+func existingNested(rootKey string, existing map[string]bool) (string, bool) {
+	for e := range existing {
+		eKey := strings.ToLower(strings.ReplaceAll(e, "\\", "/"))
+		if eKey != rootKey &&
+			(strings.HasPrefix(rootKey, eKey+"/") || strings.HasPrefix(eKey, rootKey+"/")) {
+			return e, true
+		}
+	}
+	return "", false
+}
+
+// removeNestedRoots 历史遗留的自愈逻辑：旧版本会移除位于其它已注册根目录之内的
+// 嵌套根，以防同一批图片被两套根目录重复索引。乙方案起，父子嵌套已受支持（数据层
+// 按完整路径去重，侧栏折叠展示），因此本函数不再删除嵌套根，仅保留为兼容调用。
+func (a *App) removeNestedRoots() {
+	// 乙方案：嵌套根允许存在，无需自愈移除。
+	return
+}
+
 func (a *App) SaveRootsWithMeta(roots []database.ImportedRoot) map[string]interface{} {
 	a.mu.Lock()
 	// 保留现有注册根
@@ -1946,6 +2086,8 @@ func (a *App) SaveRootsWithMeta(roots []database.ImportedRoot) map[string]interf
 					break
 				}
 			}
+			// ★ 乙方案：允许父子嵌套导入，不再跳过与现有根目录构成父子嵌套的路径。
+			//   数据层按完整路径去重、侧栏折叠展示，嵌套根可与父根共存。
 			if isNew {
 				hasNewRoot = true
 			}
@@ -2344,6 +2486,10 @@ func (a *App) startup(ctx context.Context) {
 
 	// 后台执行：补扫缺失 → 修复搜索索引（跳过增量刷新，由用户手动触发）
 	go func() {
+		// ★ 自愈历史遗留的嵌套根目录（同一子目录曾被重复导入），
+		// 必须在补扫之前做，否则嵌套根会被当作"缺失"再次扫描。
+		a.removeNestedRoots()
+
 		a.ensureImageIndex()
 
 		// ★ 启动速度优化：幽灵清理（全库 os.Stat，慢盘上数千次约 2-3 秒）延迟到
@@ -2441,30 +2587,47 @@ func (a *App) openThumbDBLocked() error {
 	// ★ NoSync: 缩略图是可再生的缓存，崩溃丢失可重新生成，不值得每次事务 fsync。
 	//   默认 bbolt 每次 Update 都 fsync，高并发写缩略图时磁盘同步成为吞吐瓶颈，
 	//   这正是"调高并发数但速度提升不明显"的主要原因之一。
+	// ★ 打点：openThumbDB 曾观测到 24~27s（平时 <0.2s），逐步骤计时定位瓶颈。
+	dbStepT0 := time.Now()
 	db, err := bbolt.Open(dbPath, 0644, &bbolt.Options{Timeout: 5 * time.Second, NoSync: true})
 	if err != nil {
+		logStartupf("ThumbDB: bbolt.Open 失败（%s）: %v", time.Since(dbStepT0).Round(time.Millisecond), err)
 		return fmt.Errorf("无法打开 BoltDB: %w", err)
 	}
+	logStartupf("ThumbDB: bbolt.Open 完成（%s）", time.Since(dbStepT0).Round(time.Millisecond))
+	dbStepT0 = time.Now()
 	if err := db.Update(func(tx *bbolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists([]byte("thumbs"))
 		return err
 	}); err != nil {
 		db.Close()
+		logStartupf("ThumbDB: CreateBucketIfNotExists 失败（%s）: %v", time.Since(dbStepT0).Round(time.Millisecond), err)
 		return fmt.Errorf("无法初始化 BoltDB bucket: %w", err)
 	}
+	logStartupf("ThumbDB: CreateBucketIfNotExists 完成（%s）", time.Since(dbStepT0).Round(time.Millisecond))
 	a.thumbDB = db
 	fmt.Printf("[缩略图] BoltDB 已打开: %s\n", dbPath)
 
 	// ★ 防乌龙：打开的库为空，但数据目录下存在带数据的库 → 强警告。
 	//   这种情况几乎都是 thumbDir 设置指向了错误目录（如漏了 \user），
 	//   会导致"数量 0 + 全量重新生成缩略图"的困惑。
-	keyN := 0
-	_ = db.View(func(tx *bbolt.Tx) error {
-		if b := tx.Bucket([]byte("thumbs")); b != nil {
-			keyN = b.Stats().KeyN
-		}
-		return nil
-	})
+	// ★ 性能：bbolt 的 Bucket.Stats() 会遍历整个 bucket 的 B 树（读全部页）。
+	//   本库 488K key / 17GB，冷缓存下实测 20.9s——不能每次启动都做全量遍历。
+	//   因此仅当库文件很小（<1MB，只可能是空库或近乎空库）才统计 key 数；
+	//   大文件必然有数据，直接跳过这条防乌龙检查（keyN 保持 -1 表示未统计）。
+	dbStepT0 = time.Now()
+	keyN := -1
+	if info, err := os.Stat(dbPath); err == nil && info.Size() < 1<<20 {
+		_ = db.View(func(tx *bbolt.Tx) error {
+			if b := tx.Bucket([]byte("thumbs")); b != nil {
+				keyN = b.Stats().KeyN
+			}
+			return nil
+		})
+	} else {
+		logStartupf("ThumbDB: 大库跳过 KeyN 统计（%s）", time.Since(dbStepT0).Round(time.Millisecond))
+	}
+	logStartupf("ThumbDB: KeyN 统计完成 key=%d（%s）", keyN, time.Since(dbStepT0).Round(time.Millisecond))
 	if keyN == 0 && a.userDataDir != "" {
 		altPath := filepath.Join(a.userDataDir, "thumbnails.db")
 		if altPath != dbPath {

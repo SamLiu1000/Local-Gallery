@@ -2194,10 +2194,6 @@ button {
 .image-card:hover .card-overlay {
     opacity: 1;
 }
-.card-favorite-icon {
-    font-size: 16px;
-    color: var(--orange);
-}
 .image-card .card-info {
     padding: 6px 8px;
     font-size: 11px;
@@ -2235,14 +2231,15 @@ button {
     transform: translateX(0);
 }
 .card-action-btn {
-    width: 32px;
-    height: 32px;
+    width: 30px;
+    height: 30px;
     border-radius: 50%;
     background: rgba(0, 0, 0, 0.65);
     backdrop-filter: blur(8px);
-    border: 2px solid rgba(255, 255, 255, 0.15);
+    border: 1.5px solid rgba(255, 255, 255, 0.18);
     color: #fff;
-    font-size: 15px;
+    /* ★ 统一图标尺寸：fav/tag 共用 16px，避免两个按钮内部图案大小不一 */
+    font-size: 16px;
     cursor: pointer;
     display: flex;
     align-items: center;
@@ -2256,16 +2253,15 @@ button {
     transform: scale(1.1);
     border-color: rgba(255, 255, 255, 0.3);
 }
-.card-action-btn.fav-btn {
-    font-size: 16px;
-}
 .card-action-btn.fav-btn.active {
     background: rgba(243, 156, 18, 0.8);
     border-color: var(--orange);
     color: #fff;
 }
-.card-action-btn.tag-btn {
-    font-size: 14px;
+/* ★ 标签图标（icon-tag.svg）天生窄长、视觉偏小：轻微放大补偿，
+   使其与收藏星星的观感大小一致 */
+.card-action-btn.tag-btn .icon {
+    transform: scale(1.25);
 }
 .card-action-btn.tag-btn:hover {
     background: rgba(74, 158, 255, 0.7);
@@ -3361,25 +3357,27 @@ button {
 }
 .tag-tree .tag-item .tag-delete-btn {
     display: none;
-    width: 28px;
-    align-self: stretch;
+    /* ★ 美化：图标本身是红色圆形 ✕（icon-close.svg），按钮只做轻量包装，
+       不再撑满标签高度、不再带分割线/方角，也不在悬停时铺浅色大背景 */
     align-items: center;
     justify-content: center;
     cursor: pointer;
-    border-left: 0.5px solid var(--border-color);
+    border: none;
     flex-shrink: 0;
-    transition: background .15s;
     background: transparent;
     color: var(--text-secondary);
-    font-size: 14px;
-    padding: 0;
-    margin: 0;
-    border-radius: 0;
-    border-top: none;
-    border-right: none;
-    border-bottom: none;
+    font-size: 15px;
+    padding: 2px;
+    margin: 0 3px;
+    border-radius: 50%;
     line-height: 1;
     font-weight: 400;
+    transition: transform .12s, filter .12s;
+}
+.tag-tree .tag-item .tag-delete-btn:hover {
+    background: transparent;
+    transform: scale(1.18);
+    filter: brightness(1.08);
 }
 
 /* 标签编辑模式 — 选择框 */
@@ -3494,10 +3492,6 @@ button {
     background: var(--accent);
     cursor: pointer;
     border: 2px solid var(--bg-primary);
-}
-.tag-tree .tag-item .tag-delete-btn:hover {
-    background: #FCEBEB;
-    color: #A32D2D;
 }
 .tag-tree .tag-tree-container {
     display: flex;

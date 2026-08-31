@@ -112,6 +112,8 @@ export function IndexRoot(arg1:string):Promise<void>;
 
 export function IsFavorite(arg1:string):Promise<boolean>;
 
+export function LogStartupTiming(arg1:string):Promise<void>;
+
 export function OpenFileLocation(arg1:string):Promise<void>;
 
 export function OpenReverseLog():Promise<void>;

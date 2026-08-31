@@ -47,6 +47,11 @@ const App = (() => {
     async function init() {
         if (isInitialized) return;
 
+        // ★ 启动打点：DOMContentLoaded（近似窗口显示时间）
+        if (window.go && window.go.main && window.go.main.App && window.go.main.App.LogStartupTiming) {
+            window.go.main.App.LogStartupTiming('DOMContentLoaded');
+        }
+
         // 移动端 UA 检测（最先执行，让 CSS 尽早知道）
         if (detectMobile()) {
             document.body.classList.add('mobile');
@@ -166,6 +171,10 @@ const App = (() => {
 
             isInitialized = true;
             console.log('[App] Local Gallery 初始化完成');
+            // ★ 启动打点：前端初始化完成
+            if (window.go && window.go.main && window.go.main.App && window.go.main.App.LogStartupTiming) {
+                window.go.main.App.LogStartupTiming('init-done');
+            }
 
             // ★ 检查是否自动启动局域网服务
             checkLANAutoStart();
@@ -261,19 +270,11 @@ const App = (() => {
             }
         });
 
-        // 全局刷新按钮：先触发后端增量修复（残缺/中断的文件夹计数），再重载页面
+        // 全局刷新按钮：仅重载前端页面，不做后端扫盘。
+        // 扫盘/增量刷新请使用文件夹右键"刷新"、导入或详情面板中的对应入口，
+        // 避免大图库刷新（逐根目录走盘+落库）期间阻塞浏览。
         btnRefresh.addEventListener('click', () => {
-            btnRefresh.classList.add('spinning');
-            const doReload = () => window.location.reload();
-            if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails() && WailsBridge.refreshAll) {
-                // ★ 修复：原来只 reload 页面，后端从不重扫 → 计数残缺永远修不好。
-                //   现在先让后端后台增量刷新（逐根目录补扫+落库），稍后重载让前端拿到最新状态。
-                WailsBridge.refreshAll().then(() => {
-                    setTimeout(doReload, 800);
-                }).catch(() => doReload());
-            } else {
-                doReload();
-            }
+            window.location.reload();
         });
 
         // 窗口大小变化
@@ -855,4 +856,11 @@ const App = (() => {
 
 document.addEventListener('DOMContentLoaded', () => {
     App.init();
+});
+
+// ★ 启动打点：window load 事件（Wails 在页面加载完成后才显示窗口，近似"界面出现"时刻）
+window.addEventListener('load', () => {
+    if (window.go && window.go.main && window.go.main.App && window.go.main.App.LogStartupTiming) {
+        window.go.main.App.LogStartupTiming('window-load');
+    }
 });

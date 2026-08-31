@@ -172,14 +172,22 @@ func parseJPEG(data []byte) *ImageMetadata {
 		marker := binary.BigEndian.Uint16(data[offset : offset+2])
 
 		if marker == 0xFFE1 {
-			// EXIF APP1
+			// APP1: EXIF 或 XMP
 			if offset+4 < len(data) {
 				length := int(binary.BigEndian.Uint16(data[offset+2 : offset+4]))
 				if offset+2+length <= len(data) {
-					exifData := data[offset+4 : offset+2+length]
-					exifText := extractEXIFText(exifData)
-					if exifText != "" {
-						textChunks["exif"] = exifText
+					payload := data[offset+4 : offset+2+length]
+					switch {
+					case len(payload) > 6 && string(payload[:6]) == "Exif\x00\x00":
+						// 标准 EXIF APP1
+						if exifText := extractEXIFText(payload); exifText != "" {
+							textChunks["exif"] = exifText
+						}
+					case len(payload) > 29 && string(payload[:29]) == "http://ns.adobe.com/xap/1.0/\x00":
+						// 标准 XMP APP1（Photoshop / Google AI 等写入，含 DigitalSourceType / Credit）
+						if xmp := strings.TrimSpace(string(payload[29:])); xmp != "" {
+							textChunks["XML:com.adobe.xmp"] = xmp
+						}
 					}
 				}
 				offset += 2 + length
@@ -200,6 +208,19 @@ func parseJPEG(data []byte) *ImageMetadata {
 		} else if marker == 0xFFDA {
 			// SOS
 			break
+		} else if marker == 0xFFED {
+			// APP13 Photoshop IRB（8BIM 资源，如 "Made with Google AI" 来源说明）
+			if offset+4 < len(data) {
+				length := int(binary.BigEndian.Uint16(data[offset+2 : offset+4]))
+				if offset+2+length <= len(data) {
+					if caption := ExtractPhotoshopCaption(data[offset+4 : offset+2+length]); caption != "" {
+						textChunks["photoshop_caption"] = caption
+					}
+				}
+				offset += 2 + length
+			} else {
+				break
+			}
 		} else if (marker >= 0xFFE0 && marker <= 0xFFEF) ||
 			marker == 0xFFDB || marker == 0xFFC4 ||
 			marker == 0xFFC0 || marker == 0xFFC2 {
@@ -375,7 +396,9 @@ func universalParse(textChunks map[string]string) *ImageMetadata {
 
 	// ★ 优先走 ParseTextChunks 专门解析（ComfyUI 递归追踪 / SD / SwarmUI / XMP），
 	//   它比泛化 flatten 更准确。拿不到有效参数时才回退到泛化解析。
-	if pp := ParseTextChunks(textChunks); pp != nil && (pp.Prompt != "" || pp.NegativePrompt != "" || len(pp.LoRAs) > 0) {
+	//   XMP 元数据可能没有 prompt（如 Google AI 的 DigitalSourceType/Credit），
+	//   此时 SourceTool 非空也应走专门解析以保留 Extra 信息。
+	if pp := ParseTextChunks(textChunks); pp != nil && (pp.Prompt != "" || pp.NegativePrompt != "" || len(pp.LoRAs) > 0 || pp.SourceTool != "") {
 		result.Prompt = pp.Prompt
 		result.NegativePrompt = pp.NegativePrompt
 		if result.Params == nil {
@@ -1299,6 +1322,31 @@ func parseComfyUIJSONNodes(nodes map[string]json.RawMessage) *ParsedParams {
 		}
 	}
 
+	// 兜底：无 positive/negative 接线时，找带 prompt 连接输入的任务节点
+	// （如 MiniMaxH3ReferenceToVideo 的 inputs.prompt: ["id", 0]），
+	// 将该连接指向的文本节点作为正向提示词来源。
+	if posNodeID == "" {
+		for nodeID, nodeRaw := range nodes {
+			var node struct {
+				ClassType string          `json:"class_type"`
+				Inputs    json.RawMessage `json:"inputs"`
+			}
+			if json.Unmarshal(nodeRaw, &node) != nil {
+				continue
+			}
+			var inputs struct {
+				Prompt json.RawMessage `json:"prompt"`
+			}
+			if json.Unmarshal(node.Inputs, &inputs) != nil {
+				continue
+			}
+			if id := extractNodeID(inputs.Prompt); id != "" && id != nodeID {
+				posNodeID = id
+				break
+			}
+		}
+	}
+
 	// resolveText 沿节点连接递归追踪，返回叶子文本节点中的提示词文本。
 	// ComfyUI 的 positive/negative 可能不直接连到 CLIPTextEncode，而是经过
 	// easy ifElse / ConditioningCombine / ConditioningSetArea 等中间节点，
@@ -1312,13 +1360,19 @@ func parseComfyUIJSONNodes(nodes map[string]json.RawMessage) *ParsedParams {
 		if !ok {
 			return ""
 		}
-		// 1. 节点自身是文本节点：text / prompt 字段直接取值
+		// 1. 节点自身是文本节点：text / prompt / value 字段直接取值
+		//    （PrimitiveStringMultiline 等叶子文本节点用 value 字段）
 		var textVal string
 		if raw, ok := inputs["text"]; ok {
 			json.Unmarshal(raw, &textVal)
 		}
 		if textVal == "" {
 			if raw, ok := inputs["prompt"]; ok {
+				json.Unmarshal(raw, &textVal)
+			}
+		}
+		if textVal == "" {
+			if raw, ok := inputs["value"]; ok {
 				json.Unmarshal(raw, &textVal)
 			}
 		}
@@ -1959,10 +2013,15 @@ func parseXMPText(raw string) *ParsedParams {
 	// 细化来源
 	if strings.Contains(raw, "canva.com") {
 		p.SourceTool = "CanvaXMP"
+	} else if strings.Contains(raw, "Made with Google AI") {
+		// Google AI 生图（Whisk / Imagen / Gemini 等导出）: photoshop:Credit="Made with Google AI"
+		p.SourceTool = "Google AI"
+		p.Model = "Google AI"
 	} else if strings.Contains(raw, "adobe.com") || strings.Contains(raw, "adobe:ns:meta") {
 		p.SourceTool = "AdobeXMP"
 	} else if strings.Contains(raw, "DigitalSourceType") {
-		p.SourceTool = "WebP-XMP"
+		// IPTC DigitalSourceType=trainedAlgorithmicMedia 等 AI 来源标记（Bing/Designer 等）
+		p.SourceTool = "AI-XMP"
 	}
 
 	// dc:description
@@ -1990,7 +2049,79 @@ func parseXMPText(raw string) *ParsedParams {
 		p.Extra["digital_source_type"] = m[1]
 	}
 
+	// DigitalSourceFileType
+	if m := regexp.MustCompile(`DigitalSourceFileType="([^"]+)"`).FindStringSubmatch(raw); m != nil {
+		p.Extra["digital_source_file_type"] = m[1]
+	}
+
+	// photoshop:Credit（如 "Made with Google AI"）
+	if m := regexp.MustCompile(`photoshop:Credit="([^"]+)"`).FindStringSubmatch(raw); m != nil {
+		p.Extra["credit"] = htmlUnescape(m[1])
+	}
+
 	return p
+}
+
+// ExtractPhotoshopCaption 解析 Photoshop APP13 (IRB, 8BIM 资源) 中的 Caption 资源 (0x0404)，
+// 提取其中的可读文本（如 Google AI 图片的 "Made with Google AI" 来源说明）。
+// 无法解析或没有可读文本时返回空字符串。
+func ExtractPhotoshopCaption(payload []byte) string {
+	const psSig = "Photoshop 3.0\x00"
+	if len(payload) < len(psSig) || string(payload[:len(psSig)]) != psSig {
+		return ""
+	}
+	pos := len(psSig)
+	for pos+12 <= len(payload) {
+		// 8BIM 资源签名
+		if string(payload[pos:pos+4]) != "8BIM" {
+			break
+		}
+		resID := binary.BigEndian.Uint16(payload[pos+4 : pos+6])
+		pos += 6
+		// Pascal 字符串名称（补齐到偶数长度）
+		nameLen := int(payload[pos])
+		pos += 1 + nameLen
+		if pos%2 == 1 {
+			pos++
+		}
+		if pos+4 > len(payload) {
+			break
+		}
+		size := int(binary.BigEndian.Uint32(payload[pos : pos+4]))
+		pos += 4
+		if pos+size > len(payload) {
+			break
+		}
+		resData := payload[pos : pos+size]
+		if resID == 0x0404 { // Caption 资源
+			// Caption 数据含编码/长度前缀等二进制头部，取最长的可读 ASCII 连续段
+			best := ""
+			var cur []byte
+			flush := func() {
+				if len(cur) >= 3 && len(cur) > len(best) {
+					best = string(cur)
+				}
+				cur = cur[:0]
+			}
+			for _, b := range resData {
+				if b >= 0x20 && b < 0x7f {
+					cur = append(cur, b)
+				} else {
+					flush()
+				}
+			}
+			flush()
+			best = strings.TrimSpace(best)
+			if best != "" {
+				return best
+			}
+		}
+		pos += size
+		if pos%2 == 1 {
+			pos++
+		}
+	}
+	return ""
 }
 
 // ==================== Midjourney 解析辅助 ====================

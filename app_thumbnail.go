@@ -1063,6 +1063,9 @@ func (a *App) AbandonFolder(folderPath string) {
 // ★ 必须同时清除祖先：若根/父文件夹此前被遗弃，前缀匹配会把其下所有子文件夹
 //   的生成全部拦截（浏览根目录后切走 → 整个树"Load failed"）。聚焦一个子文件夹
 //   时它的祖先自然也在用户视野内，不应再被遗弃拦截。
+// ★ 同时清除子孙：若此前离开过某子文件夹（它被遗弃），现在点进它的父/根目录，
+//   该子文件夹也在视野内 → 一并解除遗弃，否则父目录视图里它的缩略图全部被取消
+//   （表现为"部分不出图 / Load failed"）。
 func (a *App) FocusFolder(folderPath string) {
 	if folderPath == "" {
 		return
@@ -1071,7 +1074,7 @@ func (a *App) FocusFolder(folderPath string) {
 	abandonedFoldersMu.Lock()
 	defer abandonedFoldersMu.Unlock()
 	for ab := range abandonedFolders {
-		if ab == key || strings.HasPrefix(key, ab+"/") {
+		if ab == key || strings.HasPrefix(key, ab+"/") || strings.HasPrefix(ab, key+"/") {
 			delete(abandonedFolders, ab)
 		}
 	}
@@ -1231,11 +1234,16 @@ func (a *App) computeThumbCounts() map[string]int {
 
 // ==================== thumbCounts 持久化 ====================
 
-// thumbCountsFile 持久化的缩略图计数，附带 BoltDB key 数用于启动时校验
+// thumbCountsFile 持久化的缩略图计数，附带库文件元数据用于启动时免遍历校验
 type thumbCountsFile struct {
 	Counts    map[string]int `json:"counts"`
 	TotalKeys int            `json:"totalKeys"` // 保存时 BoltDB thumbs bucket 的 key 数
 	SavedAt   int64          `json:"savedAt"`
+	// ★ 新增：保存时缩略图库文件的大小与修改时间。
+	//   启动校验改用这两项（os.Stat，O(1)），不再用 Bucket.Stats() 全树遍历
+	//   （488K key / 17GB 库冷缓存下实测 20.9s，是启动慢的元凶）。
+	DBSize  int64 `json:"dbSize,omitempty"`
+	DBMtime int64 `json:"dbMtime,omitempty"`
 }
 
 const thumbCountsFileName = "thumb-counts.json"
@@ -1268,7 +1276,13 @@ func (a *App) persistThumbCountsLocked() {
 	if keyCount < 0 || a.userDataDir == "" {
 		return
 	}
-	data := thumbCountsFile{Counts: counts, TotalKeys: keyCount, SavedAt: time.Now().Unix()}
+	// ★ 同时记录库文件元数据（大小+修改时间），供冷启动免遍历校验
+	var dbSize, dbMtime int64
+	if info, err := os.Stat(a.GetThumbDir()); err == nil {
+		dbSize = info.Size()
+		dbMtime = info.ModTime().Unix()
+	}
+	data := thumbCountsFile{Counts: counts, TotalKeys: keyCount, SavedAt: time.Now().Unix(), DBSize: dbSize, DBMtime: dbMtime}
 	if b, err := json.Marshal(data); err == nil {
 		path := filepath.Join(a.userDataDir, thumbCountsFileName)
 		tmp := path + ".tmp"
@@ -1289,7 +1303,7 @@ func (a *App) persistThumbCounts() {
 }
 
 // loadThumbCountsFromDisk 启动时尝试恢复 thumbCounts。
-// 仅当 BoltDB 的 key 数与保存时一致（即缩略图库无变化）才采用，否则触发重算。
+// 仅当缩略图库自保存以来无变化才采用，否则触发重算。
 func (a *App) loadThumbCountsFromDisk() {
 	if a.userDataDir == "" {
 		return
@@ -1303,9 +1317,22 @@ func (a *App) loadThumbCountsFromDisk() {
 	if err := json.Unmarshal(data, &f); err != nil || f.Counts == nil {
 		return
 	}
-	keyCount := a.thumbDBKeyCount()
-	if keyCount < 0 || keyCount != f.TotalKeys {
-		fmt.Printf("[缩略图] 缩略图库有变化（key %d != %d），跳过缓存的 thumbCounts，稍后重算\n", keyCount, f.TotalKeys)
+	// ★ 免遍历校验：用库文件的大小+修改时间判断缩略图库是否有变化。
+	//   原来用 Bucket.Stats().KeyN 对比 key 数——Stats() 会遍历整个 B 树（读全部页），
+	//   488K key / 17GB 库冷缓存下实测 20.9s，是启动慢的元凶。
+	dbChanged := true
+	if info, err := os.Stat(a.GetThumbDir()); err == nil {
+		if f.DBSize != 0 || f.DBMtime != 0 {
+			dbChanged = info.Size() != f.DBSize || info.ModTime().Unix() != f.DBMtime
+		} else {
+			// 旧格式缓存（升级前写入，无 DB 元数据）→ 无法校验，直接采用；
+			// 该文件由上次关闭流程写入，通常就是当前库，下次保存会补上新字段。
+			fmt.Printf("[缩略图] 旧格式 thumbCounts（无 DB 元数据）直接采用，下次保存将写入新字段\n")
+			dbChanged = false
+		}
+	}
+	if dbChanged {
+		fmt.Printf("[缩略图] 缩略图库有变化（文件元数据与保存时不一致），跳过缓存的 thumbCounts，稍后重算\n")
 		return
 	}
 	thumbCountsMu.Lock()
@@ -1342,6 +1369,30 @@ func (a *App) PreloadThumbCounts() {
 	if a.ctx != nil {
 		a.emitThumbProgress()
 	}
+}
+
+// thumbPreloadDelay 预热 thumbCounts 的延迟：让冷启动的首次渲染/索引加载先完成，
+// 不与首屏抢磁盘/CPU。完成后通过 thumb:progress 事件通知前端刷新计数。
+const thumbPreloadDelay = 8 * time.Second
+
+var (
+	thumbPreloadMu    sync.Mutex
+	thumbPreloadTimer *time.Timer
+)
+
+// scheduleThumbCountPreload 延迟调度 thumbCounts 预热（可重排，运行期缓存失效后也会重新触发）。
+func (a *App) scheduleThumbCountPreload() {
+	thumbPreloadMu.Lock()
+	defer thumbPreloadMu.Unlock()
+	if thumbPreloadTimer != nil {
+		return // 已排定，避免重复
+	}
+	thumbPreloadTimer = time.AfterFunc(thumbPreloadDelay, func() {
+		a.PreloadThumbCounts()
+		thumbPreloadMu.Lock()
+		thumbPreloadTimer = nil
+		thumbPreloadMu.Unlock()
+	})
 }
 
 // invalidateThumbCounts 标记缓存失效并通知前端（仅在删除缩略图时使用）
@@ -1527,14 +1578,24 @@ func (a *App) removeThumbsByIDs(ids []string) {
 	if len(ids) == 0 || a.thumbDB == nil {
 		return
 	}
-	a.thumbDB.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(thumbBucket)
-		for _, id := range ids {
-			b.Delete([]byte(id))
-			thumbMemRemove(id) // 同步清内存缓存
+	// ★ 分批提交 bbolt 事务：单事务删几万条会长期持有 bbolt 写锁，
+	//   阻塞缩略图生成/读取。分批让锁周期性释放，其它操作可穿插。
+	const batchSize = 1000
+	for start := 0; start < len(ids); start += batchSize {
+		end := start + batchSize
+		if end > len(ids) {
+			end = len(ids)
 		}
-		return nil
-	})
+		chunk := ids[start:end]
+		a.thumbDB.Update(func(tx *bbolt.Tx) error {
+			b := tx.Bucket(thumbBucket)
+			for _, id := range chunk {
+				b.Delete([]byte(id))
+				thumbMemRemove(id) // 同步清内存缓存
+			}
+			return nil
+		})
+	}
 }
 
 // ClearFolderThumbs 清除指定文件夹（含子文件夹）的缩略图缓存

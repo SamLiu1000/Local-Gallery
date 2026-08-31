@@ -513,29 +513,35 @@ const Storage = (() => {
     }
 
     async function getImagesForTag(tagId) {
-        // ★ 文件夹标签：返回特殊标记，由 Gallery 直接按路径查图
+        // 收集标签及其所有子标签的 ID（文件夹标签同样需要，用于合并手动标记的图片）
+        const descendantIds = await getTagDescendantIds(tagId);
+        const allTagIds = [tagId, ...descendantIds];
+
+        // 按 tagId 查询该标签（含子标签）手动关联的图片路径
+        const collectManualPaths = async () => {
+            const tagIdSet = new Set(allTagIds);
+            if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails()) {
+                const paths = await WailsBridge.getImagesForTagIds(allTagIds);
+                return paths || [];
+            }
+            if (serverAvailable) {
+                const imgTags = serverDataCache.imageTags || [];
+                return imgTags.filter(it => tagIdSet.has(it.tagId)).map(it => it.imagePath);
+            }
+            const store = getStore('imageTags');
+            const all = await promisify(store, 'getAll');
+            return all.filter(it => tagIdSet.has(it.tagId)).map(it => it.imagePath);
+        };
+
+        // ★ 文件夹标签：返回文件夹路径 + 手动标记的图片路径（image_tags 关联），
+        //   由 Gallery 合并展示：文件夹内容 ∪ 手动标记图片。
         const allTags = serverAvailable ? (serverDataCache.tags || []) : [];
         const tag = allTags.find(t => t.id === tagId);
         if (tag && tag.linkedFolder) {
-            return { linkedFolder: tag.linkedFolder };
+            return { linkedFolder: tag.linkedFolder, manualPaths: await collectManualPaths() };
         }
 
-        // 收集标签及其所有子标签的 ID
-        const descendantIds = await getTagDescendantIds(tagId);
-        const allTagIds = [tagId, ...descendantIds];
-        const tagIdSet = new Set(allTagIds);
-
-        if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails()) {
-            const paths = await WailsBridge.getImagesForTagIds(allTagIds);
-            return paths || [];
-        }
-        if (serverAvailable) {
-            const imgTags = serverDataCache.imageTags || [];
-            return imgTags.filter(it => tagIdSet.has(it.tagId)).map(it => it.imagePath);
-        }
-        const store = getStore('imageTags');
-        const all = await promisify(store, 'getAll');
-        return all.filter(it => tagIdSet.has(it.tagId)).map(it => it.imagePath);
+        return collectManualPaths();
     }
 
     // ==================== 收藏操作 ====================

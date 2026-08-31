@@ -324,20 +324,34 @@ func (idb *ImageDB) GetImageRecord(id string) *ImageRecord {
 func (idb *ImageDB) DeleteByRoot(rootPath string) (int, error) {
 	idb.mu.Lock()
 	defer idb.mu.Unlock()
-	tx, err := idb.db.Begin()
-	if err != nil {
-		return 0, err
+	// ★ 分批删除：images 表带 FTS5 全文搜索触发器（images_fts_ad），每删一行都会
+	//   同步更新搜索索引，删除大文件夹时单个长事务会长时间独占 idb.mu，卡住所有
+	//   需要读库的 UI 操作。分批提交让锁周期性释放，其它读操作可穿插执行。
+	const batchSize = 1000
+	var total int
+	for {
+		tx, err := idb.db.Begin()
+		if err != nil {
+			return total, err
+		}
+		res, err := tx.Exec(
+			"DELETE FROM images WHERE id IN (SELECT id FROM images WHERE root_path = ? LIMIT ?)",
+			rootPath, batchSize,
+		)
+		if err != nil {
+			tx.Rollback()
+			return total, err
+		}
+		if err := tx.Commit(); err != nil {
+			return total, err
+		}
+		affected, _ := res.RowsAffected()
+		total += int(affected)
+		if affected < batchSize {
+			break
+		}
 	}
-	defer tx.Rollback()
-	result, err := tx.Exec("DELETE FROM images WHERE root_path = ?", rootPath)
-	if err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	affected, _ := result.RowsAffected()
-	return int(affected), nil
+	return total, nil
 }
 
 func (idb *ImageDB) DeleteImage(id string) error {
@@ -1048,12 +1062,24 @@ func (idb *ImageDB) SaveImageCacheBatch(entries []ImageCacheEntry) error {
 func (idb *ImageDB) DeleteImageCacheByRoot(rootPath string) (int, error) {
 	idb.mu.Lock()
 	defer idb.mu.Unlock()
-	result, err := idb.db.Exec("DELETE FROM image_cache WHERE root_path = ?", rootPath)
-	if err != nil {
-		return 0, err
+	// ★ 分批删除：与 DeleteByRoot 同理，避免删除大文件夹时单事务长期独占 idb.mu。
+	const batchSize = 1000
+	var total int
+	for {
+		res, err := idb.db.Exec(
+			"DELETE FROM image_cache WHERE id IN (SELECT id FROM image_cache WHERE root_path = ? LIMIT ?)",
+			rootPath, batchSize,
+		)
+		if err != nil {
+			return total, err
+		}
+		affected, _ := res.RowsAffected()
+		total += int(affected)
+		if affected < batchSize {
+			break
+		}
 	}
-	affected, _ := result.RowsAffected()
-	return int(affected), nil
+	return total, nil
 }
 
 // DeleteImageCacheBatch 批量从 image_cache 删除指定 ID 的记录
@@ -1081,37 +1107,70 @@ func (idb *ImageDB) DeleteImageCacheBatch(ids []string) error {
 	return tx.Commit()
 }
 
-// SaveImageCacheByRoot
+// SaveImageCacheByRoot 保存某根目录的完整图片缓存（DELETE-then-replace）。
+// ★ 分批落库：删除与插入都按小批执行、批间释放 idb.mu，避免大根目录（数十万张）
+//   的单事务长期独占锁，导致刷新期间 GetImages 全部阻塞（表现为"刷新后一直不出图"）。
+//   非原子写入：中途崩溃由刷新标记（setScanInProgress）在下次启动时补扫恢复。
 func (idb *ImageDB) SaveImageCacheByRoot(rootPath string, entries []ImageCacheEntry) error {
-	idb.mu.Lock()
-	defer idb.mu.Unlock()
-	tx, err := idb.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec("DELETE FROM image_cache WHERE root_path = ?", rootPath); err != nil {
-		return err
+	const delBatch = 1000
+	const insBatch = 2000
+
+	// 1. 分批删除该根目录旧记录
+	for {
+		idb.mu.Lock()
+		res, err := idb.db.Exec(
+			"DELETE FROM image_cache WHERE id IN (SELECT id FROM image_cache WHERE root_path = ? LIMIT ?)",
+			rootPath, delBatch,
+		)
+		if err != nil {
+			idb.mu.Unlock()
+			return err
+		}
+		affected, _ := res.RowsAffected()
+		idb.mu.Unlock()
+		if affected < delBatch {
+			break
+		}
 	}
 	if len(entries) == 0 {
-		return tx.Commit()
+		return nil
 	}
-	stmt, err := tx.Prepare("INSERT OR REPLACE INTO image_cache (id, path, name, size, last_modified, created_at, folder, root_path, width, height, is_video, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-	for _, e := range entries {
-		isVideo := 0
-		if e.IsVideo {
-			isVideo = 1
+
+	// 2. 分批插入（INSERT OR REPLACE，批间释放锁让读查询可插队）
+	stmt := `INSERT OR REPLACE INTO image_cache
+		(id, path, name, size, last_modified, created_at, folder, root_path, width, height, is_video, content_hash)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	for i := 0; i < len(entries); i += insBatch {
+		end := i + insBatch
+		if end > len(entries) {
+			end = len(entries)
 		}
-		if _, err := stmt.Exec(e.ID, e.Path, e.Name, e.Size, e.LastModified,
-			e.CreatedAt, e.Folder, e.RootPath, e.Width, e.Height, isVideo, e.ContentHash); err != nil {
+		idb.mu.Lock()
+		tx, err := idb.db.Begin()
+		if err == nil {
+			for _, e := range entries[i:end] {
+				isVideo := 0
+				if e.IsVideo {
+					isVideo = 1
+				}
+				if _, err2 := tx.Exec(stmt, e.ID, e.Path, e.Name, e.Size, e.LastModified,
+					e.CreatedAt, e.Folder, e.RootPath, e.Width, e.Height, isVideo, e.ContentHash); err2 != nil {
+					err = err2
+					break
+				}
+			}
+			if err == nil {
+				err = tx.Commit()
+			} else {
+				tx.Rollback()
+			}
+		}
+		idb.mu.Unlock()
+		if err != nil {
 			return err
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 // LoadAllImageCache 加载全部图片缓存

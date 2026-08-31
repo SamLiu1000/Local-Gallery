@@ -328,13 +328,34 @@ func (a *App) parseJPEGToLegacy(filePath string) map[string]interface{} {
 		}
 		marker := binary.BigEndian.Uint16(data[offset : offset+2])
 
-		if marker == 0xFFE1 { // EXIF APP1
+		if marker == 0xFFE1 { // APP1: EXIF 或 XMP
 			if offset+4 < len(data) {
 				length := int(binary.BigEndian.Uint16(data[offset+2 : offset+4]))
 				if offset+2+length <= len(data) {
-					exifData := data[offset+4 : offset+2+length]
-					if text := extractEXIFUserComment(exifData); text != "" {
-						textChunks["parameters"] = text
+					payload := data[offset+4 : offset+2+length]
+					switch {
+					case len(payload) > 6 && string(payload[:6]) == "Exif\x00\x00":
+						// 标准 EXIF APP1：提取 UserComment 中的 AI 参数
+						if text := extractEXIFUserComment(payload); text != "" {
+							textChunks["parameters"] = text
+						}
+					case len(payload) > 29 && string(payload[:29]) == "http://ns.adobe.com/xap/1.0/\x00":
+						// 标准 XMP APP1（Photoshop / Google AI 等写入，含 DigitalSourceType / Credit）
+						if xmp := strings.TrimSpace(string(payload[29:])); xmp != "" {
+							textChunks["XML:com.adobe.xmp"] = xmp
+						}
+					}
+				}
+				offset += 2 + length
+			} else {
+				break
+			}
+		} else if marker == 0xFFED { // APP13 Photoshop IRB（8BIM 资源）
+			if offset+4 < len(data) {
+				length := int(binary.BigEndian.Uint16(data[offset+2 : offset+4]))
+				if offset+2+length <= len(data) {
+					if caption := metadata.ExtractPhotoshopCaption(data[offset+4 : offset+2+length]); caption != "" {
+						textChunks["photoshop_caption"] = caption
 					}
 				}
 				offset += 2 + length
@@ -382,7 +403,20 @@ func (a *App) parseJPEGToLegacy(filePath string) map[string]interface{} {
 
 	parsed := metadata.ParseTextChunks(textChunks)
 	if parsed == nil && !hasEXIF {
-		return nil
+		// 仅有 Photoshop APP13 caption 时（如部分 Google AI 图片无 XMP），
+		// 由 caption 兜底识别来源。
+		if caption := textChunks["photoshop_caption"]; caption != "" {
+			parsed = &metadata.ParsedParams{
+				SourceTool: "XMP",
+				Extra:      map[string]string{"credit": caption},
+			}
+			if strings.Contains(caption, "Google") {
+				parsed.SourceTool = "Google AI"
+				parsed.Model = "Google AI"
+			}
+		} else {
+			return nil
+		}
 	}
 	if parsed == nil {
 		parsed = &metadata.ParsedParams{}

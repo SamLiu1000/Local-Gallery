@@ -1,6 +1,8 @@
 package metadata
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -411,6 +413,137 @@ func TestFormatDetection_SDWebUI(t *testing.T) {
 		t.Fatal("expected result")
 	}
 	assertEq(t, "SD WebUI", p.SourceTool, "SourceTool")
+}
+
+// ==================== Google AI (Whisk) XMP / Photoshop APP13 测试 ====================
+
+// whiskXMP 是 Google AI 生图（Whisk）实际写入的标准 XMP APP1 内容
+const whiskXMP = `<?xpacket begin="` + "\xef\xbb\xbf" + `" id="W5M0MpCehiHzreSzNTczkc9d"?> <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="XMP Core 5.5.0"> <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"> <rdf:Description rdf:about="" xmlns:Iptc4xmpExt="http://iptc.org/std/Iptc4xmpExt/2008-02-29/" xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/" Iptc4xmpExt:DigitalSourceFileType="http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia" Iptc4xmpExt:DigitalSourceType="http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia" photoshop:Credit="Made with Google AI"/> </rdf:RDF> </x:xmpmeta>`
+
+// whiskCaptionData 是 Google AI 图片 Photoshop APP13 中 Caption 资源 (0x0404) 的实际数据
+// 结构: 二进制头部 + 长度前缀(0x0013=19) + "Made with Google AI"
+var whiskCaptionData = append([]byte{0x1c, 0x02, 0x6e, 0x00, 0x13}, []byte("Made with Google AI")...)
+
+// buildPSIRB 构造 Photoshop APP13 IRB payload（"Photoshop 3.0\0" + 8BIM 资源列表）
+func buildPSIRB(resources ...[]byte) []byte {
+	buf := []byte("Photoshop 3.0\x00")
+	for _, res := range resources {
+		buf = append(buf, res...)
+	}
+	return buf
+}
+
+// psCaptionResource 构造 8BIM Caption 资源 (0x0404)
+func psCaptionResource(data []byte) []byte {
+	res := []byte("8BIM")
+	res = append(res, 0x04, 0x04) // resource ID: Caption
+	res = append(res, 0x00)       // Pascal 名称: 空
+	res = append(res, 0x00)       // 补齐到偶数长度
+	size := make([]byte, 4)
+	binary.BigEndian.PutUint32(size, uint32(len(data)))
+	res = append(res, size...)
+	res = append(res, data...)
+	if len(res)%2 == 1 {
+		res = append(res, 0x00)
+	}
+	return res
+}
+
+// jpegWithSegments 构造包含指定段(不含长度前缀, 段首两个字节为 marker)的 JPEG
+func jpegWithSegments(payloads ...[2]interface{}) []byte {
+	var buf bytes.Buffer
+	buf.Write([]byte{0xFF, 0xD8})
+	for _, p := range payloads {
+		marker := p[0].(byte)
+		payload := p[1].([]byte)
+		buf.Write([]byte{0xFF, marker})
+		length := make([]byte, 2)
+		binary.BigEndian.PutUint16(length, uint16(len(payload)+2))
+		buf.Write(length)
+		buf.Write(payload)
+	}
+	buf.Write([]byte{0xFF, 0xD9})
+	return buf.Bytes()
+}
+
+func TestXMP_GoogleAI_Whisk(t *testing.T) {
+	p := ParseTextChunks(map[string]string{"XML:com.adobe.xmp": whiskXMP})
+	if p == nil {
+		t.Fatal("expected result")
+	}
+	fmt.Println("=== Google AI Whisk XMP ===")
+	fmt.Println(pretty(p))
+
+	assertEq(t, "Google AI", p.SourceTool, "SourceTool")
+	assertEq(t, "Google AI", p.Model, "Model")
+	assertEq(t, "Made with Google AI", p.Extra["credit"], "Extra credit")
+	assertEq(t, "http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia", p.Extra["digital_source_type"], "Extra digital_source_type")
+	assertEq(t, "http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia", p.Extra["digital_source_file_type"], "Extra digital_source_file_type")
+}
+
+func TestExtractPhotoshopCaption(t *testing.T) {
+	payload := buildPSIRB(psCaptionResource(whiskCaptionData))
+	caption := ExtractPhotoshopCaption(payload)
+	assertEq(t, "Made with Google AI", caption, "Photoshop APP13 Caption")
+
+	// 非 Photoshop payload 返回空
+	assertEq(t, "", ExtractPhotoshopCaption([]byte("garbage data here")), "invalid payload")
+	// 无 Caption 资源返回空
+	assertEq(t, "", ExtractPhotoshopCaption(buildPSIRB([]byte("8BIM\x00\x01\x00\x00\x00\x00\x00\x00\x00\x02AB"))), "no caption resource")
+}
+
+func TestParseFile_GoogleAI_Whisk(t *testing.T) {
+	xmpPayload := append([]byte("http://ns.adobe.com/xap/1.0/\x00"), []byte(whiskXMP)...)
+	psPayload := buildPSIRB(psCaptionResource(whiskCaptionData))
+
+	data := jpegWithSegments(
+		[2]interface{}{byte(0xED), psPayload},  // APP13 Photoshop
+		[2]interface{}{byte(0xE1), xmpPayload}, // APP1 XMP
+	)
+
+	result := ParseFile(data, "whisk_test.jpg")
+	if result == nil {
+		t.Fatal("expected result")
+	}
+	fmt.Println("=== ParseFile Google AI Whisk ===")
+	fmt.Println(pretty(result))
+
+	assertEq(t, "Google AI", result.Params["SourceTool"], "Params SourceTool")
+	assertEq(t, "Google AI", result.Params["Model"], "Params Model")
+	assertEq(t, "Made with Google AI", result.Params["credit"], "Params credit")
+	if result.Raw["XML:com.adobe.xmp"] == "" {
+		t.Error("raw should contain XML:com.adobe.xmp")
+	}
+	if result.Raw["photoshop_caption"] != "Made with Google AI" {
+		t.Errorf("raw photoshop_caption should be 'Made with Google AI', got %q", result.Raw["photoshop_caption"])
+	}
+}
+
+func TestComfyUI_MiniMaxH3(t *testing.T) {
+	// ComfyUI MiniMax H3 参考转视频工作流（moov/udta/meta keyed metadata 中的 mdtaprompt）。
+	// 特征：正片提示词通过 MiniMaxH3ReferenceToVideo.inputs.prompt 连接到
+	// PrimitiveStringMultiline（value 字段），无 KSampler 的 positive/negative 接线。
+	graph := `{
+  "136": {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": {"prompt": ["138", 0], "clip": ["128", 0], "vae": ["119", 0]}},
+  "138": {"class_type": "PrimitiveStringMultiline", "inputs": {"value": "<Subject 1> is defined by <Picture 1>, keep identity, dancing"}},
+  "127": {"class_type": "UNETLoader", "inputs": {"unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors", "weight_dtype": "default"}},
+  "123": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
+  "124": {"class_type": "BasicScheduler", "inputs": {"scheduler": "beta", "steps": 8, "denoise": 1.0}},
+  "129": {"class_type": "RandomNoise", "inputs": {"noise_seed": 1029437820840887}}
+}`
+	p := ParseTextChunks(map[string]string{"prompt": graph})
+	if p == nil {
+		t.Fatal("expected result")
+	}
+	fmt.Println("=== ComfyUI MiniMax H3 ===")
+	fmt.Println(pretty(p))
+
+	assertEq(t, "ComfyUI", p.SourceTool, "SourceTool")
+	assertEq(t, "<Subject 1> is defined by <Picture 1>, keep identity, dancing", p.Prompt, "Prompt")
+	assertEq(t, "minimax_h3_ref2va_pruned_int8_convrot", p.Model, "Model")
+	assertEq(t, "euler", p.Sampler, "Sampler")
+	assertEq(t, "beta", p.Scheduler, "Scheduler")
+	assertEq(t, int64(1029437820840887), p.Seed, "Seed")
 }
 
 // ==================== 工具 ====================
