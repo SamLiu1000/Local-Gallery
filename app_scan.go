@@ -7,6 +7,7 @@ import (
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -76,6 +77,15 @@ func (a *App) scanAllFolders() int {
 			// ★ 串行扫描：scanRootAsync 末尾 rebuildFolderCountsFromSQLLocked 会
 			//   重建整个 folderCount，若并行扫会导致计数互相覆盖回退。
 			for _, rootPath := range missingRoots {
+				// ★ 跳过正在被快速导入扫描的根目录，避免并发抢改同一批索引/SQLite
+				normPath, _ := filepath.Abs(rootPath)
+				a.scanMu.Lock()
+				beingScanned := a.scanningRoots[normPath]
+				a.scanMu.Unlock()
+				if beingScanned {
+					fmt.Printf("[扫描] 跳过正在扫描的根目录(避免并发抢改): %s\n", normPath)
+					continue
+				}
 				a.scanRootAsync(rootPath)
 			}
 			return 0 // 增量扫描是异步的，不返回总数
@@ -99,6 +109,7 @@ func (a *App) scanAllFolders() int {
 	//   若并行扫，先扫完的 root 会把仍在内存增长、尚未落库的 root 计数冲掉，
 	//   导致侧栏数字回退。串行保证每个 root 扫完都已落库，重建计数正确。
 	totalCount := 0
+	scannedAny := false
 	for _, rootPath := range roots {
 		normalizedPath, err := filepath.Abs(rootPath)
 		if err != nil {
@@ -108,7 +119,26 @@ func (a *App) scanAllFolders() int {
 		if err != nil || !info.IsDir() {
 			continue
 		}
+		// ★ 跳过"正在被其它扫描(如快速导入 countFilesQuick)处理"的根目录：
+		//   并发改同一批 memory/SQLite 会互相覆盖计数和子文件夹索引。
+		a.scanMu.Lock()
+		beingScanned := a.scanningRoots[normalizedPath]
+		a.scanMu.Unlock()
+		if beingScanned {
+			fmt.Printf("[扫描] 跳过正在扫描的根目录(避免并发抢改): %s\n", normalizedPath)
+			continue
+		}
 		totalCount += a.scanRootAsync(normalizedPath)
+		scannedAny = true
+	}
+
+	// ★ 只有真正扫到了东西才重建计数/落库/失效缓存。
+	//   若所有根都在被快速导入扫描(全被跳过)，直接返回——否则末尾的
+	//   rebuildFolderCounts()/saveImageIndexToSQLite() 会用当前不完整的 a.images
+	//   把在跑扫描的 folderCount 怼回部分值、或用部分数据覆盖 image_cache。
+	if !scannedAny {
+		fmt.Printf("[扫描] 没有实际扫描的根目录(均在扫描中/无效)，跳过计数重建与落库\n")
+		return 0
 	}
 
 	a.mu.Lock()
@@ -150,11 +180,32 @@ func getImageDimensions(filePath string) (int, int) {
 	}
 	w, h := cfg.Width, cfg.Height
 
-	// 读取 EXIF Orientation 标签，如果图片需要旋转 90° 或 270°，交换宽高
-	if orientation := readEXIFOrientation(filePath); orientation >= 5 && orientation <= 8 {
-		w, h = h, w
+	// 读取 EXIF Orientation 标签，如果图片需要旋转 90° 或 270°，交换宽高。
+	// ★ 复用同一个文件句柄(seek 回 0 再 exif.Decode)，避免慢盘(如 L 盘)对同一文件二次打开
+	//   的那一次额外磁盘读——实测慢盘上单张尺寸读取 ~920ms，二次打开要占约一半。
+	if _, err := f.Seek(0, io.SeekStart); err == nil {
+		if orientation := readEXIFOrientationFromReader(f); orientation >= 5 && orientation <= 8 {
+			w, h = h, w
+		}
 	}
 	return w, h
+}
+
+// readEXIFOrientationFromReader 从已打开的 reader 读取 EXIF Orientation 标签值。
+func readEXIFOrientationFromReader(r io.Reader) int {
+	x, err := exif.Decode(r)
+	if err != nil {
+		return 0
+	}
+	tag, err := x.Get(exif.Orientation)
+	if err != nil {
+		return 0
+	}
+	val, err := tag.Int(0)
+	if err != nil {
+		return 0
+	}
+	return val
 }
 
 // readEXIFOrientation 读取 JPEG 文件的 EXIF Orientation 标签值
@@ -477,6 +528,204 @@ func (a *App) incrementFolderCounts(entries map[string]*ImageEntry) {
 	}
 }
 
+// mergeScanBatchIntoMemory 把一批扫描结果"幂等"合并进内存。
+// ★ 幂等：已在 a.images 中的 ID 直接跳过——这样即席扫描（GetImages 点开子文件夹）
+//   与后台批量扫描（countFilesQuick/scanRootAsync）可能扫到同一批文件时，
+//   folderIndex 不会重复追加、folderCount 不会重复计数。
+//   folderIndex 只追加本次"真正新增"的 ID；folderCount 只对新增图片计数。
+// 自管 a.mu 锁。返回本次新增的 entries（供调用方统计/回传）。
+func (a *App) mergeScanBatchIntoMemory(batchImages map[string]*ImageEntry, batchFolderIndex map[string][]string) map[string]*ImageEntry {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	newEntries := make(map[string]*ImageEntry, len(batchImages))
+	for k, v := range batchImages {
+		if _, exists := a.images[k]; exists {
+			continue
+		}
+		a.images[k] = v
+		newEntries[k] = v
+	}
+	if len(newEntries) == 0 {
+		return newEntries
+	}
+	for fk, ids := range batchFolderIndex {
+		for _, id := range ids {
+			if _, ok := newEntries[id]; ok {
+				a.folderIndex[fk] = append(a.folderIndex[fk], id)
+			}
+		}
+	}
+	a.incrementFolderCounts(newEntries)
+	return newEntries
+}
+
+// folderEntriesFromMemory 收集某文件夹子树下（含自身）已索引到内存的全部图片。
+func (a *App) folderEntriesFromMemory(folder string) []*ImageEntry {
+	normalized := strings.ReplaceAll(folder, "\\", "/")
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	seen := make(map[string]bool)
+	var results []*ImageEntry
+	for fk, ids := range a.folderIndex {
+		if fk == normalized || strings.HasPrefix(fk, normalized+"/") {
+			for _, id := range ids {
+				if seen[id] {
+					continue
+				}
+				seen[id] = true
+				if e, ok := a.images[id]; ok {
+					results = append(results, e)
+				}
+			}
+		}
+	}
+	return results
+}
+
+// rebuildFolderIndexForRoot 导入完成后用 a.images 权威重建"某个根目录"的 folderIndex/folderCount。
+// ★ 目的：countFilesQuick 扫描过程中 folderIndex 是增量写入的，若期间被并发扫描/即席扫描
+//   抢写过，或幂等合并跳过了一些，导入结束时 folderIndex 可能只覆盖部分子文件夹，
+//   导致侧栏"子文件夹只显示部分，刷新页面才全"。此处用内存里该根目录的完整图片集合重算，
+//   保证 GetFolders→buildFolderTreeFromIndex 能列出全部非空子文件夹。
+// 只影响 rootPath 这棵子树，不碰其它根。
+func (a *App) rebuildFolderIndexForRoot(rootPath string) {
+	rootNorm := strings.ReplaceAll(rootPath, "\\", "/")
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	// 1. 清掉本根目录下现有的 folderIndex 键与计数，避免残留（可能来自被中途替换的部分扫描）
+	for fk := range a.folderIndex {
+		if fk == rootNorm || strings.HasPrefix(fk, rootNorm+"/") {
+			delete(a.folderIndex, fk)
+		}
+	}
+	for k := range a.folderCount {
+		if k == rootNorm || strings.HasPrefix(k, rootNorm+"/") {
+			delete(a.folderCount, k)
+		}
+	}
+	// 2. 从 a.images 重建（仅本根目录；扫描刚结束，该根全部图片都在 a.images 中，未被 LRU 淘汰）
+	folderIdx := make(map[string][]string)
+	counts := make(map[string]int)
+	for id, e := range a.images {
+		rp := strings.ReplaceAll(e.RootPath, "\\", "/")
+		if rp != rootNorm {
+			continue
+		}
+		fk := rootNorm
+		var fd string
+		if e.Folder != "" {
+			fd = strings.ReplaceAll(e.Folder, "\\", "/")
+			fk = rootNorm + "/" + fd
+		}
+		folderIdx[fk] = append(folderIdx[fk], id)
+		counts[rootNorm]++
+		if fd != "" {
+			parts := strings.Split(fd, "/")
+			for i := 1; i <= len(parts); i++ {
+				counts[rootNorm+"/"+strings.Join(parts[:i], "/")]++
+			}
+		}
+	}
+	for k, v := range folderIdx {
+		a.folderIndex[k] = append(a.folderIndex[k], v...)
+		// ★ 标记已加载：这些图片都已写入 a.images，避免之后 ensureFolderLoaded 再从 DB 追加重复 ID
+		if !a.folderLoaded[k] {
+			a.folderLoaded[k] = true
+			if a.folderLRU != nil {
+				a.lruNodes[k] = a.folderLRU.PushBack(k)
+			}
+		}
+	}
+	for k, v := range counts {
+		a.folderCount[k] = v
+	}
+}
+
+// folderIsSubfolder 判断 normalizedFolder(正斜杠) 是否为某个已注册根目录内的"严格"子文件夹。
+// GetImages 冷启动用：点开子文件夹时让即席扫描接管，而不是一刀切触发全量后台扫描。
+func (a *App) folderIsSubfolder(normalized string) bool {
+	lower := strings.ToLower(normalized)
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	for root := range a.registeredRoots {
+		rn := strings.ReplaceAll(root, "\\", "/")
+		if strings.HasPrefix(lower, strings.ToLower(rn)+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// scanSubfolderImmediate 点开子文件夹时"即席优先扫描"：只扫这一个子文件夹（含其子树），
+// 立即把结果写进内存并返回，让用户"点哪个先出哪个"，不用等整个后台大扫描扫到它。
+// 以最长的已注册父根为 folderKey/RootPath 基准，保证与 GetImages/GetFolderCount 的前缀匹配一致。
+// 幂等（mergeScanBatchIntoMemory），并与后台扫描并发去重（subfolderScanning）。
+func (a *App) scanSubfolderImmediate(subfolder string) []*ImageEntry {
+	normalized := strings.ReplaceAll(subfolder, "\\", "/")
+	// 找最长匹配的已注册父根（严格子文件夹：前缀 parentRoot+"/"；大小写不敏感，避免路径大小写差异匹配不到）
+	a.mu.RLock()
+	var parentRoot, parentRootNorm string
+	for root := range a.registeredRoots {
+		rn := strings.ReplaceAll(root, "\\", "/")
+		if strings.HasPrefix(strings.ToLower(normalized), strings.ToLower(rn)+"/") && len(rn) > len(parentRootNorm) {
+			parentRootNorm = rn
+			parentRoot = root
+		}
+	}
+	a.mu.RUnlock()
+	if parentRoot == "" {
+		return nil // 不位于任何已注册根内，或本身就是根，交给常规扫描
+	}
+	// ★ 按长度取相对路径，避免大小写不同导致 TrimPrefix 失败
+	relFolder := normalized[len(parentRootNorm)+1:]
+	if relFolder == "" {
+		return nil
+	}
+
+	// 并发去重：同一子文件夹只允许一个即席扫描在跑
+	a.scanMu.Lock()
+	if a.subfolderScanning == nil {
+		a.subfolderScanning = make(map[string]bool)
+	}
+	if a.subfolderScanning[normalized] {
+		a.scanMu.Unlock()
+		return a.folderEntriesFromMemory(normalized)
+	}
+	a.subfolderScanning[normalized] = true
+	a.scanMu.Unlock()
+	defer func() {
+		a.scanMu.Lock()
+		delete(a.subfolderScanning, normalized)
+		a.scanMu.Unlock()
+	}()
+
+	fmt.Printf("[即席扫描] 点开子文件夹，立即扫描: %s (父根: %s)\n", normalized, parentRoot)
+	a.scanWalkDirBatched(subfolder, parentRoot, relFolder,
+		func(batchImages map[string]*ImageEntry, batchFolderIndex map[string][]string, folderRel string, batchCount int) {
+			a.mergeScanBatchIntoMemory(batchImages, batchFolderIndex)
+			// 标记已加载，避免之后 ensureFolderLoaded 去 DB（可能仍为空）把内存数据当作"未加载"
+			a.mu.Lock()
+			for fk := range batchFolderIndex {
+				if !a.folderLoaded[fk] {
+					a.folderLoaded[fk] = true
+					if a.folderLRU != nil {
+						a.lruNodes[fk] = a.folderLRU.PushBack(fk)
+					}
+				}
+			}
+			a.mu.Unlock()
+		})
+
+	entries := a.folderEntriesFromMemory(normalized)
+	if a.ctx != nil {
+		wailsruntime.EventsEmit(a.ctx, "folder:count", map[string]interface{}{
+			"folderPath": normalized,
+			"count":      len(entries),
+		})
+	}
+	return entries
+}
+
 func (a *App) rebuildFolderIndex() {
 	idx := make(map[string][]string)
 	for id, entry := range a.images {
@@ -507,9 +756,32 @@ func (a *App) pruneDeadFolders() (prunedFolders int, prunedImages int) {
 		return 0, 0
 	}
 
-	// 1. 收集目录已不存在的 folder key（IO 阶段不持锁）
-	var deadKeys []string
+	// ★ 启动速度优化：只对"根目录 mtime 变了"的根做幽灵清理。健康启动（磁盘上无增删）
+	//   直接跳过，避免每次开机对每个子文件夹目录 os.Stat——注释里"慢盘数千次约 2-3 秒"。
+	//   删除顶级子文件夹/在根下增删文件都会改变根目录的 mtime，故根 mtime 不变≈无变化。
+	var changedRoots []string
 	for _, root := range roots {
+		rootNorm := strings.ReplaceAll(root, "\\", "/")
+		info, err := os.Stat(root)
+		if err != nil || !info.IsDir() {
+			// 根本身已不存在：归入死根，交由 removeByRoot 类清理
+			changedRoots = append(changedRoots, root)
+			continue
+		}
+		a.mu.RLock()
+		unchanged := a.dirMtimeUnchanged(rootNorm, info.ModTime().UnixMilli())
+		a.mu.RUnlock()
+		if !unchanged {
+			changedRoots = append(changedRoots, root)
+		}
+	}
+	if len(changedRoots) == 0 {
+		return 0, 0 // 无根变化：跳过整棵树的 stat
+	}
+
+	// 1. 收集目录已不存在的 folder key（IO 阶段不持锁）——仅遍历"变化过的根"之下
+	var deadKeys []string
+	for _, root := range changedRoots {
 		rootNorm := strings.ReplaceAll(root, "\\", "/")
 		prefix := rootNorm + "/"
 		a.mu.RLock()
@@ -745,15 +1017,18 @@ func (a *App) buildFolderTreeFromIndex(rootPath string, thumbCounts map[string]i
 	// ★ 乙方案：本根之内已注册的嵌套根（子目录被单独导入）在父目录树里渲染为
 	//   "折叠入口"——不再展开其子文件夹（避免与顶层独立入口重复显示一整棵子树），
 	//   其计数仍显示该嵌套根的全部图片数（folderCount 键与真实目录一致）。
+	// ★ 注意：调用方(GetFolders)已持有 a.mu.RLock；此处**不能再取一次 RLock**。
+	//   否则当有写者(快速导入每批的 a.mu.Lock)在排队时，Go RWMutex 会阻塞新的读锁，
+	//   → GetFolders 卡在这层读锁、外层读锁不释放 → 写者也等不到锁 → 死锁，
+	//   表现为"点击任何文件夹都不出图、磁盘不读、连累其它文件夹"。
+	//   这里的读取依赖调用方已持有的读锁。
 	var registeredUnder []string
-	a.mu.RLock()
 	for root := range a.registeredRoots {
 		rn := strings.ReplaceAll(root, "\\", "/")
 		if rn != normalizedRoot && strings.HasPrefix(rn, prefix) {
 			registeredUnder = append(registeredUnder, rn)
 		}
 	}
-	a.mu.RUnlock()
 	registeredSet := make(map[string]bool, len(registeredUnder))
 	for _, rn := range registeredUnder {
 		registeredSet[rn] = true
@@ -1385,6 +1660,18 @@ func (a *App) refreshFolderInternal(folderPath string) *FolderDiffResult {
 		return &FolderDiffResult{Success: false, Error: "未找到匹配的已注册根目录: " + folderPath}
 	}
 
+	// ★ 正在被快速导入/全量扫描的根目录：跳过本次刷新。
+	//   否则 refreshFolderInternal 与在跑的扫描并发改同一批 memory/SQLite
+	//   （快照→删→写回→rebuildFolderCountsFromSQLLocked），会把导入中的
+	//   folderIndex/计数/SQLite 冲成残缺，表现为"导入中点刷新后文件夹消失/计数回退"。
+	a.scanMu.Lock()
+	beingScanned := a.scanningRoots[matchedRoot]
+	a.scanMu.Unlock()
+	if beingScanned {
+		fmt.Printf("[增量刷新] 根目录正在扫描中，跳过刷新: %s\n", matchedRoot)
+		return &FolderDiffResult{Success: false, Error: "文件夹正在扫描中，请稍后再刷新"}
+	}
+
 	// 检查文件夹是否存在
 	info, err := os.Stat(folderPath)
 	if err != nil || !info.IsDir() {
@@ -1490,10 +1777,21 @@ func (a *App) refreshFolderInternal(folderPath string) *FolderDiffResult {
 			//   表现为"刷新后整目录图片消失"。只有映射到已知文件（len(ids)>0）才可安全跳过；
 			//   映射为空则回退完整处理：文件仍在 a.images 会被标记 current 保留，否则重扫入库。
 			if ids, mapped := dirIDMap[dirNorm]; mapped && len(ids) > 0 {
-				for id := range ids {
-					currentIDs[id] = true
+				// ★ 完整性校验：若该叶子目录里实际媒体文件数 ≠ 已索引数，说明上次扫描
+				//   是半成品（导入中途中断/被并发干扰），mtime 未变但仍有文件未入库——
+				//   此时不能跳过，必须重扫这一目录，否则"点刷新计数一直不变"。
+				itemCount := 0
+				for _, it := range items {
+					if !it.IsDir() && (isImageFile(it.Name()) || isVideoFile(it.Name())) {
+						itemCount++
+					}
 				}
-				return
+				if itemCount == len(ids) {
+					for id := range ids {
+						currentIDs[id] = true
+					}
+					return
+				}
 			}
 		}
 
@@ -1571,6 +1869,12 @@ func (a *App) refreshFolderInternal(folderPath string) *FolderDiffResult {
 	}
 
 	if len(addedEntries) == 0 && len(removedIDs) == 0 {
+		// ★ 即使没有增删，也重建一次该根目录计数：可能上次导入/落库被并发扫描干扰，
+		//   导致 folderCount 停留在偏小/0 值（表现为"点刷新计数一直不变"）。数据已完整，
+		//   从 SQLite 重建一次最稳妥。
+		a.mu.Lock()
+		a.rebuildFolderCountsFromSQLLocked()
+		a.mu.Unlock()
 		return &FolderDiffResult{Added: []SafeImage{}, Removed: []string{}, Unchanged: unchanged, Success: true}
 	}
 

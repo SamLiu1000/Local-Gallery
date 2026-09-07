@@ -30,6 +30,10 @@ export function DebugPagination(arg1:string):Promise<Record<string, any>>;
 
 export function DebugScanRoot(arg1:string):Promise<main.DebugScanResult>;
 
+export function DebugSwitchLog(arg1:string):Promise<void>;
+
+export function DebugSwitchLogBatch(arg1:Array<string>):Promise<void>;
+
 export function DeletePromptVersion(arg1:string):Promise<Record<string, any>>;
 
 export function FocusFolder(arg1:string):Promise<void>;
@@ -109,6 +113,8 @@ export function ImportImageTags(arg1:Array<database.ImageTag>):Promise<Record<st
 export function ImportPromptVersions(arg1:Array<database.PromptVersion>):Promise<Record<string, any>>;
 
 export function IndexRoot(arg1:string):Promise<void>;
+
+export function InitDebugSwitchLog():Promise<void>;
 
 export function IsFavorite(arg1:string):Promise<boolean>;
 

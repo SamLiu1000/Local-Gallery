@@ -31,6 +31,25 @@ const Gallery = (() => {
     let sortOrder = 'date-desc';
     let showPromptCount = false;    // 是否显示提示词版本数量
     let promptCountMap = {};        // imagePath → count
+
+    // ★ debug：前端"文件夹切换"逐步日志。写入 user/debug-switch.log(经 WailsBridge
+    //   debugSwitchLogBatch 落盘)，并同步打 console。为避免低频 websocket 刷爆，
+    //   先攒进 _traceBuf，满 20 条或每 300ms 批量发一次。
+    const _traceBuf = [];
+    function trace(...args) {
+        const line = args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
+        _traceBuf.push(`+${performance.now().toFixed(0)}ms ${line}`);
+        if (_traceBuf.length >= 20) flushTrace();
+        try { console.log('[TRACE]', line); } catch (e) {}
+    }
+    function flushTrace() {
+        if (_traceBuf.length === 0) return;
+        const batch = _traceBuf.splice(0, _traceBuf.length);
+        if (typeof WailsBridge !== 'undefined' && WailsBridge.debugSwitchLogBatch) {
+            WailsBridge.debugSwitchLogBatch(batch);
+        }
+    }
+    setInterval(flushTrace, 300);
     let currentFolderFilter = null; // 当前文件夹过滤路径
     let currentTagFilter = null;     // 当前标签过滤 ID（null 表示不在标签视图）
     let folderTagExtraPaths = null;  // 文件夹标签：手动标记该标签、但不在文件夹内的图片路径集合（标签视图=文件夹内容∪手动标记）
@@ -41,7 +60,7 @@ const Gallery = (() => {
     // ★ 内存优化：全局 images 数组软上限（LRU 式淘汰旧文件夹的服务端图片）。
     //   images 跨文件夹切换只增不减（用于快速缓存切换），大库浏览久了会膨胀。
     //   超过上限时保留"当前视图 + 最近访问"的文件夹，淘汰更早的 _fromServer 图片。
-    const IMAGES_CACHE_MAX = 20000;
+    const IMAGES_CACHE_MAX = 8000;
     const IMAGES_KEEP_RECENT_FOLDERS = 10; // 最近访问的文件夹数量
     let recentFolderKeys = [];              // MRU 在前
 
@@ -59,9 +78,8 @@ const Gallery = (() => {
         for (let i = 0; i < images.length; i++) {
             const img = images[i];
             if (!img._fromServer) continue;
-            const imgRoot = (img.rootPath || '').replace(/\\/g, '/');
-            const imgFolder = (img.folder || '').replace(/\\/g, '/');
-            const folderKey = imgFolder ? `${imgRoot}/${imgFolder}` : imgRoot;
+            // ★ GC 优化：用缓存好的 folderKey,避免每轮 repeat 字符串替换
+            const folderKey = imageFolderKey(img);
             if (!keepKeys.has(folderKey)) {
                 removable.push(img);
             }
@@ -299,17 +317,35 @@ const Gallery = (() => {
             if (window.runtime && window.runtime.EventsOn) {
                 let pendingScanFolder = null;  // 正在为这个文件夹进行首次加载
                 let loadedScanFolder = null;   // 已经为这个文件夹的 scan 加载完成
+                let _scanCompleteLast = 0;      // scan:complete 重取当前文件夹的防抖时间戳
                 window.runtime.EventsOn('scan:complete', (data) => {
                     console.log('[Gallery] 收到扫描完成事件:', data);
-                    folderCacheMeta = {};
                     const scanRoot = (data.rootPath || '').replace(/\\/g, '/');
+                    // ★ 只清除本次扫描 root 子树下的缓存元数据，而不是 `folderCacheMeta = {}` 清空全部。
+                    //   旧逻辑把**所有**文件夹的缓存元数据一次清空——之后点任何已缓存文件夹都命中失败，
+                    //   退化成"showLoading(true) + 重拉 GetImages"（表现为"该文件夹已缓存，点击还是加载中很久"）。
+                    //   真正的图片缓存 images 其实还在；只有被扫描的 root 内容可能变化，才需要重拉。
+                    //   非扫描 root 的元数据立即保留，下一次点击直接缓存命中、不加载。
+                    if (scanRoot) {
+                        for (const k of Object.keys(folderCacheMeta)) {
+                            if (k === scanRoot || k.startsWith(scanRoot + '/')) {
+                                delete folderCacheMeta[k];
+                            }
+                        }
+                    }
                     if (currentFolderFilter && scanRoot &&
                         currentFolderFilter.replace(/\\/g, '/').startsWith(scanRoot)) {
                         // ★ 修复：扫描完成后必须重新拉取当前文件夹列表（forceRefresh:false，不做后端重扫）。
                         //   旧逻辑用 pendingScanFolder/loadedScanFolder 守卫跳过刷新——但若文件夹是在
                         //   扫描中途（image_cache 未写全）打开的，分页总数会冻结在部分数量上，
                         //   之后滚动不再加载（表现为"导入后只加载几百张就没反应"）。
-                        //   统一重拉一次，用最终 total 校正分页状态；重复加载无害（forceRefresh:false）。
+                        //   统一重拉一次，用最终 total 校正分页状态。
+                        // ★ 防抖：导入多个根时 scan:complete 会频繁触发，每触发一次就重取/重渲染当前文件夹
+                        //   ——大导入下会反复发 GetImages（如 AmourAngels 被连续取 4-5 次），压垮 websocket。
+                        //   合并为 1 秒内最多重取一次。
+                        const now = Date.now();
+                        if (_scanCompleteLast && now - _scanCompleteLast < 1000) return;
+                        _scanCompleteLast = now;
                         console.log('[Gallery] 扫描完成，重新拉取当前文件夹:', currentFolderFilter);
                         filterByFolder(currentFolderFilter, null, { forceRefresh: false });
                     }
@@ -324,7 +360,11 @@ const Gallery = (() => {
                 Gallery._beginScanLoad = (fp) => { pendingScanFolder = fp; loadedScanFolder = null; };
                 Gallery._finishScanLoad = (fp) => { if (pendingScanFolder === fp) { pendingScanFolder = null; loadedScanFolder = fp; } };
 
-                // ★ 增量扫描：每完成一个文件夹立即收到推送
+                // ★ 增量扫描：每完成一个文件夹立即收到推送（大库事件上万，DOM 更新做节流合并）
+                let _batchPending = false;
+                let _batchRoot = null;
+                let _batchTotal = 0;
+                let _batchThumb = 0;
                 window.runtime.EventsOn('scan:batch', (data) => {
                     const batchRoot = (data.rootPath || '').replace(/\\/g, '/');
                     const count = data.count || 0;
@@ -332,13 +372,39 @@ const Gallery = (() => {
 
                     console.log('[Gallery] scan:batch root=' + batchRoot + ' folder=' + (data.folder || '(root)') + ' count=' + count + ' totalSoFar=' + data.totalSoFar);
 
-                    // ★ 轻量更新侧栏计数
-                    if (typeof Sidebar !== 'undefined' && Sidebar._updateFolderCounts) {
-                        Sidebar._updateFolderCounts(batchRoot, data.totalSoFar, data.thumbCount);
-                    } else if (typeof Sidebar !== 'undefined' && Sidebar._updateSingleFolderCount) {
-                        Sidebar._updateSingleFolderCount(batchRoot);
-                    } else if (typeof Sidebar !== 'undefined' && Sidebar.refreshFolderTree) {
-                        Sidebar.refreshFolderTree();
+                    // ★ 轻量更新侧栏计数（200ms 内合并为一次 DOM 更新，避免洪泛卡死 UI/轮询）
+                    _batchRoot = batchRoot;
+                    _batchTotal = data.totalSoFar || 0;
+                    _batchThumb = data.thumbCount || 0;
+                    if (_batchPending) return;
+                    _batchPending = true;
+                    setTimeout(() => {
+                        _batchPending = false;
+                        if (_batchRoot && typeof Sidebar !== 'undefined' && Sidebar._updateFolderCounts) {
+                            Sidebar._updateFolderCounts(_batchRoot, _batchTotal, _batchThumb);
+                        } else if (typeof Sidebar !== 'undefined' && Sidebar._updateSingleFolderCount) {
+                            Sidebar._updateSingleFolderCount(_batchRoot);
+                        } else if (typeof Sidebar !== 'undefined' && Sidebar.refreshFolderTree) {
+                            Sidebar.refreshFolderTree();
+                        }
+                    }, 200);
+
+                    // ★ 流式补图：当前打开的文件夹属于正在扫描的根目录时，边扫边增量追加，
+                    //   而不是等 scan:complete 才一次性刷新（否则导入中打开子文件夹要等很久）。
+                    if (currentFolderFilter) {
+                        const curNorm = currentFolderFilter.replace(/\\/g, '/');
+                        if (curNorm === batchRoot || curNorm.startsWith(batchRoot + '/')) {
+                            _scheduleScanStreaming();
+                        }
+                    }
+                });
+
+                // ★ 即席扫描：点开子文件夹时后端立即只扫这一个文件夹并回传计数，更新侧栏该节点
+                window.runtime.EventsOn('folder:count', (data) => {
+                    const fp = (data.folderPath || '').replace(/\\/g, '/');
+                    if (!fp) return;
+                    if (typeof Sidebar !== 'undefined' && Sidebar._updateSingleFolderCount) {
+                        Sidebar._updateSingleFolderCount(fp);
                     }
                 });
 
@@ -1772,6 +1838,15 @@ const Gallery = (() => {
 
         hideGalleryPlaceholder();
 
+        // ★ DOM/GC 优化：列表超大时一次性创建全部卡片会让 DOM 膨胀、滚动/GC 变卡。
+        //   直接委托虚拟化 renderGrid(只渲染视口+缓冲行)。progressiveRender 保留给
+        //   中小列表(逐批淡入更好看),超大数据走虚拟化更划算。
+        if (displayImages.length > 300) {
+            renderGrid(displayImages);
+            updateImageCount();
+            return;
+        }
+
         const batchSize = options.batchSize || getOptimalBatchSize() * 5;  // 默认 50-100 张/帧
 
         isProgressiveRendering = true;
@@ -1835,6 +1910,19 @@ const Gallery = (() => {
 
     // ==================== 过滤 ====================
 
+    // imageFolderKey 计算并缓存图片的"所属文件夹路径"(rootId|rootPath + "/" + folder)。
+    // ★ DOM/GC 优化：applyCurrentFilter / 缓存命中筛选 / pruneImagesCache 原本每轮对
+    //   每张图重复 `replace(/\\/g,'/')` + 字符串拼接来算 folderKey —— 大规模下是频繁的
+    //   字符串分配(GC 垃圾)。图片的 rootId/rootPath/folder 在加载后固定不变,故缓存一次、
+    //   之后 O(1) 取用。0 分配。
+    function imageFolderKey(img) {
+        if (img._folderKey !== undefined) return img._folderKey;
+        const r = (img.rootId || img.rootPath || '').replace(/\\/g, '/');
+        const f = (img.folder || '').replace(/\\/g, '/');
+        img._folderKey = f ? `${r}/${f}` : r;
+        return img._folderKey;
+    }
+
     function applyCurrentFilter(options = {}) {
         const includeDescendants = options.includeDescendants !== false;
         // ★ auto dedup: remove duplicate entries before filtering
@@ -1858,9 +1946,7 @@ const Gallery = (() => {
 
         for (let i = 0; i < len; i++) {
             const img = images[i];
-            const imgRootId = (img.rootId || img.rootPath || '').replace(/\\/g, '/');
-            const imgFolder = (img.folder || '').replace(/\\/g, '/');
-            const imageFolderPath = imgFolder ? `${imgRootId}/${imgFolder}` : imgRootId;
+            const imageFolderPath = imageFolderKey(img);
 
             const inExtra = !!extraSet && extraSet.has(img.path);
             if (includeDescendants) {
@@ -1954,10 +2040,17 @@ const Gallery = (() => {
      */
     async function isServerRegisteredPath(folderPath) {
         if (!folderPath) return false;
-        const normalized = folderPath.replace(/\\/g, '/');
+        // ★ Wails 模式下，侧栏可点的任何文件夹都来自后端已注册根，直接返回 true。
+        //   否则启动初期 importedRoots / Storage 尚未加载完成时会被误判为 false，
+        //   而 filterByFolder 的"从后端加载"整段逻辑都在这条判断之内 → 直接什么都不加载，
+        //   表现为"点击文件夹不读盘、不出图"。
+        if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails()) {
+            return true;
+        }
+        const normalized = folderPath.replace(/\\/g, '/').toLowerCase();
         // ★ 先用内存中的 importedRoots 快速判断，避免每次异步查 Storage
         for (const root of importedRoots) {
-            const rootId = (root.rootId || '').replace(/\\/g, '/');
+            const rootId = (root.rootId || '').replace(/\\/g, '/').toLowerCase();
             if (rootId === normalized || normalized.startsWith(rootId + '/')) {
                 return true;
             }
@@ -1966,7 +2059,7 @@ const Gallery = (() => {
         try {
             const roots = await Storage.getRegisteredRoots();
             return (roots || []).some(r => {
-                const rootId = r.replace(/\\/g, '/');
+                const rootId = r.replace(/\\/g, '/').toLowerCase();
                 return rootId === normalized || normalized.startsWith(rootId + '/');
             });
         } catch (err) {
@@ -2198,6 +2291,65 @@ const Gallery = (() => {
         loadMoreIndicator.style.display = show ? 'flex' : 'none';
     }
 
+    // ★ 流式补图调度（模块级计时器）：导入/扫描期间，当前打开的文件夹按 scan:batch
+    //   节流地触发 _scanStreamLoad 增量追加，避免等 scan:complete 才一次性刷新。
+    //   300ms 合并，防 scan:batch 洪泛反复重查。
+    let _scanStreamTimer = null;
+    function _scheduleScanStreaming() {
+        if (_scanStreamTimer) return;
+        _scanStreamTimer = setTimeout(() => {
+            _scanStreamTimer = null;
+            if (!currentFolderFilter) return;
+            // 全量加载交给滚动；这里只在"还没全量加载完"时补拉下一批
+            if (folderLoadTotal > 0 && folderLoadOffset >= folderLoadTotal) return;
+            _scanStreamLoad();
+        }, 300);
+    }
+
+    // 流式补图：从当前已加载偏移取下一批追加。网格为空/占位（导入中途打开且首屏为 0）时
+    // 走 render() 全量渲染（会清掉占位），否则走 appendImageCards 增量追加，避免重复重建/跳动。
+    let _scanStreamBusy = false;
+    async function _scanStreamLoad() {
+        if (_scanStreamBusy) return;
+        const folderPath = currentFolderFilter;
+        if (!folderPath || isLoadingMoreFolder) return;
+        _scanStreamBusy = true;
+        const normFolder = folderPath.replace(/\\/g, '/');
+        try {
+            const result = await loadImagesFromServer(folderPath, folderLoadOffset, FOLDER_FETCH_BATCH);
+            if (folderPath !== currentFolderFilter) return; // 等待期间切走了
+            if (result.images.length === 0) {
+                folderCacheMeta[normFolder] = { total: result.total };
+                return;
+            }
+            const existIDs = new Set(images.map(i => i.id).filter(Boolean));
+            const added = result.images.filter(i => i.id && !existIDs.has(i.id));
+            folderLoadTotal = result.total;
+            folderCacheMeta[normFolder] = { total: result.total };
+            if (added.length === 0) {
+                folderLoadOffset = Math.max(folderLoadOffset, folderLoadTotal);
+                updateImageCount();
+                return;
+            }
+            images.push(...added);
+            folderLoadOffset += added.length;
+            invalidatePathIndex();
+            applyCurrentFilter();
+            updateImageCount();
+            if (galleryGrid.querySelector('.image-card')) {
+                const prevFilteredLength = filteredImages.length;
+                const newFiltered = filteredImages.slice(prevFilteredLength);
+                if (newFiltered.length > 0) appendImageCards(newFiltered);
+            } else {
+                render(); // 空/占位 → 按布局全量渲染
+            }
+        } catch (err) {
+            console.warn('[Gallery] 扫描流式补图失败:', err.message);
+        } finally {
+            _scanStreamBusy = false;
+        }
+    }
+
     /**
      * ★ 标签视图增量加载：按标签的图片路径分批拉取后续批次
      *   （标签结果超过首屏 FOLDER_LOOKAHEAD 时滚动触发，与文件夹分页一致）
@@ -2294,11 +2446,21 @@ const Gallery = (() => {
         }
     }
 
+    // ★ 后台刷新节流：记录每个文件夹上次后台刷新的时间戳，避免快速来回切换时，
+    //   每个文件夹都反复"静默重查 + O(N) 扫描"，导致切多了 UI 无响应。
+    let _folderRefreshLastMap = {};
+
     /**
      * ★ 后台异步刷新文件夹缓存：在缓存命中并渲染后，静默检查服务端是否有更新。
      *   不阻塞用户交互，刷新完成后自动替换 images 数组并重渲染画廊。
      */
     async function _refreshFolderCacheAsync(folderPath, normalizedFolder, signal, currentController) {
+        // ★ 节流：同一文件夹 5 秒内不重复后台刷新（切回来想立刻看到更新时 5 秒后到位）。
+        const now = Date.now();
+        if (_folderRefreshLastMap[normalizedFolder] && now - _folderRefreshLastMap[normalizedFolder] < 5000) {
+            return;
+        }
+        _folderRefreshLastMap[normalizedFolder] = now;
         try {
             const freshResult = await loadImagesFromServer(folderPath, 0, FOLDER_FETCH_BATCH);
             if (signal.aborted || folderAbortController !== currentController) return;
@@ -2314,9 +2476,7 @@ const Gallery = (() => {
                 // 进一步检查：对比第一张图片的 ID
                 const cachedFirst = images.find(img => {
                     if (!img._fromServer) return false;
-                    const imgRoot = (img.rootPath || '').replace(/\\/g, '/');
-                    const imgFolder = (img.folder || '').replace(/\\/g, '/');
-                    const imageFolderPath = imgFolder ? `${imgRoot}/${imgFolder}` : imgRoot;
+                    const imageFolderPath = imageFolderKey(img);
                     return imageFolderPath === normalizedFolder;
                 });
                 hasChanges = cachedFirst && freshImages[0] && cachedFirst.id !== freshImages[0].id;
@@ -2332,9 +2492,7 @@ const Gallery = (() => {
             // 替换 images 中的旧数据
             images = images.filter(img => {
                 if (!img._fromServer) return true;
-                const imgRoot = (img.rootPath || '').replace(/\\/g, '/');
-                const imgFolder = (img.folder || '').replace(/\\/g, '/');
-                const imageFolderPath = imgFolder ? `${imgRoot}/${imgFolder}` : imgRoot;
+                const imageFolderPath = imageFolderKey(img);
                 return !(imageFolderPath === normalizedFolder || imageFolderPath.startsWith(normalizedFolder + '/'));
             });
             // ★ dedup
@@ -2380,6 +2538,7 @@ const Gallery = (() => {
     async function filterByFolder(folderPath, folderName, options = {}) {
         const includeDescendants = options.includeDescendants !== false;
         const forceRefresh = options.forceRefresh || false;
+        trace('[filterByFolder] 进入 folderPath=', folderPath, 'forceRefresh=', forceRefresh, 'includeDescendants=', includeDescendants, 'images=', images.length, 'folderCacheMetaKeys=', Object.keys(folderCacheMeta).length);
 
         // ★ 问题一修复：中断前一个文件夹切换请求
         abortFolderSwitch();
@@ -2436,7 +2595,10 @@ const Gallery = (() => {
 
         // ★ 后端注册目录：通过 importedRoots 匹配判断，而非路径格式判断
         console.log('[filterByFolder] folderPath:', folderPath, 'importedRoots:', importedRoots.map(r => r.rootId));
-        if (folderPath && await isServerRegisteredPath(folderPath)) {
+        const _isRegT0 = performance.now();
+        const _isRegistered = folderPath && await isServerRegisteredPath(folderPath);
+        trace('[filterByFolder] isServerRegisteredPath=', _isRegistered, '耗时=', (performance.now() - _isRegT0).toFixed(0) + 'ms');
+        if (_isRegistered) {
             console.log('[filterByFolder] 进入服务端路径分支:', folderPath);
 
             // ★ 修复：await isServerRegisteredPath 期间用户可能已切换文件夹 / 进入搜索/标签视图。
@@ -2451,52 +2613,79 @@ const Gallery = (() => {
 
             // ★ 缓存加速：在清空画廊和显示 loading 之前，先检查内存缓存
             //   如果 images 数组中已有该文件夹数据，立即渲染，避免用户等待 RPC
-            const cachedImages = !forceRefresh ? images.filter(img => {
+            // ★ 性能修复：只在"确有此文件夹缓存元数据"时才去全量扫 images(否则缓存命中渲染不成立)。
+            //   之前无条件 `images.filter` 每次点击都对全部已加载图片做 O(N) 扫描，
+            //   图片多时切换文件夹明显变慢（表现为"点击子文件夹后要等好久才出现 get image"）。
+            const hasFolderCache = !!(folderCacheMeta[normalizedFolder]);
+            const _cachedFiltT0 = performance.now();
+            const cachedImages = (!forceRefresh && hasFolderCache) ? images.filter(img => {
                 if (!img._fromServer) return false;
-                const imgRoot = (img.rootPath || '').replace(/\\/g, '/');
-                const imgFolder = (img.folder || '').replace(/\\/g, '/');
-                const imageFolderPath = imgFolder ? `${imgRoot}/${imgFolder}` : imgRoot;
+                // ★ 与 applyCurrentFilter 使用完全相同的字段表达式 (rootId || rootPath)，
+                //   否则一旦某张图 rootId 与 rootPath 不一致，缓存命中会过滤出 >0 张，
+                //   而 applyCurrentFilter 却过滤成 0 → 触发"缓存命中渲染为空"自愈→ 回退 GetImages，
+                //   这正是"点击当前文件夹后要等一会才出图"的根因。二者统一后永不再互相矛盾。
+                //   用 imageFolderKey 缓存好的字段，避免每轮字符串替换分配(GC)。
+                const imageFolderPath = imageFolderKey(img);
                 return imageFolderPath === normalizedFolder || imageFolderPath.startsWith(normalizedFolder + '/');
             }) : [];
+            trace('[filterByFolder] 缓存检查 hasFolderCache=', hasFolderCache, 'cachedImages=', cachedImages.length, '筛选耗时=', (performance.now() - _cachedFiltT0).toFixed(0) + 'ms');
 
             if (cachedImages.length > 0 && folderCacheMeta[normalizedFolder]) {
-                // ★ 缓存命中：立即用缓存数据渲染，不显示 loading
-                folderLoadTotal = folderCacheMeta[normalizedFolder].total;
-                folderLoadOffset = cachedImages.length;
-                isLoadingMoreFolder = false;
-                console.log(`[Gallery] 缓存命中: ${normalizedFolder}，${cachedImages.length}/${folderLoadTotal} 张，立即渲染`);
+                trace('[filterByFolder] 缓存命中 → 直接渲染 folder=', normalizedFolder, '张数=', cachedImages.length);
+                try {
+                    // ★ 缓存命中：立即用缓存数据渲染，不显示 loading
+                    folderLoadTotal = folderCacheMeta[normalizedFolder].total;
+                    folderLoadOffset = cachedImages.length;
+                    isLoadingMoreFolder = false;
+                    const _swCachedT0 = performance.now();
+                    console.log(`[Gallery] 缓存命中: ${normalizedFolder}，${cachedImages.length}/${folderLoadTotal} 张，立即渲染`);
 
-                applyCurrentFilter({ includeDescendants });
-                sortImages();
-                if (Gallery._finishScanLoad) Gallery._finishScanLoad(currentFolderFilter);
-                // ★ dedup before render
-                images = _dedupImages(images);
+                    applyCurrentFilter({ includeDescendants });
+                    sortImages();
+                    if (Gallery._finishScanLoad) Gallery._finishScanLoad(currentFolderFilter);
+                    // ★ dedup before render
+                    images = _dedupImages(images);
 
-                const displayImages = isFilteringActive ? filteredImages : images;
-                if (displayImages.length > 100) {
-                    if (currentLayout === 'masonry') {
-                        renderMasonry(displayImages);
-                    } else if (currentLayout === 'pinterest') {
-                        renderPinterest(displayImages);
-                    } else if (currentLayout === 'list') {
-                        renderList(displayImages);
-                    } else {
-                        progressiveRender(displayImages);
+                    const displayImages = isFilteringActive ? filteredImages : images;
+                    // ★ 自愈：明明缓存命中(cachedImages>0)却被 applyCurrentFilter 过滤成 0，
+                    //   说明内存状态/路径匹配出了问题（正是"当前文件夹空白、后台却在处理
+                    //   之前文件夹"的根因）。当作异常抛出 → 走 catch 回退服务端加载(发 GetImages)。
+                    if (displayImages.length === 0 && !forceRefresh) {
+                        throw new Error(`缓存命中渲染为空(${cachedImages.length}/${folderLoadTotal})，回退服务端加载`);
                     }
-                } else {
-                    render();
-                }
-                clearSelection();
-                showLoading(false);
+                    if (displayImages.length > 100) {
+                        if (currentLayout === 'masonry') {
+                            renderMasonry(displayImages);
+                        } else if (currentLayout === 'pinterest') {
+                            renderPinterest(displayImages);
+                        } else if (currentLayout === 'list') {
+                            renderList(displayImages);
+                        } else {
+                            progressiveRender(displayImages);
+                        }
+                    } else {
+                        render();
+                    }
+                    clearSelection();
+                    showLoading(false);
+                    console.log(`[切换耗时] 缓存命中切换: ${normalizedFolder} 耗时=${(performance.now() - _swCachedT0).toFixed(0)}ms displayImages=${displayImages.length} images=${images.length} filtered=${filteredImages.length}`);
 
-                // ★ 异步后台刷新：不阻塞用户，检查服务端是否有更新
-                if (!forceRefresh) {
-                    _refreshFolderCacheAsync(folderPath, normalizedFolder, signal, currentController);
+                    // ★ 异步后台刷新：不阻塞用户，检查服务端是否有更新
+                    if (!forceRefresh) {
+                        _refreshFolderCacheAsync(folderPath, normalizedFolder, signal, currentController);
+                    }
+                    return;
+                } catch (err) {
+                    // ★ 缓存命中渲染抛错（如含 %27/+ 等特殊字符路径在 applyCurrentFilter/sort
+                    //   中出问题）会静默失败 → 既不渲染也不触发 GetImages，表现为"不出图"。
+                    //   清掉过期缓存并回退到服务端加载，让 [GetImages] 重新拉取。
+                    console.error('[Gallery] 缓存命中渲染失败，回退服务端加载:', err.message, err);
+                    delete folderCacheMeta[normalizedFolder];
                 }
-                return;
             }
 
             // ★ 缓存未命中：显示 loading 并从服务端加载
+            trace('[filterByFolder] 缓存未命中 → showLoading(true) + 走服务端 GetImages folder=', normalizedFolder);
             showLoading(true);
             try {
                 // ★ 问题一修复：先清空图廊，避免显示旧内容
@@ -2526,7 +2715,10 @@ const Gallery = (() => {
                 }
 
                 console.log('[filterByFolder] 缓存未命中，调用 loadImagesFromServer:', normalizedFolder);
+                const _swRpcT0 = performance.now();
                 const firstResult = await loadImagesFromServer(folderPath, 0, FOLDER_FETCH_BATCH);
+                console.log(`[切换耗时] GetImages RPC: ${(performance.now() - _swRpcT0).toFixed(0)}ms returned=${firstResult.images.length} total=${firstResult.total} images=${images.length}`);
+                trace('[filterByFolder] GetImages 返回: returned=', firstResult.images.length, 'total=', firstResult.total, '返回耗时=', ((performance.now() - _swRpcT0).toFixed(0)) + 'ms');
 
                 // ★ 修复：await 返回后立即检查中断，避免被中断的旧文件夹请求
                 //   覆盖新文件夹的 folderLoadTotal/folderLoadOffset/folderCacheMeta，
@@ -2642,12 +2834,16 @@ const Gallery = (() => {
                     return;
                 }
 
+                const _swMergeT0 = performance.now();
                 applyCurrentFilter({ includeDescendants });
                 sortImages();
+                const _swMergeMs = performance.now() - _swMergeT0;
+                trace('[filterByFolder] 合并+过滤+排序完成 applyCurrentFilter+sortImages=', _swMergeMs.toFixed(0) + 'ms', 'displayImages=', (isFilteringActive ? filteredImages : images).length, 'images=', images.length, 'filtered=', filteredImages.length);
                 // 标记加载完成，防止同一次 scan 的 complete 事件触发重复刷新
                 if (Gallery._finishScanLoad) Gallery._finishScanLoad(currentFolderFilter);
 
                 const displayImages = isFilteringActive ? filteredImages : images;
+                const _swRenderT0 = performance.now();
                 if (displayImages.length > 100) {
                     if (currentLayout === 'masonry') {
                         renderMasonry(displayImages);
@@ -2656,12 +2852,20 @@ const Gallery = (() => {
                     } else if (currentLayout === 'list') {
                         renderList(displayImages);
                     } else {
-                        progressiveRender(displayImages);
+                        // ★ DOM/GC 优化：grid 布局用虚拟化 renderGrid(只渲染视口+缓冲行)，
+                        //   替代 progressiveRender(一次性创建全部卡片)。大文件夹下 progressiveRender
+                        //   会让 DOM 膨胀、GC 停顿加剧("用久变卡")。
+                        renderGrid(displayImages);
                     }
                 } else {
                     render();
                 }
-
+                const _swRenderMs = performance.now() - _swRenderT0;
+                console.log(`[切换耗时] 切换完成: ${normalizedFolder} 渲染后 displayImages=${displayImages.length} images=${images.length} filtered=${filteredImages.length} folderCacheMeta=${Object.keys(folderCacheMeta).length} | filter+sort=${_swMergeMs.toFixed(0)}ms render=${_swRenderMs.toFixed(0)}ms`);
+                trace('[filterByFolder] 渲染完成 render=', _swRenderMs.toFixed(0) + 'ms', 'displayImages=', displayImages.length, 'layout=', currentLayout);
+                if (displayImages.length === 0) {
+                    trace('[filterByFolder] 空视图! displayImages=0 但 images=', images.length, '→ 图廊会显示"加载中/无图"。诊断: currentFolder=', normalizedFolder);
+                }
             } finally {
                 showLoading(false);
                 // ★ 修复：使用闭包捕获的 currentController 判断是否是当前请求
@@ -2993,13 +3197,29 @@ const Gallery = (() => {
     // ★ 按 ID 去重：清理已存在的重复图片条目
     function _dedupImages(arr) {
         if (!Array.isArray(arr) || arr.length === 0) return arr;
+        // ★ DOM/GC 优化：绝大多数时候 images 已经去重(合并时会按 id 判重)。
+        //   旧实现无论有无重复都 `arr.filter` 重建整个数组 —— 大数组(数千张)每次
+        //   切换/渲染都分配一个新数组 + Set,长会话累积成 GC 停顿。这里只在实际
+        //   发现重复时才才新建数组;无重复直接复用原数组(零分配)。
         const seen = new Set();
-        return arr.filter(item => {
+        let changed = false;
+        for (let i = 0; i < arr.length; i++) {
+            const item = arr[i];
             const key = item.id || item.path;
-            if (!key || seen.has(key)) return false;
+            if (!key || seen.has(key)) { changed = true; continue; }
             seen.add(key);
-            return true;
-        });
+        }
+        if (!changed) return arr;
+        const out = [];
+        const seenOut = new Set();
+        for (let i = 0; i < arr.length; i++) {
+            const item = arr[i];
+            const key = item.id || item.path;
+            if (!key || seenOut.has(key)) continue;
+            seenOut.add(key);
+            out.push(item);
+        }
+        return out;
     }
     function render() {
         // ★ auto-dedup: remove duplicate entries by id/path
@@ -3008,6 +3228,21 @@ const Gallery = (() => {
         // ★ 内存优化：超上限时淘汰旧文件夹的服务端图片（保留当前/最近访问的文件夹）
         pruneImagesCache();
         const displayImages = isFilteringActive ? filteredImages : images;
+        if (displayImages.length === 0 && images.length > 0) {
+            // ★ 诊断：拿到了图但过滤后为 0 → 打印匹配信息，定位"数据没匹配上"还是"状态被覆盖"
+            const normF = (currentFolderFilter || '').replace(/\\/g, '/');
+            let matchCount = 0;
+            const samples = [];
+            for (let i = 0; i < images.length && samples.length < 3; i++) {
+                const im = images[i];
+                const ir = (im.rootId || im.rootPath || '').replace(/\\/g, '/');
+                const iff = (im.folder || '').replace(/\\/g, '/');
+                const fp = iff ? `${ir}/${iff}` : ir;
+                if (normF && (fp === normF || fp.startsWith(normF + '/'))) { matchCount++; }
+                else if (samples.length < 3) { samples.push({ root: ir, folder: iff, id: im.id, path: im.path }); }
+            }
+            console.warn(`[render] 空视图诊断: currentFolder=${JSON.stringify(normF)} images=${images.length} filtered=${filteredImages.length} 匹配=${matchCount} 不匹配样本=${JSON.stringify(samples)}`);
+        }
         console.log('[render] 被调用，displayImages.length:', displayImages.length, 'isFilteringActive:', isFilteringActive);
 
         // 渲染前刷新收藏缓存（异步，不阻塞渲染）
@@ -3655,6 +3890,7 @@ const Gallery = (() => {
             //   对于虚拟滚动，只有视窗附近的卡片才会被创建，因此直接加载是正确的
             img.src = imgData.thumbnailUrl;
             armThumbTimeout();
+            trace('[thumb] 图廊请求缩略图 id=', imgData.id, 'url=', imgData.thumbnailUrl, 'folder=', imgData.folder);
         } else {
             img.className = 'loading placeholder-loading';
             img.alt = imgData.name;

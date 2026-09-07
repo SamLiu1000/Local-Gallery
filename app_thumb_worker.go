@@ -17,6 +17,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -146,20 +147,35 @@ func (a *App) ensureThumbWorker() bool {
 }
 
 // killThumbWorker 杀死 worker 进程：OS 立即终止其在途的原图读取。
+// ★ 只 Kill 不 Wait：回收僵尸交给 ensureThumbWorker 里启动的那个后台
+//   reaper 协程执行（它负责 c.Wait() 并清理状态）。此处若再 Wait 会与
+//   reaper 对同一个 *exec.Cmd 并发调用 Wait——这是 go `exec` 的数据竞态，
+//   会造成 worker 状态错乱（`thumbWorkerCmd` 指向已死进程），随后
+//   ensureThumbWorker 误判存活、generateViaWorker 反复连一个死端口，
+//   导致缩略图生成长期失败/被取消。
+// thumbNoWorkerLastLog 限制"无存活 worker"日志频率：每次点击文件夹都会
+// 调用 killThumbWorker，而前台缩略图现走进程内直连(不依赖 worker)、pre-gen
+// 的 worker 又常为空闲/已死，导致无存活分支在每次切换时都刷屏，把真正的
+// [GetImages] 日志淹没、误导用户以为"没在处理当前文件夹"。限流后仍能看到
+// 此信息(便于诊断)，但不再每条切换都打。
+var thumbNoWorkerLastLog time.Time
+
 func (a *App) killThumbWorker() {
 	thumbWorkerMu.Lock()
-	defer thumbWorkerMu.Unlock()
 	if thumbWorkerCmd != nil && thumbWorkerCmd.Process != nil {
 		fmt.Printf("[缩略图worker] 杀进程 pid=%d\n", thumbWorkerCmd.Process.Pid)
 		_ = thumbWorkerCmd.Process.Kill()
-		_ = thumbWorkerCmd.Wait() // 回收僵尸
+		thumbWorkerCmd = nil
+		thumbWorkerPort = ""
 	} else {
-		// ★ 诊断关键：无 worker 可杀 = worker 从未 spawn 或已退出，
-		//   说明生成在走主进程 inline 回退（那 kill 机制就没生效）
-		fmt.Println("[缩略图worker] kill 时无存活 worker（生成可能走主进程 inline 回退）")
+		// 无 worker 可杀 = worker 从未 spawn 或已退出（前台缩略图走主进程
+		// inline 回退，本就无需 worker）。属正常状态，故限流，避免刷屏。
+		if time.Since(thumbNoWorkerLastLog) > 5*time.Second {
+			thumbNoWorkerLastLog = time.Now()
+			fmt.Println("[缩略图worker] kill 时无存活 worker（正常：前台缩略图走主进程 inline 回退）")
+		}
 	}
-	thumbWorkerCmd = nil
-	thumbWorkerPort = ""
+	thumbWorkerMu.Unlock()
 }
 
 // generateViaWorker 优先经 worker 进程生成缩略图字节。
@@ -179,25 +195,45 @@ func (a *App) generateViaWorker(srcPath string) ([]byte, error) {
 		"maxSize": thumbMaxSize,
 		"quality": thumbJPEGQuality,
 	})
-	client := &http.Client{Timeout: 120 * time.Second}
-	// ★ 重试几次：覆盖 worker 刚 spawn 尚未就绪（vips 初始化）的窗口；
-	//   连续失败则清状态，让下次调用重新拉起。
+	// ★ 关键：超时必须短。worker 线程池被一个慢图占满时，/gen 会一直不返回，
+	//   旧值 120s=2 分钟会让当前文件夹的所有缩略图请求整体挂 2 分钟（每个还占一个
+	//   thumbSem 槽位），表现为"一直加载中不出图"。降到 20s：超时立即走主进程
+	//   内联回退（内联用独立的 vips，不受 worker 阻塞），缩略图不会等 2 分钟。
+	client := &http.Client{Timeout: 20 * time.Second}
+	// ★ 分三种情况，避免盲目重试/杀进程：
+	//   - HTTP 非 200（如 500）：worker 活着，是这张图本身生成失败 → 交给内联重试，
+	//     不杀 worker（杀了也只是再报一次同样的错）。
+	//   - 超时：worker 卡住/忙 → 交给内联回退，并重置 worker（下次重新 spawn 一个干净的）。
+	//   - 连接被拒/重置：worker 刚 spawn 尚未就绪（vips 初始化）→ 重试覆盖启动窗口；
+	//     耗尽仍是连接错误 → 清状态，下次调用重新 spawn。
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		resp, err := client.Post("http://127.0.0.1:"+port+"/gen", "application/json", bytes.NewReader(payload))
-		if err == nil {
-			if resp.StatusCode == http.StatusOK {
-				data, readErr := io.ReadAll(resp.Body)
-				resp.Body.Close()
-				return data, readErr
-			}
-			lastErr = fmt.Errorf("worker 生成失败: HTTP %d", resp.StatusCode)
-			resp.Body.Close()
-		} else {
+		if err != nil {
 			lastErr = err
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				break // 超时=worker 忙/卡：交给内联回退并重置 worker
+			}
+			time.Sleep(200 * time.Millisecond)
+			continue // 连接错误=启动窗口：重试
 		}
-		time.Sleep(150 * time.Millisecond)
+		if resp.StatusCode == http.StatusOK {
+			data, readErr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return data, readErr
+		}
+		lastErr = fmt.Errorf("worker 生成失败: HTTP %d", resp.StatusCode)
+		resp.Body.Close()
+		break // worker 活着但这张图失败 → 内联回退，不杀 worker
 	}
-	a.killThumbWorker() // 清掉失效 worker，下次调用重新 spawn
+	if lastErr != nil {
+		// 只对"网络层错误"重置 worker（连接被拒=worker 死/未就绪；超时=worker 卡住）。
+		// HTTP 4xx/5xx 是图片本身的问题（fmt.Errorf，非 net.Error）→ 不动 worker。
+		var ne net.Error
+		if errors.As(lastErr, &ne) {
+			a.killThumbWorker()
+		}
+	}
 	return nil, lastErr
 }

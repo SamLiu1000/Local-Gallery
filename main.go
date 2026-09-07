@@ -111,6 +111,7 @@ func main() {
 
 	// 创建 App 实例
 	app := NewApp(userDataDir, defaultUserDataDir)
+	app.InitDebugSwitchLog()
 	logStartupf("NewApp 完成")
 
 	// 创建 Wails 应用

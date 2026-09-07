@@ -199,6 +199,7 @@ const Sidebar = (() => {
 
     // ★ 修复：refreshFolderTree 全局锁，防止并发调用导致 DOM 竞态覆写
     let isFolderTreeRefreshing = false;
+    let _folderTreeRefreshQueued = false; // 若刷新在跑时又收到请求，标记待执行，跑完再刷新一次
 
     // ★ 展开状态：单一真相来源（内存 Map），启动时一次性加载，之后不走存储
     let expandedStateCache = null;      // Map<path, boolean>
@@ -942,8 +943,15 @@ const Sidebar = (() => {
     }
 
     async function doRefreshFolderTree(options = {}) {
-        if (isFolderTreeRefreshing) return;
+        if (isFolderTreeRefreshing) {
+            // ★ 在跑的刷新还没结束：不丢弃本次请求，结束后补跑一次，
+            //   否则导入完成时的刷新会被正在跑的（可能拿到不完整子目录）刷新吞掉，
+            //   表现为"子文件夹展开图标一直不出现，要刷新页面才有"。
+            _folderTreeRefreshQueued = true;
+            return;
+        }
         isFolderTreeRefreshing = true;
+        _folderTreeRefreshQueued = false;
         const requestId = ++currentRefreshId; // ★ 请求序号，旧请求结果丢弃
         try {
             // ★ 并行启动：展开状态加载 + 后端文件夹树拉取（互不依赖）
@@ -1031,6 +1039,11 @@ const Sidebar = (() => {
             console.error('[Sidebar] 刷新文件夹树失败:', err);
         } finally {
             isFolderTreeRefreshing = false;
+            // ★ 若刷新期间又来了请求（如 scan:complete），补跑一次，确保最新的子树结构被渲染
+            if (_folderTreeRefreshQueued) {
+                _folderTreeRefreshQueued = false;
+                doRefreshFolderTree(options);
+            }
         }
     }
 
@@ -2298,6 +2311,10 @@ const Sidebar = (() => {
                     });
                 }
 
+                // ★ 新导入的根默认折叠，不自动展开：用户手动点击才展开子文件夹子树。
+                //   写入展开缓存为 false，避免刷新后 applyExpandedStates 把它当"无状态"误处理。
+                if (expandedStateCache) expandedStateCache.set(folderPath, false);
+
                 const normalizedNew = folderPath.replace(/\\/g, '/').toLowerCase();
                 if (!folderRoots.some(r => (r.path || '').replace(/\\/g, '/').toLowerCase() === normalizedNew)) {
                     folderRoots.push({
@@ -2305,7 +2322,7 @@ const Sidebar = (() => {
                         path: folderPath,
                         displayPath: folderPath,
                         displayName: folderName,
-                        expanded: true,
+                        expanded: false,
                         imageCount: 0,
                         thumbCount: 0,
                         isRoot: true,
@@ -2403,8 +2420,11 @@ const Sidebar = (() => {
             let ok = false;
             if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails()) {
                 try {
-                    await WailsBridge.removeFolder(path);
-                    ok = true;
+                    // ★ 检查 result.success：后端 RemoveFolder 可能因路径匹配失败而没真正删除，
+                    //   不能只看 RPC 是否抛错。否则 removeImportedRoot→saveRootsWithMeta 会把
+                    //   仍在 registeredRoots 里的这个文件夹“保留/重写”回去，导致永远删不掉。
+                    const result = await WailsBridge.removeFolder(path);
+                    ok = !!(result && result.success);
                 } catch (err) {
                     console.warn('[Sidebar] Wails 移除文件夹失败:', err.message);
                 }
@@ -2463,8 +2483,11 @@ const Sidebar = (() => {
      */
     function pollScanProgress(folderPath, folderName) {
         const normalizedTarget = (folderPath || '').replace(/\\/g, '/').toLowerCase();
-        const maxWait = 120000;
         const interval = 800;
+        // ★ 去掉 2 分钟轮询上限：大文件夹在慢盘上扫描可能远超 2 分钟，
+        //   轮询改为一直持续到收到 scan:complete（或目标文件夹被移除）为止。
+        //   只剩一个防循环兜底时间（2 小时），正常场景由 scan:complete 结束。
+        const maxWait = 2 * 60 * 60 * 1000;
         const startTime = Date.now();
         let lastCount = -1;
         let stableRounds = 0;
@@ -2500,6 +2523,19 @@ const Sidebar = (() => {
             }
         }
 
+        // ★ 目标文件夹是否仍在侧栏树中（用户若删除了该导入项，则停止轮询）
+        function targetStillExists() {
+            function find(nodes) {
+                for (const node of nodes) {
+                    const p = (node.path || '').replace(/\\/g, '/').toLowerCase();
+                    if (p === normalizedTarget) return true;
+                    if (node.children && node.children.length > 0 && find(node.children)) return true;
+                }
+                return false;
+            }
+            return find(folderRoots);
+        }
+
         function finishPoll(count) {
             if (count >= 0) updateLocalCount(count);
             updateDOMCount(count);
@@ -2511,9 +2547,14 @@ const Sidebar = (() => {
         }
 
         async function poll() {
+            // ★ 目标文件夹已被移除（用户删了导入项）→ 停止轮询
+            if (!targetStillExists()) {
+                cleanupEvent();
+                return;
+            }
             if (Date.now() - startTime > maxWait) {
-                console.warn('[Sidebar] 扫描轮询超时:', folderPath);
-                // 超时时做最后一次 getFolderCount 尝试
+                console.warn('[Sidebar] 扫描轮询超时(兜底):', folderPath);
+                // 超时兜底：只做最后一次 getFolderCount 尝试并退出，避免无限 poll
                 try {
                     if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails()) {
                         const finalCount = await WailsBridge.getFolderCount(folderPath);
@@ -2524,11 +2565,13 @@ const Sidebar = (() => {
                                 if (Gallery._beginScanLoad) Gallery._beginScanLoad(folderPath);
                                 await Gallery.filterByFolder(folderPath, folderName);
                             }
+                            cleanupEvent();
                             return;
                         }
                     }
                 } catch (e) { /* ignore */ }
                 await refreshFolderTree();
+                cleanupEvent();
                 return;
             }
 
@@ -2546,12 +2589,14 @@ const Sidebar = (() => {
                                 await Gallery.filterByFolder(folderPath, folderName);
                             }
                             console.log('[Sidebar] 扫描完成 (scan:complete):', folderPath, count, '张图片');
+                            cleanupEvent();
                             return;
                         }
                     }
                 } catch (e) { /* ignore */ }
                 // 如果 getFolderCount 失败，回退到整树刷新
                 await refreshFolderTree();
+                cleanupEvent();
                 return;
             }
 
@@ -2611,13 +2656,8 @@ const Sidebar = (() => {
                 onScanComplete = null;
             }
         };
-        const origPoll = poll;
-        poll = async function() {
-            const result = await origPoll();
-            cleanupEvent();
-            return result;
-        };
-
+        // ★ 移除每次迭代后都 cleanupEvent 的包装：那样会在第一轮就移除 scan:complete 监听，
+        //   导致"等 scan:complete 才结束"失效。改为在各退出点（scan:complete/超时/文件夹被删）主动清理。
         setTimeout(poll, 500);
     }
 

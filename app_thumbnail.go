@@ -33,6 +33,21 @@ var (
 	thumbSemMu    sync.RWMutex
 	thumbSem      = make(chan struct{}, max(goruntime.NumCPU(), 2))
 	thumbSemSize  = int32(max(goruntime.NumCPU(), 2))
+
+	// onDemandSem 前台按需缩略图专用的并发限流，与后台预生成的 thumbSem 分开。
+	// ★ 关键：图廊缩略图走 /thumb(serveThumbnail 内联生成)，而预览大图走 /image
+	//   (enqueueHighWait，无限流)。若 on-demand 也去抢后台预生成的 thumbSem，
+	//   一旦它被调到很小(如 2，为后台让路)，前台图廊缩略图就卡在低并发→空白，
+	//   而预览依旧 HIGH 优先飞快——表现为"预览能出图、图廊不出图"。
+	//   单独一个更宽松的预算(max(4,CPU)，上限≈12=浏览器连接池)让前台快速出图，
+	//   后台预生成仍用 thumbSem 限流、互不干扰。onDemandActive 已使预生成让位，
+	//   两者不会叠加超订阅主进程 vips。
+	onDemandSem = make(chan struct{}, onDemandSemBudget())
+
+	// ★ onDemandActive：是否有前台按需缩略图生成正在进行（正读原图）。
+	//   自动预生成据此让出磁盘——用户点击/浏览文件夹时，on-demand 优先获得
+	//   磁盘读原图，预生成暂停，避免大批量导入时前台点击被子文件夹缩略图排队拖慢。
+	onDemandActive int32
 )
 
 var thumbBucket = []byte("thumbs")
@@ -103,6 +118,26 @@ func thumbSemAcquire() func() {
 	thumbSemMu.RUnlock()
 	sem <- struct{}{}
 	return func() { <-sem }
+}
+
+// onDemandSemBudget 前台按需缩略图并发预算：至少 4，随 CPU 提升，封顶 12(≈浏览器连接池)。
+//  前台浏览必须"快"，不能像后台预生成那样被压到很小并发。
+func onDemandSemBudget() int {
+	n := goruntime.NumCPU()
+	if n < 4 {
+		n = 4
+	}
+	if n > 12 {
+		n = 12
+	}
+	return n
+}
+
+// onDemandSemAcquire 获取前台 on-demand 专用信号量，返回释放函数。
+//  不参与后台预生成的 thumbSem，前台图廊缩略图因此不被后台并发预算卡住。
+func onDemandSemAcquire() func() {
+	onDemandSem <- struct{}{}
+	return func() { <-onDemandSem }
 }
 
 // ==================== 全局设置（独立于用户数据目录） ====================
@@ -329,7 +364,13 @@ func (a *App) generateThumbnail(srcPath string, imageID string) error {
 		if fk := a.imageFolderKey(srcPath); fk != "" && isFolderAbandoned(fk) {
 			return fmt.Errorf("文件夹已切换，取消缩略图生成: %s", imageID)
 		}
+		// ★ 内联回退必须走 thumbSem 限流：worker 死时预生成全部落到主进程内联，
+		//   若不限流会和前台 on-demand 一起超订阅主进程 vips 线程池/磁盘 → 每张都慢、
+		//   图廊靠后卡片在浏览器超时窗口内等不到 → Load failed（表现为"没出图要刷新"）。
+		//   限流后总并发=CPU 核数，且 pre-gen 会在 on-demand 浏览时让出槽位（浏览优先）。
+		release := thumbSemAcquire()
 		jpegBytes, err = generateThumbnailBytes(srcPath, thumbMaxSize, thumbJPEGQuality)
+		release()
 		if err != nil {
 			a.markThumbFailed(imageID)
 			return fmt.Errorf("缩略图生成失败: %w", err)
@@ -503,6 +544,7 @@ func isImageByMagic(filePath string) bool {
 
 // serveThumbnail 从 BoltDB 读取缩略图 JPEG 字节；如不存在则生成
 func (a *App) serveThumbnail(imageID string) ([]byte, error) {
+	debugSwitchf("[thumb] serveThumbnail 进入: id=%s", imageID)
 	imagePath := a.resolveImagePath(imageID)
 	if imagePath == "" {
 		a.markThumbFailed(imageID)
@@ -516,6 +558,7 @@ func (a *App) serveThumbnail(imageID string) ([]byte, error) {
 	// ★ 内存缓存优先：命中直接返回，不再触发内核从 12GB bbolt(mmap) 换页
 	//   （削减 Task Manager 里 System 进程的疯狂读盘）
 	if cached := thumbMemGet(imageID); cached != nil {
+		debugSwitchf("[thumb] 内存缓存命中: id=%s", imageID)
 		return cached, nil
 	}
 
@@ -577,6 +620,7 @@ func (a *App) serveThumbnail(imageID string) ([]byte, error) {
 			if len(jpegBytes) == 1 && jpegBytes[0] == 0 {
 				return nil, fmt.Errorf("缩略图不可用: %s", imageID)
 			}
+			debugSwitchf("[thumb] bbolt 双重检查命中: id=%s", imageID)
 			return jpegBytes, nil
 		}
 	}
@@ -588,17 +632,49 @@ func (a *App) serveThumbnail(imageID string) ([]byte, error) {
 		return nil, fmt.Errorf("文件夹已切换，取消缩略图生成: %s", imageID)
 	}
 
+	debugSwitchf("[thumb] 未命中, 排队生成: id=%s", imageID)
+
 	// ★ 低优先级队列：大图读取（HIGH）永远先于缩略图生成（LOW）被调度，
 	//   查看大图不会被排队的缩略图任务拖住。并发仍由 thumbSem 控制
 	//   （任务内部 acquire），并发设置语义不变。
 	var jpegBytes []byte
 	var genErr error
+	// ★ 浏览优先(before-semaphore)：在排队/抢 thumbSem 槽位之前就置 on-demand 标志。
+	//   自动预生成 worker 循环的任务开头检查 onDemandActive(见 auto pre-gen 循环)，
+	//   看到即让出磁盘与信号量。若等到拿到 thumbSem 槽位才置 1，on-demand 会在信号量
+	//   上干等——而点击文件夹时 AbandonFolder 杀掉了 worker，预生成的 generateThumbnail
+	//   退化为内联回退、正占着 thumbSem 槽位，于是前台点击迟迟不 thumbnailing、
+	//   等预生成腾位后一次性爆发。前置标志让预生成立即让路，当前文件夹优先生成。
+	atomic.AddInt32(&onDemandActive, 1)
 	enqueueLowWait(func() {
-		// 信号量限制并发数
-		release := thumbSemAcquire()
+		// ★ 无论正常完成还是中途 return(如文件夹已切走)都释放 on-demand 标志。
+		defer atomic.AddInt32(&onDemandActive, -1)
+
+		// ★ 前台 on-demand 用独立信号量(而非后台预生成的 thumbSem)：图廊缩略图
+		//   必须快速生成，否则预览(/image,HIGH)飞快而图廊(/thumb)空白——
+		//   "预览能出图、图廊不出图"就是这个机制。预算见 onDemandSemBudget()。
+		tSem0 := time.Now()
+		release := onDemandSemAcquire()
+		debugSwitchf("[thumb] 拿到 on-demand 信号量: id=%s 等待=%.1fms", imageID, time.Since(tSem0).Seconds()*1000)
 		defer release()
 
-		if err := a.generateThumbnail(imagePath, imageID); err != nil {
+		// ★ 双重检查：排队到执行前用户可能已切走 → 仍放弃，不读原图。
+		if fk := a.imageFolderKey(imagePath); fk != "" && isFolderAbandoned(fk) {
+			genErr = fmt.Errorf("文件夹已切换，取消缩略图生成: %s", imageID)
+			return
+		}
+
+		// ★ 前台按需生成走 generateThumbnail(优先 worker 进程、失败才内联回退)：
+		//   worker 化后主进程不再被每张 130-183ms 的内联 libvips 生成占满——
+		//   "点击文件夹慢"的根因就是主进程忙于给视口几十张大图现场生成缩略图，
+		//   导致同一主进程里的 GetImages/UI 全被拖慢。生成挪到 worker 后主进程
+		//   只发请求、等字节，点击/查询恢复流畅。worker 不可用(刚被杀/初始化中)
+		//   时退回主进程内联，保证前台不失败。
+		//   (on-demand 标志已在上方入队前置位，让自动预生成循环让出 worker/磁盘。)
+		tGen0 := time.Now()
+		err := a.generateThumbnail(imagePath, imageID)
+		debugSwitchf("[thumb] 生成完成: id=%s err=%v 耗时=%.1fms", imageID, err, time.Since(tGen0).Seconds()*1000)
+		if err != nil {
 			fmt.Printf("[缩略图] 生成失败 %s: %v\n", imageID, err)
 			a.markThumbFailed(imageID)
 			genErr = err
@@ -826,6 +902,18 @@ func (a *App) runPreGen(folder string, entries []*ImageEntry) {
 				default:
 				}
 
+				// ★ 浏览优先：on-demand 正在生成时，runPreGen 也让出磁盘/信号量，
+				//   与 auto pre-gen 循环(检查 onDemandActive)保持一致。否则若 worker
+				//   已死(点击切换被 AbandonFolder 杀掉)，generateThumbnail 在此退化为
+				//   内联回退、占着 thumbSem，前台点击的缩略图会被本预生成挡住干等。
+				for atomic.LoadInt32(&onDemandActive) > 0 {
+					select {
+					case <-preGenCancel:
+						return
+					case <-time.After(200 * time.Millisecond):
+					}
+				}
+
 				// 跳过已有缓存
 				if a.thumbDB != nil {
 					hasCache := false
@@ -991,6 +1079,16 @@ func (a *App) triggerAutoPreGen(label string, entries []*ImageEntry) {
 						continue
 					}
 				}
+				// ★ 浏览优先：用户正在点击/浏览文件夹时，on-demand 正在读原图做缩略图，
+				//   自动预生成让出磁盘（否则大批量导入时磁盘被占满，前台点击排队）。
+				//   等 on-demand 读原图告一段落再继续，且随时响应取消。
+				for atomic.LoadInt32(&onDemandActive) > 0 {
+					select {
+					case <-cancel:
+						return
+					case <-time.After(200 * time.Millisecond):
+					}
+				}
 				muI, _ := thumbGenLocks.LoadOrStore(e.ID, &sync.Mutex{})
 				mu := muI.(*sync.Mutex)
 				mu.Lock()
@@ -1045,7 +1143,12 @@ var (
 //   之前用 5 秒过期，导致切换后 5 秒生成又恢复读原图——用户看到的"没停"就是它。
 
 // AbandonFolder 前端在离开某文件夹（切换视图）时调用：记录为"已遗弃"。
-// ★ 同时杀掉缩略图生成 worker 进程——OS 立即终止其在途的原图读取（等效"关闭程序"）。
+// ★ 不再杀 worker 进程：此前"每次切换都 killThumbWorker"会在用户快速切文件夹时
+//   反复杀掉/重生 worker（重生含 vips 初始化停滞），且前台 on-demand 现走 worker
+//   生成——杀 worker 等于把当前文件夹的缩略图生成打断。遗弃保护由调用方的
+//   isFolderAbandoned 判断承担（on-demand / 自动预生成在发任务前都会检查并跳过，
+//   worker 只是"生成字节"的无状态进程，不知道也无需知道文件夹归属）。
+//   在途的原图读取最多完成当前 1 个任务即空闲，不会持续读被遗弃文件夹。
 func (a *App) AbandonFolder(folderPath string) {
 	if folderPath == "" {
 		return
@@ -1054,8 +1157,6 @@ func (a *App) AbandonFolder(folderPath string) {
 	abandonedFoldersMu.Lock()
 	abandonedFolders[key] = time.Now().UnixMilli()
 	abandonedFoldersMu.Unlock()
-	// ★ kill worker：在途的原图读取立即终止
-	a.killThumbWorker()
 }
 
 // FocusFolder 前端进入某文件夹时调用：从遗弃集合移除该文件夹及其所有祖先，

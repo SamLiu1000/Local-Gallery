@@ -54,6 +54,14 @@ export function DebugScanRoot(arg1) {
   return window['go']['main']['App']['DebugScanRoot'](arg1);
 }
 
+export function DebugSwitchLog(arg1) {
+  return window['go']['main']['App']['DebugSwitchLog'](arg1);
+}
+
+export function DebugSwitchLogBatch(arg1) {
+  return window['go']['main']['App']['DebugSwitchLogBatch'](arg1);
+}
+
 export function DeletePromptVersion(arg1) {
   return window['go']['main']['App']['DeletePromptVersion'](arg1);
 }
@@ -212,6 +220,10 @@ export function ImportPromptVersions(arg1) {
 
 export function IndexRoot(arg1) {
   return window['go']['main']['App']['IndexRoot'](arg1);
+}
+
+export function InitDebugSwitchLog() {
+  return window['go']['main']['App']['InitDebugSwitchLog']();
 }
 
 export function IsFavorite(arg1) {

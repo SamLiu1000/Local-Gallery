@@ -212,11 +212,16 @@ func (a *App) loadFolderIndexLight() {
 	}
 	// ★ 冷启动优化：优先读取上次保存的轻量索引快照（小 JSON，毫秒级），
 	//   避免对 4.5GB 的 images.db 做 GROUP BY 全量统计（冷缓存下实测 2-10s）。
-	//   快照在每次扫描/刷新后由 rebuildFolderCountsFromSQLLocked 同步更新，保证不过期。
-	if entries, ok := a.loadFolderIndexLightCache(); ok {
+	//   快照在每次扫描/刷新后由 rebuildFolderCountsFromSQLLocked 同步更新。
+	// ★ 但快照可能过期：若导入/重扫没写完就重启（或 saveFolderIndexLight 写失败），
+	//   快照是旧数据，新导入的根不在里面 → 重启后该文件夹 count 显示 0。
+	//   因此必须验证快照覆盖了所有已注册根：缺任一根 → 视为过期，回退 SQL 重查。
+	if entries, ok := a.loadFolderIndexLightCache(); ok && a.folderIndexLightCoversAllRoots(entries) {
 		a.populateFolderIndexFromEntries(entries)
 		fmt.Printf("[缓存] 轻量索引从快照就绪: %d 个文件夹\n", len(a.folderIndex))
 		return
+	} else if ok {
+		fmt.Printf("[缓存] 轻量索引快照过期（未覆盖全部已注册根），回退 SQL 重建\n")
 	}
 	entries, err := a.imageDB.LoadFolderIndexLight()
 	if err != nil {
@@ -231,6 +236,29 @@ func (a *App) loadFolderIndexLight() {
 	a.populateFolderIndexFromEntries(entries)
 	a.saveFolderIndexLight(entries) // ★ 写快照，供下次冷启动直接读取
 	fmt.Printf("[缓存] 轻量索引就绪: %d 个文件夹\n", len(a.folderIndex))
+}
+
+// folderIndexLightCoversAllRoots 检查轻量索引快照是否覆盖所有已注册根目录。
+// 若某个已注册根不在快照里，说明快照是"导入/扫描完成前"保存的过期数据——此时
+// image_cache 里该根可能已有新图片（只是快照没更新），若直接用旧快照会把它的
+// count 显示成 0。返回 false 则调用方应回退 SQL 重查并重写快照。
+func (a *App) folderIndexLightCoversAllRoots(entries []database.ImageCacheEntry) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if len(a.registeredRoots) == 0 {
+		return true
+	}
+	covered := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		covered[strings.ToLower(strings.ReplaceAll(e.RootPath, "\\", "/"))] = true
+	}
+	for root := range a.registeredRoots {
+		norm := strings.ToLower(strings.ReplaceAll(root, "\\", "/"))
+		if norm != "" && !covered[norm] {
+			return false
+		}
+	}
+	return true
 }
 
 // populateFolderIndexFromEntries 用 LoadFolderIndexLight 返回的条目重建轻量索引结构：

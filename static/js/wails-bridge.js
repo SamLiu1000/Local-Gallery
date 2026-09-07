@@ -118,6 +118,17 @@ const WailsBridge = (() => {
         } catch (e) { console.warn('[worker] 通知聚焦失败:', e.message); }
     }
 
+    // ★ debug：把前端"文件夹切换"每一步写入 user/debug-switch.log（由 Go 侧落盘）。
+    //   非 Wails(纯浏览器)环境直接丢弃，避免抛错。
+    function debugSwitchLog(msg) {
+        if (!isWailsEnv) return;
+        try { getApp().DebugSwitchLog(String(msg)); } catch (e) {}
+    }
+    function debugSwitchLogBatch(lines) {
+        if (!isWailsEnv || !Array.isArray(lines) || lines.length === 0) return;
+        try { getApp().DebugSwitchLogBatch(lines.map(String)); } catch (e) {}
+    }
+
     async function removeFolder(path) {
         if (!isWailsEnv) {
             const response = await fetch('/api/remove-folder', {
@@ -1113,6 +1124,8 @@ const WailsBridge = (() => {
         refreshFolder,
         abandonFolder,
         focusFolder,
+        debugSwitchLog,
+        debugSwitchLogBatch,
         getImages,
         getImagesByPaths,
         getFolders,

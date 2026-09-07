@@ -1175,8 +1175,8 @@ func (idb *ImageDB) SaveImageCacheByRoot(rootPath string, entries []ImageCacheEn
 
 // LoadAllImageCache 加载全部图片缓存
 func (idb *ImageDB) LoadAllImageCache() ([]ImageCacheEntry, error) {
-	idb.mu.Lock()
-	defer idb.mu.Unlock()
+	idb.mu.RLock()
+	defer idb.mu.RUnlock()
 	rows, err := idb.db.Query(`SELECT id, path, name, size, last_modified, created_at,
 		folder, root_path, width, height, is_video FROM image_cache`)
 	if err != nil {
@@ -1200,8 +1200,8 @@ func (idb *ImageDB) LoadAllImageCache() ([]ImageCacheEntry, error) {
 // LoadFolderIndexLight 仅加载文件夹列表与计数（不读图片详情）。
 // 返回的 entry 仅填充 RootPath/Folder；Size 字段复用为 COUNT(*)。
 func (idb *ImageDB) LoadFolderIndexLight() ([]ImageCacheEntry, error) {
-	idb.mu.Lock()
-	defer idb.mu.Unlock()
+	idb.mu.RLock()
+	defer idb.mu.RUnlock()
 	rows, err := idb.db.Query(`SELECT root_path, folder, COUNT(*) FROM image_cache GROUP BY root_path, folder`)
 	if err != nil {
 		return nil, err
@@ -1220,8 +1220,8 @@ func (idb *ImageDB) LoadFolderIndexLight() ([]ImageCacheEntry, error) {
 
 // LoadImageCacheByFolder 按根目录+相对文件夹精确加载。folder="" 表示根目录直接子文件。
 func (idb *ImageDB) LoadImageCacheByFolder(rootPath, folder string) ([]ImageCacheEntry, error) {
-	idb.mu.Lock()
-	defer idb.mu.Unlock()
+	idb.mu.RLock()
+	defer idb.mu.RUnlock()
 	rows, err := idb.db.Query(`SELECT id, path, name, size, last_modified, created_at,
 		folder, root_path, width, height, is_video FROM image_cache WHERE root_path=? AND folder=?`, rootPath, folder)
 	if err != nil {
@@ -1244,8 +1244,8 @@ func (idb *ImageDB) LoadImageCacheByFolder(rootPath, folder string) ([]ImageCach
 
 // CountImagesByFolder 统计某根目录+相对文件夹下的直接图片数（侧边栏预览确定性选取用）
 func (idb *ImageDB) CountImagesByFolder(rootPath, folder string) (int, error) {
-	idb.mu.Lock()
-	defer idb.mu.Unlock()
+	idb.mu.RLock()
+	defer idb.mu.RUnlock()
 	var n int
 	err := idb.db.QueryRow(`SELECT COUNT(*) FROM image_cache WHERE root_path=? AND folder=?`, rootPath, folder).Scan(&n)
 	return n, err
@@ -1253,8 +1253,8 @@ func (idb *ImageDB) CountImagesByFolder(rootPath, folder string) (int, error) {
 
 // GetImageByFolderOffset 按 ORDER BY id 分页取某文件夹直接图片的 ID、修改时间与路径（侧边栏预览用，LIMIT 1 开销极低）
 func (idb *ImageDB) GetImageByFolderOffset(rootPath, folder string, offset int) (string, int64, string, error) {
-	idb.mu.Lock()
-	defer idb.mu.Unlock()
+	idb.mu.RLock()
+	defer idb.mu.RUnlock()
 	var id string
 	var lm int64
 	var p string
@@ -1265,8 +1265,8 @@ func (idb *ImageDB) GetImageByFolderOffset(rootPath, folder string, offset int) 
 
 // LoadImageCacheByRoot 加载整个根目录所有子文件夹的图片。
 func (idb *ImageDB) LoadImageCacheByRoot(rootPath string) ([]ImageCacheEntry, error) {
-	idb.mu.Lock()
-	defer idb.mu.Unlock()
+	idb.mu.RLock()
+	defer idb.mu.RUnlock()
 	rows, err := idb.db.Query(`SELECT id, path, name, size, last_modified, created_at,
 		folder, root_path, width, height, is_video FROM image_cache WHERE root_path=?`, rootPath)
 	if err != nil {
@@ -1298,8 +1298,8 @@ func (idb *ImageDB) LoadImageCacheByRoot(rootPath string) ([]ImageCacheEntry, er
 //	把全部同名变体文件夹的记录都查回来（如 Imageye 重复下载的 18 个文件夹合成上千条），
 //	而前端过滤按 "folder + /" 精确匹配又排除变体 → 图廊空、计数与图量对不上。
 func (idb *ImageDB) LoadImageCacheByPathPrefixPaged(pathPrefix string, offset, limit int, sortOrder string) ([]ImageCacheEntry, int, error) {
-	idb.mu.Lock()
-	defer idb.mu.Unlock()
+	idb.mu.RLock()
+	defer idb.mu.RUnlock()
 	if limit <= 0 {
 		limit = 500
 	}
@@ -1342,8 +1342,8 @@ func (idb *ImageDB) LoadImageCacheByPathPrefixPaged(pathPrefix string, offset, l
 //
 //	避免把"名称是前缀延伸"的兄弟文件夹（如 "A (1)" 之于 "A"）误算进来（P+\uFFFF 上界会误吞）。
 func (idb *ImageDB) LoadImageCacheIDsUnderPath(folderPath string) ([]string, error) {
-	idb.mu.Lock()
-	defer idb.mu.Unlock()
+	idb.mu.RLock()
+	defer idb.mu.RUnlock()
 	lower := strings.ReplaceAll(folderPath, "/", "\\") + "\\"
 	upper := lower + "\uFFFF"
 	rows, err := idb.db.Query(`SELECT id FROM image_cache WHERE path >= ? AND path < ?`, lower, upper)
@@ -1389,8 +1389,8 @@ func imageCacheOrderBy(sortOrder string) string {
 
 // LoadImageCacheByFolderTreePaged 按根目录+相对文件夹前缀分页加载文件夹树图片。
 func (idb *ImageDB) LoadImageCacheByFolderTreePaged(rootPath, folder string, offset, limit int, sortOrder string) ([]ImageCacheEntry, int, error) {
-	idb.mu.Lock()
-	defer idb.mu.Unlock()
+	idb.mu.RLock()
+	defer idb.mu.RUnlock()
 	if limit <= 0 {
 		limit = 500
 	}
@@ -1430,8 +1430,8 @@ func (idb *ImageDB) LoadImageCacheByFolderTreePaged(rootPath, folder string, off
 
 // LoadImageCachePaged 按 offset/limit 分页加载全部图片（folder="" 时用）。
 func (idb *ImageDB) LoadImageCachePaged(offset, limit int, sortOrder string) ([]ImageCacheEntry, error) {
-	idb.mu.Lock()
-	defer idb.mu.Unlock()
+	idb.mu.RLock()
+	defer idb.mu.RUnlock()
 	query := `SELECT id, path, name, size, last_modified, created_at,
 		folder, root_path, width, height, is_video FROM image_cache ORDER BY ` + imageCacheOrderBy(sortOrder) + ` LIMIT ? OFFSET ?`
 	rows, err := idb.db.Query(query, limit, offset)
@@ -1455,8 +1455,8 @@ func (idb *ImageDB) LoadImageCachePaged(offset, limit int, sortOrder string) ([]
 
 // GetImageEntry 单点查询某 imageID（推广 resolveImagePath 回退模式）。
 func (idb *ImageDB) GetImageEntry(id string) (*ImageCacheEntry, error) {
-	idb.mu.Lock()
-	defer idb.mu.Unlock()
+	idb.mu.RLock()
+	defer idb.mu.RUnlock()
 	var e ImageCacheEntry
 	var isVideo int
 	err := idb.db.QueryRow(`SELECT id, path, name, size, last_modified, created_at,
