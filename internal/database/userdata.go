@@ -223,9 +223,12 @@ func (udb *UserDataDB) RemoveRoot(path string) error {
 	udb.mu.Lock()
 	defer udb.mu.Unlock()
 
-	_, err := udb.db.Exec("DELETE FROM imported_roots WHERE path = ?", path)
+	res, err := udb.db.Exec("DELETE FROM imported_roots WHERE path = ?", path)
 	if err != nil {
 		return err
+	}
+	if n, rerr := res.RowsAffected(); rerr == nil {
+		fmt.Printf("[删除诊断] RemoveRoot SQLite DELETE: path=%q 影响行数=%d\n", path, n)
 	}
 
 	// 同时清理该路径下的 image_tags 和 favorites

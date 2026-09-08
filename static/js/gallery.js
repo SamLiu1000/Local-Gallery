@@ -1645,6 +1645,7 @@ const Gallery = (() => {
 
         // ★ 修复 Bug 1：规范化路径比较，解决斜杠风格不一致的问题
         const normalized = (rootPath || '').replace(/\\/g, '/').toLowerCase();
+        console.log('[删除诊断] removeImportedRoot 进入: rootPath=', rootPath, ' normalized=', normalized, ' importedRoots 当前=', importedRoots.map(r => r.rootId || r.path));
 
         // rootPath 可能是 rootId 或原始路径，优先规范化匹配
         let toRemove = images.filter(img => {
@@ -1676,6 +1677,7 @@ const Gallery = (() => {
             const rName = (root.name || '').replace(/\\/g, '/').toLowerCase();
             return rId !== normalized && rPath !== normalized && rName !== normalized;
         });
+        console.log('[删除诊断] removeImportedRoot 过滤后 importedRoots 剩余=', importedRoots.map(r => r.rootId || r.path), ' 长度=', importedRoots.length, ' loadFlag=', importedRootsLoaded);
 
         if (currentFolderFilter) {
             const currentNorm = currentFolderFilter.replace(/\\/g, '/').toLowerCase();
@@ -2922,6 +2924,9 @@ const Gallery = (() => {
         currentFavoriteFilter = false;
         currentFolderFilter = null;
         isFilteringActive = true;
+        // ★ 进入标签视图时清掉上一个视图可能残留的"加载更多"指示器 / 加载态
+        _showLoadMoreIndicator(false);
+        isLoadingMoreFolder = false;
 
         // ★ 即时视觉反馈：清空格子 + 显示加载中
         showLoading(true);
@@ -2993,12 +2998,15 @@ const Gallery = (() => {
 
             // ★ 记录标签分页状态，供滚动增量加载（标签结果超过首屏数量时按路径分批拉取）
             tagPaths = taggedPaths;
-            tagLoadTotal = taggedPaths.length;
+            tagLoadTotal = taggedPaths.length; // 兜底：路径数
             tagLoadOffset = 0;
 
             // ★ 精准查询：只向 Go 请求标签关联的图片路径，而非全量
             const firstResult = await loadImagesByPaths(taggedPaths, 0, FOLDER_LOOKAHEAD);
             const tagImages = firstResult.images;
+            // ★ 总数用后端返回的真实图片数：路径数可能 > 可加载图片数（部分文件已删/不在库），
+            //   若用路径数，offset 永远 < total，底部"加载中"会一直卡住。
+            if (firstResult.total > 0) tagLoadTotal = firstResult.total;
             tagLoadOffset = tagImages.length;
 
             // 移除已有 server 同路径旧条目，避免重复；保留非 server 图片
@@ -3047,6 +3055,9 @@ const Gallery = (() => {
         currentFavoriteFilter = true;
         currentFolderFilter = null;
         isFilteringActive = true;
+        // ★ 进入收藏视图时清掉上一个视图可能残留的"加载更多"指示器 / 加载态
+        _showLoadMoreIndicator(false);
+        isLoadingMoreFolder = false;
 
         // ★ 即时视觉反馈
         showLoading(true);
@@ -3067,12 +3078,15 @@ const Gallery = (() => {
 
             // ★ 记录收藏分页状态，供滚动增量加载
             favPaths = favPathList;
-            favLoadTotal = favPathList.length;
+            favLoadTotal = favPathList.length; // 兜底：路径数
             favLoadOffset = 0;
 
             // ★ 精准查询：只向 Go 请求收藏的图片路径
             const firstResult = await loadImagesByPaths(favPathList, 0, FOLDER_LOOKAHEAD);
             const favImages = firstResult.images;
+            // ★ 总数用后端返回的真实图片数：收藏路径数可能 > 可加载图片数（部分文件已删/不在库），
+            //   若用路径数，offset 永远 < total，底部"加载中"会一直卡住。
+            if (firstResult.total > 0) favLoadTotal = firstResult.total;
             favLoadOffset = favImages.length;
 
             const pathSet = new Set(favPathList);
@@ -5143,8 +5157,15 @@ const Gallery = (() => {
 
     function updateImageCount() {
         const displayImages = isFilteringActive ? filteredImages : images;
-        const label = I18n.t('toolbar.image_count');
-        imageCountEl.textContent = `${displayImages.length} ${label}`;
+        // ★ 只更新数字部分，单位"张图片/images"保留为带 data-i18n 的 <span>（由 i18n.scanDOM 管理），
+        //   否则用 textContent 整体覆盖会把单位 span 干碎，切语言时单位文字不会再翻译。
+        const numEl = imageCountEl ? imageCountEl.querySelector('#imageCountNum') : null;
+        if (numEl) {
+            numEl.textContent = String(displayImages.length);
+        } else if (imageCountEl) {
+            const label = I18n.t('toolbar.image_count');
+            imageCountEl.textContent = `${displayImages.length} ${label}`;
+        }
     }
 
     // ==================== 按需解析元数据 ====================
@@ -5314,6 +5335,7 @@ const Gallery = (() => {
     function addImportedRoot(rootInfo) {
         if (!rootInfo || !rootInfo.rootId) return;
         if (importedRoots.some(r => r.rootId === rootInfo.rootId)) return;
+        console.log('[删除诊断] addImportedRoot: rootId=', rootInfo.rootId, ' path=', rootInfo.path || rootInfo.rootId, ' 当前 importedRoots=', importedRoots.map(r => r.rootId));
 
         importedRoots.push({
             rootId: rootInfo.rootId,
@@ -5349,6 +5371,7 @@ const Gallery = (() => {
                 handleName: r.handleName || '',
                 addedAt: r.addedAt || new Date().toISOString()
             }));
+            console.log('[删除诊断] saveImportedRootsToServer 发送: paths=', rootsData.map(r => r.path), ' count=', rootsData.length, ' loadFlag=', importedRootsLoaded);
             if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails()) {
                 const result = await WailsBridge.saveRootsWithMeta(rootsData);
                 if (result && result.success) {

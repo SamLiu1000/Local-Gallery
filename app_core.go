@@ -633,6 +633,14 @@ func (a *App) ScanFolderQuick(path, folderType string, quick bool) *ScanResult {
 	a.registeredRoots[resolvedPath] = true
 	a.folderTypes[resolvedPath] = folderType
 	a.mu.Unlock()
+	// ★ 诊断：注册根后快照
+	a.mu.RLock()
+	regAfter := make([]string, 0, len(a.registeredRoots))
+	for root := range a.registeredRoots {
+		regAfter = append(regAfter, root)
+	}
+	a.mu.RUnlock()
+	fmt.Printf("[删除诊断] ScanFolderQuick 已注册根: %s | 当前 registeredRoots=%v\n", resolvedPath, regAfter)
 	// ★ 修复：同步持久化注册（原为 go 异步）。若导入后立即退出程序，
 	//   异步 goroutine 可能未完成，注册丢失 → 重启后文件夹消失。
 	//   同时写入"扫描中"标记，中途退出后下次启动能识别并补扫。
@@ -700,7 +708,7 @@ func (a *App) ScanFolderQuick(path, folderType string, quick bool) *ScanResult {
 				a.scanMu.Unlock()
 			}()
 
-			imageCount := a.countFilesQuick(resolvedPath)
+			localImages, localFolderIndex, imageCount := a.countFilesQuick(resolvedPath)
 			normalizedRoot := strings.ReplaceAll(resolvedPath, "\\", "/")
 			a.mu.Lock()
 			// ★ 只增不减：countFilesQuick 幂等合并时，被即席扫描/并发扫描"先索引过"的图片
@@ -709,11 +717,25 @@ func (a *App) ScanFolderQuick(path, folderType string, quick bool) *ScanResult {
 			if imageCount > a.folderCount[normalizedRoot] {
 				a.folderCount[normalizedRoot] = imageCount
 			}
-			finalCount := a.folderCount[normalizedRoot]
 			a.mu.Unlock()
 			fmt.Printf("[导入] countFilesQuick 完成: %s = %d 个文件\n", resolvedPath, imageCount)
 
 			a.saveRegisteredRoots()
+
+			// ★ 修复计数倒退：并发 GetImages（前端一导入就打开该文件夹）会触发 evictLRU
+			//   （32 文件夹/5 万张上限），把刚扫进 a.images 的图片淘汰掉一部分，导致
+			//   saveImageIndexByRoot / rebuildFolderIndexForRoot 只读到残缺子集
+			//   （实测 125504 → 只落库 17151）。这里在落库前把本次扫到的【完整集合】回填进
+			//   a.images / folderIndex，确保 SQLite 和计数都基于完整数据（先落库，之后才允许淘汰）。
+			a.mu.Lock()
+			for k, v := range localImages {
+				a.images[k] = v
+			}
+			for fk, ids := range localFolderIndex {
+				a.folderIndex[fk] = append(a.folderIndex[fk], ids...)
+			}
+			a.mu.Unlock()
+			fmt.Printf("[导入] 已回填完整集合（%d 张）到内存，准备落库: %s\n", len(localImages), resolvedPath)
 
 			// ★ 先同步写入 SQLite image_cache，再发 scan:complete。
 			//   前端收到 scan:complete 后立即调用 GetImages，而 GetImages 优先走
@@ -725,6 +747,11 @@ func (a *App) ScanFolderQuick(path, folderType string, quick bool) *ScanResult {
 			//   若被并发/即席扫描抢写过，可能只覆盖部分子文件夹。这里用内存完整图片集合重算，
 			//   保证侧栏子文件夹全部显示、计数正确（否则要刷新页面才完整）。
 			a.rebuildFolderIndexForRoot(resolvedPath)
+			// ★ 计数以 SQLite 为唯一真相：重新从 SQLite 重建 folderCount（而非仅从可能被 LRU
+			//   淘汰的 a.images），确保当前内存计数 == 数据库真实数量，刷新后不再出现偏差。
+			a.mu.Lock()
+			a.rebuildFolderCountsFromSQLLocked()
+			a.mu.Unlock()
 			// ★ 扫描完成，清除"扫描中"标记（中断退出时该标记残留，下次启动补扫）
 			a.setScanInProgress(resolvedPath, false)
 
@@ -733,12 +760,16 @@ func (a *App) ScanFolderQuick(path, folderType string, quick bool) *ScanResult {
 				if thumbCounts := a.getCachedThumbCounts(); thumbCounts != nil {
 					thumbCount = thumbCounts[normalizedRoot]
 				}
+				// ★ 用重建后的最新计数（finalCount 是重建前的旧值，可能因已有底数而偏小）
+				a.mu.RLock()
+				actualCount := a.folderCount[normalizedRoot]
+				a.mu.RUnlock()
 				wailsruntime.EventsEmit(a.ctx, "scan:complete", map[string]interface{}{
 					"rootPath":   resolvedPath,
-					"count":      finalCount,
+					"count":      actualCount,
 					"thumbCount": thumbCount,
 				})
-				fmt.Printf("[导入] scan:complete 已发出: %s (count=%d)\n", resolvedPath, finalCount)
+				fmt.Printf("[导入] scan:complete 已发出: %s (count=%d)\n", resolvedPath, actualCount)
 			} else {
 				fmt.Printf("[导入] 警告: a.ctx 为 nil，scan:complete 未发出: %s\n", resolvedPath)
 			}
@@ -781,10 +812,16 @@ func (a *App) ScanFolderQuick(path, folderType string, quick bool) *ScanResult {
 
 // countFilesQuick 分批扫描文件夹：每扫完一个目录就把图片写入内存并发出
 // scan:batch 事件，前端侧栏计数随扫描实时增长，点击文件夹也能立即看到
-// 已扫描的图片（GetImages 内存回退）。返回该文件夹的总图片数。
+// 已扫描的图片（GetImages 内存回退）。返回该文件夹的【完整图片集合】与总图片数。
+// ★ 必须返回完整集合（而非只依赖会被 LRU 淘汰的全局 a.images）：否则并发
+//   GetImages→evictLRU（32 文件夹/5 万张上限）会把部分图片从 a.images 清掉，
+//   导致 saveImageIndexByRoot / rebuildFolderIndexForRoot 只读到残缺子集，
+//   表现为"导入计数从 N 倒退到 M"（如 125504→17151）。
 // 使用 os.ReadDir 递归替代 filepath.Walk，对机械硬盘更友好（批量读取目录条目）。
-func (a *App) countFilesQuick(rootPath string) int {
+func (a *App) countFilesQuick(rootPath string) (map[string]*ImageEntry, map[string][]string, int) {
 	normalizedRoot := strings.ReplaceAll(rootPath, "\\", "/")
+	localImages := make(map[string]*ImageEntry)
+	localFolderIndex := make(map[string][]string)
 	totalCount := 0
 
 	a.scanWalkBatched(rootPath, func(batchImages map[string]*ImageEntry, batchFolderIndex map[string][]string, folderRel string, batchCount int) {
@@ -792,6 +829,13 @@ func (a *App) countFilesQuick(rootPath string) int {
 		//   folderIndex 不重复追加、folderCount 不重复计数。
 		newEntries := a.mergeScanBatchIntoMemory(batchImages, batchFolderIndex)
 		totalCount += len(newEntries)
+		// ★ 本地完整集合：收集本次扫到的全部（含幂等合并跳过的），不受 a.images LRU 淘汰影响
+		for k, v := range batchImages {
+			localImages[k] = v
+		}
+		for fk, ids := range batchFolderIndex {
+			localFolderIndex[fk] = append(localFolderIndex[fk], ids...)
+		}
 		// 发 scan:batch 事件，前端侧栏数字实时上升
 		if a.ctx != nil && len(newEntries) > 0 {
 			thumbCount := 0
@@ -808,7 +852,7 @@ func (a *App) countFilesQuick(rootPath string) int {
 		}
 	})
 
-	return totalCount
+	return localImages, localFolderIndex, totalCount
 }
 
 func (a *App) RemoveFolder(path string) *ScanResult {
@@ -817,10 +861,23 @@ func (a *App) RemoveFolder(path string) *ScanResult {
 		return &ScanResult{Success: false, Message: "请提供文件夹路径"}
 	}
 	resolvedPath, _ := filepath.Abs(folderPath)
+	// ★ 诊断：删除入口快照
+	a.mu.RLock()
+	regSnapshot := make([]string, 0, len(a.registeredRoots))
+	for root := range a.registeredRoots {
+		regSnapshot = append(regSnapshot, root)
+	}
+	a.mu.RUnlock()
+	dbBefore := a.getDBRootsForDiag()
+	fmt.Printf("[删除诊断] 收到删除: path=%q | resolvedPath=%q | registeredRoots=%v | SQLite roots=%v\n",
+		folderPath, resolvedPath, regSnapshot, dbBefore)
+
 	var matchedPath string
+	var directMatch bool
 	a.mu.RLock()
 	if a.registeredRoots[resolvedPath] {
 		matchedPath = resolvedPath
+		directMatch = true
 	} else {
 		// ★ 健壮匹配：大小写/分隔符/结尾斜杠都归一化后比较，避免前端传的路径格式
 		//   (如带尾斜杠、/ 与 \ 混用)与 registeredRoots 键不一致 → 匹配不到 → 删不掉，
@@ -838,8 +895,10 @@ func (a *App) RemoveFolder(path string) *ScanResult {
 	}
 	a.mu.RUnlock()
 	if matchedPath == "" {
+		fmt.Printf("[删除诊断] 未匹配到注册根目录 → 返回失败: path=%q | registeredRoots=%v\n", folderPath, regSnapshot)
 		return &ScanResult{Success: false, Message: "该目录不在扫描列表中"}
 	}
+	fmt.Printf("[删除诊断] 匹配到: matchedPath=%q (精确命中=%v)\n", matchedPath, directMatch)
 	a.mu.Lock()
 	delete(a.registeredRoots, matchedPath)
 	delete(a.folderTypes, matchedPath)
@@ -847,15 +906,44 @@ func (a *App) RemoveFolder(path string) *ScanResult {
 		a.userDataDB.RemoveRoot(matchedPath)
 	}
 	a.mu.Unlock()
+	// ★ 诊断：删除后状态
+	a.mu.RLock()
+	regAfter := make([]string, 0, len(a.registeredRoots))
+	for root := range a.registeredRoots {
+		regAfter = append(regAfter, root)
+	}
+	a.mu.RUnlock()
+	fmt.Printf("[删除诊断] 已删除: matchedPath=%q | registeredRoots 剩余=%v | SQLite roots 剩余=%v\n",
+		matchedPath, regAfter, a.getDBRootsForDiag())
 	go a.saveRegisteredRoots()
 	// ★ 嵌套虚拟根：其图片由父目录扫描持有（RootPath 为父根），移除时仅注销本根，
 	//   不清空父目录的数据，否则会误删父根下的整棵子树。
 	if a.isRootNested(matchedPath) {
 		return &ScanResult{Success: true, Message: fmt.Sprintf("已移除嵌套目录: %s（父目录中的内容保留）", matchedPath)}
 	}
-	// 异步清理内存和数据库，避免大量文件时阻塞 UI
-	go a.removeByRoot(matchedPath)
+	// ★ 同步清理内存和数据库：确保删完返回时 SQLite 的用户数据已真正移除。
+	//   否则删除→立刻重导 会读到残留数据（双倍/幽灵）；计数从 SQLite 读时也要依赖这里
+	//   及时清干净。代价是大文件夹删除会稍慢（需真删几万行），前端可提示"正在删除"。
+	a.removeByRoot(matchedPath)
 	return &ScanResult{Success: true, Message: fmt.Sprintf("已移除目录: %s", matchedPath)}
+}
+
+// getDBRootsForDiag 读取 SQLite imported_roots 表的所有路径（诊断用）。
+// 返回空切片表示 userDataDB 未初始化或读取失败。
+func (a *App) getDBRootsForDiag() []string {
+	if a.userDataDB == nil {
+		return []string{}
+	}
+	roots, err := a.userDataDB.GetAllRoots()
+	if err != nil {
+		fmt.Printf("[删除诊断] GetAllRoots 失败: %v\n", err)
+		return []string{}
+	}
+	paths := make([]string, 0, len(roots))
+	for _, r := range roots {
+		paths = append(paths, r.Path)
+	}
+	return paths
 }
 
 // RemoveImages 批量删除图片（从内存、缩略图缓存、数据库中移除）
@@ -1715,6 +1803,10 @@ func (a *App) GetFolders() []*FolderNode {
 			node.Previews = ps
 		}
 		roots = append(roots, node)
+		// ★ 诊断：每个根的实际计数 + folderCount 里是否缺该键
+		fc, hasFC := a.folderCount[normalizedRoot]
+		fmt.Printf("[删除诊断] GetFolders 根=%s ImageCount=%d folderCount[%s]=%d hasKey=%v folderIndexKeys=%d\n",
+			rootPath, node.ImageCount, normalizedRoot, fc, hasFC, len(a.folderIndex))
 	}
 	sort.Slice(roots, func(i, j int) bool {
 		return roots[i].Name < roots[j].Name
@@ -2168,6 +2260,18 @@ func (a *App) SaveRootsWithMeta(roots []database.ImportedRoot) map[string]interf
 	existing := make(map[string]bool, len(a.registeredRoots))
 	for root := range a.registeredRoots {
 		existing[root] = true
+	}
+	// ★ 诊断：SaveRootsWithMeta 入参 + 现有注册根
+	{
+		incoming := make([]string, 0, len(roots))
+		for _, r := range roots {
+			incoming = append(incoming, r.Path)
+		}
+		existingList := make([]string, 0, len(existing))
+		for k := range existing {
+			existingList = append(existingList, k)
+		}
+		fmt.Printf("[删除诊断] SaveRootsWithMeta: 传入 %d 个根=%v | 现有 registeredRoots=%v\n", len(roots), incoming, existingList)
 	}
 	// 传入根的元数据（按规范化路径索引），用于合并后保留
 	metaMap := make(map[string]database.ImportedRoot, len(roots))

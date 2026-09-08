@@ -38,6 +38,11 @@ func (a *App) loadUserData() {
 			}
 			a.mu.Unlock()
 			fmt.Printf("[加载] 从 SQLite 注册 %d 个根目录\n", len(a.registeredRoots))
+			rootList := make([]string, 0, len(a.registeredRoots))
+			for root := range a.registeredRoots {
+				rootList = append(rootList, root)
+			}
+			fmt.Printf("[删除诊断] 启动时 registeredRoots=%v\n", rootList)
 			return
 		}
 		// SQLite 表为空（len(roots)==0）：继续尝试 JSON fallback 以支持旧数据迁移
@@ -87,6 +92,11 @@ func (a *App) loadUserData() {
 	}
 	a.mu.Unlock()
 	fmt.Printf("[加载] 已注册 %d 个根目录\n", len(a.registeredRoots))
+	rootList := make([]string, 0, len(a.registeredRoots))
+	for root := range a.registeredRoots {
+		rootList = append(rootList, root)
+	}
+	fmt.Printf("[删除诊断] 启动时 registeredRoots=%v\n", rootList)
 }
 
 func (a *App) loadImageIndex() {
@@ -381,6 +391,12 @@ func (a *App) rebuildFolderCountsFromSQLLocked() {
 	a.folderCount = counts
 	// ★ 同步更新轻量索引快照，让下次冷启动读到最新统计，避免快照过期。
 	a.saveFolderIndexLight(entries)
+	// ★ 诊断：重建后的根级计数
+	rootCounts := make([]string, 0, len(counts))
+	for k, v := range counts {
+		rootCounts = append(rootCounts, fmt.Sprintf("%s=%d", k, v))
+	}
+	fmt.Printf("[删除诊断] rebuildFolderCountsFromSQLLocked 完成: 共 %d 个 folderCount 键, 前 5 个=%v\n", len(counts), rootCounts[:min(5, len(rootCounts))])
 }
 
 // ensureFolderLoaded 同步加载某 folderKey 进缓存；带 double-check + LRU 淘汰。
@@ -668,6 +684,12 @@ func (a *App) saveRegisteredRoots() {
 		importedRoots = append(importedRoots, ir)
 	}
 	a.mu.RUnlock()
+
+	rootList := make([]string, 0, len(importedRoots))
+	for _, r := range importedRoots {
+		rootList = append(rootList, r.Path)
+	}
+	fmt.Printf("[删除诊断] saveRegisteredRoots: 正在把 %d 个根写入 SQLite=%v\n", len(importedRoots), rootList)
 
 	// 合并现有元数据（display_name, handle_name 等前端维护的字段）
 	if err := a.userDataDB.MergeRoots(importedRoots); err != nil {

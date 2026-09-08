@@ -901,12 +901,19 @@ const Sidebar = (() => {
     // 节流保存：结构/计数刷新后写入 localStorage，供下次启动 0 秒渲染
     function saveFolderTreeCache(nodes) {
         const now = Date.now();
-        if (now - _lastTreeCacheSave < 3000) return; // 节流
+        if (now - _lastTreeCacheSave < 3000) {
+            console.log('[删除诊断] saveFolderTreeCache 被节流跳过(3秒内): nodes=', nodes.map(n => n.path));
+            return; // 节流
+        }
         _lastTreeCacheSave = now;
         try {
             const json = JSON.stringify(nodes.map(serializeFolderNode));
-            if (json.length > 3500000) return; // localStorage 约 5MB 上限，留余量
+            if (json.length > 3500000) {
+                console.log('[删除诊断] saveFolderTreeCache 超 5MB 上限跳过: nodes=', nodes.map(n => n.path));
+                return;
+            }
             localStorage.setItem(FOLDER_TREE_CACHE_KEY, json);
+            console.log('[删除诊断] saveFolderTreeCache 已写入 localStorage: nodes=', nodes.map(n => n.path));
         } catch (e) { /* 静默：缓存失败不影响功能 */ }
     }
 
@@ -916,10 +923,47 @@ const Sidebar = (() => {
             if (!json) return null;
             const data = JSON.parse(json);
             if (!Array.isArray(data) || data.length === 0) return null;
-            return data.map(deserializeFolderNode);
+            const loaded = data.map(deserializeFolderNode);
+            console.log('[删除诊断] loadFolderTreeCache 从 localStorage 加载: paths=', loaded.map(n => n.path));
+            return loaded;
         } catch (e) {
             return null;
         }
+    }
+
+    /**
+     * ★ 修复：删除文件夹时同步清掉 localStorage 里的树缓存（含该文件夹及其子树）。
+     *   "幽灵文件夹"（后端已无注册、仅靠本地缓存显示）就是靠这份缓存存活：
+     *   之前删除只清了内存 folderRoots/importedRoots，没清缓存 → 刷新/重启后又从缓存画出来。
+     *   normalizedPath 用正斜杠+小写传入。
+     */
+    function purgeFolderFromTreeCache(normalizedPath) {
+        if (!normalizedPath) return;
+        try {
+            const json = localStorage.getItem(FOLDER_TREE_CACHE_KEY);
+            if (!json) return;
+            const data = JSON.parse(json);
+            if (!Array.isArray(data)) return;
+            const filterRec = (nodes) => {
+                const out = [];
+                for (const node of nodes) {
+                    const np = (node.p || '').replace(/\\/g, '/').toLowerCase();
+                    if (np === normalizedPath || np.startsWith(normalizedPath + '/')) {
+                        continue; // 丢弃该文件夹及其整棵子树
+                    }
+                    if (node.c) node.c = filterRec(node.c);
+                    out.push(node);
+                }
+                return out;
+            };
+            const cleaned = filterRec(data);
+            if (cleaned.length !== data.length) {
+                localStorage.setItem(FOLDER_TREE_CACHE_KEY, JSON.stringify(cleaned));
+                console.log('[删除诊断] purgeFolderFromTreeCache: 已从 localStorage 移除 ', normalizedPath, ' 剩余=', cleaned.map(n => n.p));
+            } else {
+                console.log('[删除诊断] purgeFolderFromTreeCache: localStorage 未发现 ', normalizedPath, ' 当前缓存=', data.map(n => n.p));
+            }
+        } catch (e) { /* 静默 */ }
     }
 
     async function refreshFolderTree(options = {}) {
@@ -1016,6 +1060,7 @@ const Sidebar = (() => {
             applyExpandedStates(mergedTree);
 
             folderRoots = mergedTree;
+            console.log('[删除诊断] doRefreshFolderTree 合并完成: 根路径=', mergedTree.map(n => n.path), ' 数量=', mergedTree.length, ' fetched=', fetched);
             // ★ 保存本地缓存（节流）：下次启动 0 秒渲染
             saveFolderTreeCache(mergedTree);
             // ★ [调试] 统计带 previews 的节点数量 + 当前已开启的预览根
@@ -2411,10 +2456,15 @@ const Sidebar = (() => {
      */
     async function removeFolderPath(path) {
         if (!path) return;
+        console.log('[删除诊断] 前端 removeFolderPath 开始: path=', path);
+        const normalized = (path || '').replace(/\\/g, '/').toLowerCase();
 
         // 立即从 UI 中移除，无论后端调用结果如何
         removeRootFromTree(path);
         renderFolderTree();
+        // ★ 修复：同步清掉 localStorage 里的树缓存，防止"幽灵文件夹"刷新/重启后从缓存复活。
+        //   后端未注册时删除会失败（"不在扫描列表中"），但幽灵不能因此一直挂着。
+        purgeFolderFromTreeCache(normalized);
 
         try {
             let ok = false;
@@ -2425,6 +2475,7 @@ const Sidebar = (() => {
                     //   仍在 registeredRoots 里的这个文件夹“保留/重写”回去，导致永远删不掉。
                     const result = await WailsBridge.removeFolder(path);
                     ok = !!(result && result.success);
+                    console.log('[删除诊断] removeFolder RPC 返回: ok=', ok, ' message=', result && result.message);
                 } catch (err) {
                     console.warn('[Sidebar] Wails 移除文件夹失败:', err.message);
                 }
@@ -2440,11 +2491,13 @@ const Sidebar = (() => {
             if (ok) {
                 if (typeof Gallery !== 'undefined' && Gallery.removeImportedRoot) {
                     await Gallery.removeImportedRoot(path);
+                    console.log('[删除诊断] removeImportedRoot 调用后 importedRoots 长度=', typeof Gallery !== 'undefined' && Gallery.getImportedRoots ? Gallery.getImportedRoots().length : 'n/a');
                 }
                 App.showToast(t('toast.folder_removed'), 'success');
             } else {
                 if (typeof Gallery !== 'undefined' && Gallery.removeImportedRoot) {
                     const removed = await Gallery.removeImportedRoot(path);
+                    console.log('[删除诊断] RPC 失败分支 removeImportedRoot: removed=', removed);
                     if (removed) {
                         App.showToast(t('toast.folder_removed'), 'success');
                     } else {

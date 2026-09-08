@@ -744,49 +744,21 @@ var (
 const thumbNotifyThrottle = 300 * time.Millisecond
 
 // StartPreGenThumbs 开始后台预生成缩略图（按多个文件夹）
+// ★ 立即返回：收集几万张图片条目是重活（逐个子文件夹查 SQL），若在 RPC 里同步做，
+//   点"开始"后要等收集完才返回 → 前端很久没反应（表现为"点了没反应/要等很久"）。
 func (a *App) StartPreGenThumbs(folders []string) map[string]interface{} {
 	// 规范化路径分隔符，与 folderIndex / folderCount 的 key 保持一致
-	normFolders := make([]string, len(folders))
-	for i, f := range folders {
-		normFolders[i] = strings.ReplaceAll(f, "\\", "/")
-	}
-
-	// 收集所有选中文件夹及其子文件夹下的 folderKey
-	a.mu.RLock()
-	var keysToLoad []string
-	for _, folder := range normFolders {
-		prefix := folder + "/"
-		for k := range a.folderIndex {
-			if k == folder || strings.HasPrefix(k, prefix) {
-				keysToLoad = append(keysToLoad, k)
-			}
+	normFolders := make([]string, 0, len(folders))
+	for _, f := range folders {
+		if strings.TrimSpace(f) != "" {
+			normFolders = append(normFolders, strings.ReplaceAll(f, "\\", "/"))
 		}
 	}
-	a.mu.RUnlock()
-
-	// ★ 直接从 SQL 拉取条目，避免 LRU 淘汰造成漏数据
-	seen := make(map[string]bool)
-	var entries []*ImageEntry
-	for _, k := range keysToLoad {
-		root, folderRel := a.splitFolderKey(k)
-		dbEntries, err := a.imageDB.LoadImageCacheByFolder(root, folderRel)
-		if err != nil {
-			continue
-		}
-		for _, e := range dbEntries {
-			if seen[e.ID] {
-				continue
-			}
-			seen[e.ID] = true
-			entries = append(entries, toImageEntry(e))
-		}
+	if len(normFolders) == 0 {
+		return map[string]interface{}{"success": false, "message": "请选择文件夹"}
 	}
 
-	if len(entries) == 0 {
-		return map[string]interface{}{"success": false, "message": "文件夹无图片数据"}
-	}
-
-	// 停止旧的预生成任务
+	// 停止旧的预生成任务（轻量、尽快返回）
 	preGenMu.Lock()
 	preGenCloseOnce.Do(func() {
 		if preGenCancel != nil {
@@ -804,13 +776,68 @@ func (a *App) StartPreGenThumbs(folders []string) map[string]interface{} {
 	preGenStatus = PreGenStatus{
 		Running: true,
 		Folder:  folderLabel,
-		Total:   len(entries),
+		Total:   0, // 收集完再填；前端此时显示"准备中"，进度 0%
 	}
 	preGenStatusMu.Unlock()
 
-	go a.runPreGen(folderLabel, entries)
-	fmt.Printf("[预生成] 开始为 %s 生成缩略图，共 %d 张\n", folderLabel, len(entries))
-	return map[string]interface{}{"success": true, "total": len(entries)}
+	// ★ 重活放后台：先收集图片条目，再启动生成，RPC 立即返回
+	go func() {
+		entries := a.collectPreGenEntries(normFolders)
+		if len(entries) == 0 {
+			preGenStatusMu.Lock()
+			preGenStatus.Running = false
+			preGenStatusMu.Unlock()
+			fmt.Printf("[预生成] %s: 无可生成图片\n", folderLabel)
+			return
+		}
+		preGenStatusMu.Lock()
+		preGenStatus.Total = len(entries)
+		preGenStatusMu.Unlock()
+		a.runPreGen(folderLabel, entries)
+	}()
+	fmt.Printf("[预生成] 开始为 %s 启动预生成任务\n", folderLabel)
+	return map[string]interface{}{"success": true}
+}
+
+// collectPreGenEntries 收集这些文件夹（含子文件夹）下的全部图片条目。
+// ★ 直接从 SQLite 按路径前缀分页读取（权威、完整），不再依赖内存 folderIndex：
+//    folderIndex 是 LRU 缓存（子文件夹可能未加载/被淘汰），从中枚举会漏掉大量子目录，
+//    导致"明明两万张只生成一小部分就提示完成"。
+func (a *App) collectPreGenEntries(normFolders []string) []*ImageEntry {
+	if a.imageDB == nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var entries []*ImageEntry
+	const batch = 2000
+	for _, folder := range normFolders {
+		// 转成 Windows 反斜杠路径前缀；LoadImageCacheByPathPrefixPaged 内部用
+		// [folder\, folder\+\uFFFF) 限定该文件夹子树（不含"名称是前缀延伸"的兄弟目录）。
+		pathPrefix := strings.ReplaceAll(folder, "/", "\\")
+		offset := 0
+		for {
+			dbEntries, total, err := a.imageDB.LoadImageCacheByPathPrefixPaged(pathPrefix, offset, batch, "date-desc")
+			if err != nil {
+				fmt.Printf("[预生成] 收集 %s 失败: %v\n", folder, err)
+				break
+			}
+			if len(dbEntries) == 0 {
+				break
+			}
+			for _, e := range dbEntries {
+				if seen[e.ID] {
+					continue
+				}
+				seen[e.ID] = true
+				entries = append(entries, toImageEntry(e))
+			}
+			offset += len(dbEntries)
+			if offset >= total {
+				break
+			}
+		}
+	}
+	return entries
 }
 
 // runPreGen 并发生成缩略图（按设置的并发数），跳过已有缓存，支持暂停/恢复/取消
