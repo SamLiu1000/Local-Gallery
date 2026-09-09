@@ -4,7 +4,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -542,9 +544,32 @@ func isImageByMagic(filePath string) bool {
 	return true
 }
 
-// serveThumbnail 从 BoltDB 读取缩略图 JPEG 字节；如不存在则生成
-func (a *App) serveThumbnail(imageID string) ([]byte, error) {
+// errClientGone 请求方（浏览器）已断开：放弃本次缩略图生成。
+// ★ 前端滚动时会把滚出视窗的缩略图请求 abort 掉（清空 img.src），但后端在生成前
+//   如果不知道，就会继续按"滚动经过的顺序"一张张生成——用户最后停下的位置反而排在
+//   滚动路径后面。这里用请求上下文判断：客户端已走 → 直接跳过，不占生成队列。
+var errClientGone = errors.New("客户端已断开，跳过缩略图生成")
+
+func clientGone(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	select {
+	case <-ctx.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+// serveThumbnail 从 BoltDB 读取缩略图 JPEG 字节；如不存在则生成。
+// ctx 为发起方请求的上下文：客户端断开后（前端滚动丢弃了这张图）跳过尚未开始的生成，
+// 让生成队列跟着"当前视窗"走，而不是跟着滚动路径走。
+func (a *App) serveThumbnail(ctx context.Context, imageID string) ([]byte, error) {
 	debugSwitchf("[thumb] serveThumbnail 进入: id=%s", imageID)
+	if clientGone(ctx) {
+		return nil, errClientGone
+	}
 	imagePath := a.resolveImagePath(imageID)
 	if imagePath == "" {
 		a.markThumbFailed(imageID)
@@ -632,6 +657,12 @@ func (a *App) serveThumbnail(imageID string) ([]byte, error) {
 		return nil, fmt.Errorf("文件夹已切换，取消缩略图生成: %s", imageID)
 	}
 
+	// ★ 视窗优先：等 per-image 锁/读库期间客户端可能已经断开（滚动丢弃了这张图）
+	//   → 不再排队生成，把生成队列让给当前视窗内的图。
+	if clientGone(ctx) {
+		return nil, errClientGone
+	}
+
 	debugSwitchf("[thumb] 未命中, 排队生成: id=%s", imageID)
 
 	// ★ 低优先级队列：大图读取（HIGH）永远先于缩略图生成（LOW）被调度，
@@ -661,6 +692,14 @@ func (a *App) serveThumbnail(imageID string) ([]byte, error) {
 		// ★ 双重检查：排队到执行前用户可能已切走 → 仍放弃，不读原图。
 		if fk := a.imageFolderKey(imagePath); fk != "" && isFolderAbandoned(fk) {
 			genErr = fmt.Errorf("文件夹已切换，取消缩略图生成: %s", imageID)
+			return
+		}
+
+		// ★ 视窗优先（关键）：排队期间客户端已断开（前端滚动把它 abort 了）→
+		//   直接放弃，不生成、不写失败标记。这样快速滚动时，滚动路径上尚未开始的
+		//   任务会成批被丢弃，队列迅速收敛到用户最后停留的视窗。
+		if clientGone(ctx) {
+			genErr = errClientGone
 			return
 		}
 
@@ -734,6 +773,10 @@ var (
 var (
 	cachedThumbCounts map[string]int
 	thumbCountsValid  bool
+	// thumbCountsStale 计数已从磁盘恢复（可先展示）但与缩略图库不一致，需后台重算纠正
+	thumbCountsStale bool
+	// thumbScanMu 保证同一时刻只有一次全量扫描（扫描在 thumbCountsMu 之外进行）
+	thumbScanMu       sync.Mutex
 	thumbCountsMu     sync.RWMutex
 	thumbNotifyTimer  *time.Timer
 	thumbNotifyMu     sync.Mutex
@@ -1301,19 +1344,62 @@ func (a *App) GetPreGenStatus() *PreGenStatus {
 	return &s
 }
 
-// computeThumbCounts 返回每个文件夹的缩略图缓存数（视频直接算作已完成）
+// computeThumbCounts 返回每个文件夹的缩略图缓存数（视频直接算作已完成）。
+//
+// ★ 关键：全量扫描必须在 thumbCountsMu 之外进行。此前整段（bbolt 游标全表 +
+//   SQLite 元数据 + 落盘时 Stats().KeyN 全树遍历）都持有 thumbCountsMu.Lock()，
+//   而每张缩略图生成结束都会调 incrementThumbCount() 取同一把锁 —— 启动后计数
+//   预热期间（实测 12~20s）所有刚生成完的缩略图都卡在最后一步，HTTP 响应发不
+//   出去，前端 15s 超时 + 重试耗尽后显示 "Load failed"（黑块）。扫描移出锁外后，
+//   期间 incrementThumbCount / GetFolders 只做一次 map 读写，不再被拖住。
 func (a *App) computeThumbCounts() map[string]int {
-	thumbCountsMu.Lock()
-	defer thumbCountsMu.Unlock()
-	if thumbCountsValid {
-		return copyCounts(cachedThumbCounts)
+	// 快路径：缓存已就绪且与库一致，锁内只做一次 map 拷贝
+	// （stale=true 表示只是"上次的计数"，必须真正重算，不能直接返回）
+	thumbCountsMu.RLock()
+	if thumbCountsValid && !thumbCountsStale {
+		counts := copyCounts(cachedThumbCounts)
+		thumbCountsMu.RUnlock()
+		return counts
 	}
+	thumbCountsMu.RUnlock()
+
+	// 慢路径：锁外全量扫描
+	result := a.scanThumbCounts()
+	if result == nil {
+		return nil
+	}
+
+	thumbCountsMu.Lock()
+	if thumbCountsValid && !thumbCountsStale {
+		// 扫描期间已有其他协程算好 → 用现成结果，避免覆盖更新的计数
+		counts := copyCounts(cachedThumbCounts)
+		thumbCountsMu.Unlock()
+		return counts
+	}
+	cachedThumbCounts = result
+	thumbCountsValid = true
+	thumbCountsStale = false
+	thumbCountsMu.Unlock()
+
+	// ★ 落盘也放锁外：thumbDBKeyCount() 内部 Bucket.Stats().KeyN 会遍历整棵 B 树
+	//   （488K key 实测 20.9s），不能占着锁做。
+	a.persistThumbCountsSnapshot(result)
+	return copyCounts(result)
+}
+
+// scanThumbCounts 全量扫描 bbolt + SQLite 计算各文件夹缩略图数（无锁，耗时较长）。
+// 同一时刻只允许一次扫描：重复触发直接返回 nil，调用方沿用现有缓存。
+func (a *App) scanThumbCounts() map[string]int {
+	if !thumbScanMu.TryLock() {
+		return nil
+	}
+	defer thumbScanMu.Unlock()
 
 	if err := a.ensureThumbDB(); err != nil {
 		fmt.Printf("[缩略图] thumbCounts 缓存预热跳过: %v\n", err)
 		return nil
 	}
-	if a.imageDB == nil {
+	if a.imageDB == nil || a.thumbDB == nil {
 		return nil
 	}
 
@@ -1353,11 +1439,7 @@ func (a *App) computeThumbCounts() map[string]int {
 		}
 	}
 
-	cachedThumbCounts = result
-	thumbCountsValid = true
-	// ★ 持久化到磁盘，供下次冷启动直接恢复（避免每次启动全量扫 8.6GB BoltDB + SQLite）
-	a.persistThumbCountsLocked()
-	return copyCounts(result)
+	return result
 }
 
 // ==================== thumbCounts 持久化 ====================
@@ -1397,9 +1479,12 @@ func (a *App) thumbDBKeyCount() int {
 	return n
 }
 
-// persistThumbCountsLocked 写入磁盘（调用方需已持 thumbCountsMu）
-func (a *App) persistThumbCountsLocked() {
-	counts := copyCounts(cachedThumbCounts)
+// persistThumbCountsSnapshot 用给定快照写盘。不要求持锁——内部 thumbDBKeyCount()
+// 会遍历整棵 B 树（秒级），必须能在锁外调用。
+func (a *App) persistThumbCountsSnapshot(counts map[string]int) {
+	if counts == nil {
+		return
+	}
 	keyCount := a.thumbDBKeyCount()
 	if keyCount < 0 || a.userDataDir == "" {
 		return
@@ -1420,14 +1505,19 @@ func (a *App) persistThumbCountsLocked() {
 	}
 }
 
-// persistThumbCounts 供关闭流程调用（自持锁）
+// persistThumbCounts 供关闭流程调用。
+// ★ stale 时不落盘：否则会把"上次的计数"配上当前库的 size/mtime 写成"有效缓存"，
+//   下次启动误判为一致，错误计数就永久固化了。
+// ★ 只持锁取快照，全树 KeyN 统计（秒级）在锁外做，避免关闭时长时间占锁。
 func (a *App) persistThumbCounts() {
 	thumbCountsMu.RLock()
-	defer thumbCountsMu.RUnlock()
-	if !thumbCountsValid {
+	if !thumbCountsValid || thumbCountsStale {
+		thumbCountsMu.RUnlock()
 		return
 	}
-	a.persistThumbCountsLocked()
+	counts := copyCounts(cachedThumbCounts)
+	thumbCountsMu.RUnlock()
+	a.persistThumbCountsSnapshot(counts)
 }
 
 // loadThumbCountsFromDisk 启动时尝试恢复 thumbCounts。
@@ -1460,12 +1550,21 @@ func (a *App) loadThumbCountsFromDisk() {
 		}
 	}
 	if dbChanged {
-		fmt.Printf("[缩略图] 缩略图库有变化（文件元数据与保存时不一致），跳过缓存的 thumbCounts，稍后重算\n")
+		// ★ 库有变化也先把上次的计数装进内存：侧栏立刻显示"上次已知计数"，
+		//   而不是先闪一片 0 再等十几秒全量重算。真实值由后台重算纠正
+		//   （thumbCountsStale → GetFolders 触发 PreloadThumbCounts）。
+		thumbCountsMu.Lock()
+		cachedThumbCounts = f.Counts
+		thumbCountsValid = true
+		thumbCountsStale = true
+		thumbCountsMu.Unlock()
+		fmt.Printf("[缩略图] 缩略图库有变化，先展示上次计数（%d 个文件夹）并后台重算\n", len(f.Counts))
 		return
 	}
 	thumbCountsMu.Lock()
 	cachedThumbCounts = f.Counts
 	thumbCountsValid = true
+	thumbCountsStale = false
 	thumbCountsMu.Unlock()
 	fmt.Printf("[缩略图] 从磁盘恢复 thumbCounts（%d 个文件夹）\n", len(f.Counts))
 }
@@ -1486,6 +1585,13 @@ func (a *App) getCachedThumbCounts() map[string]int {
 		return nil
 	}
 	return copyCounts(cachedThumbCounts)
+}
+
+// thumbCountsNeedRefresh 是否需要后台重算：缓存未就绪，或已从磁盘恢复但与缩略图库不一致。
+func (a *App) thumbCountsNeedRefresh() bool {
+	thumbCountsMu.RLock()
+	defer thumbCountsMu.RUnlock()
+	return !thumbCountsValid || thumbCountsStale
 }
 
 // PreloadThumbCounts 预热 thumbCounts 缓存（启动时异步调用，避免 GetFolders 首次阻塞）
@@ -1560,6 +1666,9 @@ func (a *App) incrementThumbCount(imageID string) {
 	thumbCountsMu.Lock()
 	if !thumbCountsValid {
 		thumbCountsMu.Unlock()
+		// 计数尚未就绪（首次运行 / 后台重算中）：无法累加，但仍要发一次通知——
+		// 前端据此自愈已显示 "Load failed" 的卡片（此时字节已落库，重试必命中）。
+		a.throttleThumbProgress()
 		return
 	}
 	// 记录本次变化的文件夹新计数（含所有上级），供 thumb:progress 增量定向通知
@@ -1587,6 +1696,24 @@ func (a *App) incrementThumbCount(imageID string) {
 	thumbNotifyMu.Unlock()
 
 	a.throttleThumbProgress()
+}
+
+// clearThumbCountsForRoot 删除某根目录（含其所有子路径）的缩略图计数缓存。
+// ★ 删除根目录 / 全量重扫时必须清：缩略图字节由 removeThumbsByIDs 删除，但计数是
+// 增量累加的（incrementThumbCount），不清就会在旧值上继续加 ——
+// 表现为"删除后重新导入，缩略图数量翻倍或只重复一部分"。
+func (a *App) clearThumbCountsForRoot(rootPath string) {
+	rootNorm := strings.ReplaceAll(rootPath, "\\", "/")
+	thumbCountsMu.Lock()
+	if cachedThumbCounts != nil {
+		delete(cachedThumbCounts, rootNorm)
+		for k := range cachedThumbCounts {
+			if strings.HasPrefix(k, rootNorm+"/") {
+				delete(cachedThumbCounts, k)
+			}
+		}
+	}
+	thumbCountsMu.Unlock()
 }
 
 // takeThumbFolderCountsLocked 取出并清空待通知的文件夹缩略图计数（调用方需持有 thumbNotifyMu）

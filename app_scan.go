@@ -74,7 +74,7 @@ func (a *App) scanAllFolders() int {
 		a.mu.RUnlock()
 		if len(missingRoots) > 0 {
 			fmt.Printf("[扫描] 增量扫描 %d 个缺失根目录（保留现有 %d 张图片）\n", len(missingRoots), len(a.images))
-			// ★ 串行扫描：scanRootAsync 末尾 rebuildFolderCountsFromSQLLocked 会
+			// ★ 串行扫描：scanRootAsync 末尾 rebuildFolderCountsFromSQL 会
 			//   重建整个 folderCount，若并行扫会导致计数互相覆盖回退。
 			for _, rootPath := range missingRoots {
 				// ★ 跳过正在被快速导入扫描的根目录，避免并发抢改同一批索引/SQLite
@@ -105,7 +105,7 @@ func (a *App) scanAllFolders() int {
 	//   scan:complete。相比旧的"并行扫描→一次性合并"方案，用户能立即看到
 	//   数字变化并点击已扫到的图片。
 	//   注意：多个 root 必须串行扫描——scanRootAsync 末尾会
-	//   rebuildFolderCountsFromSQLLocked 用 SQLite 重建整个 folderCount，
+	//   rebuildFolderCountsFromSQL 用 SQLite 重建整个 folderCount，
 	//   若并行扫，先扫完的 root 会把仍在内存增长、尚未落库的 root 计数冲掉，
 	//   导致侧栏数字回退。串行保证每个 root 扫完都已落库，重建计数正确。
 	totalCount := 0
@@ -446,6 +446,9 @@ func (a *App) removeByRoot(rootPath string) {
 
 	// 清理对应的缩略图缓存
 	a.removeThumbsByIDs(idsToRemove)
+	// ★ 同步清掉该根目录（含子路径）的缩略图计数缓存：否则重新导入后
+	//   缩略图计数会在旧值上继续累加，表现为"数量翻倍 / 只重复一部分"。
+	a.clearThumbCountsForRoot(rootPath)
 }
 
 // removeByRootFromMemory 只清除内存中的 images 和 folderIndex
@@ -861,8 +864,9 @@ func (a *App) pruneFolderKeys(deadKeys []string) (prunedFolders int, prunedImage
 		delete(a.images, id)
 	}
 	a.evictLRU()
-	a.rebuildFolderCountsFromSQLLocked()
 	a.mu.Unlock()
+	// ★ 锁外重建（内部先无锁算 SQL，再短暂持锁换入），避免长事务卡住读操作
+	a.rebuildFolderCountsFromSQL()
 
 	prunedFolders = len(deadKeys)
 	prunedImages = len(deadIDs)
@@ -977,6 +981,22 @@ func (a *App) isRootNestedLockedNorm(norm string) bool {
 		}
 	}
 	return false
+}
+
+// owningRootLockedNorm 返回包含 norm 的最近（最长匹配）已注册根目录；
+// 没有则返回空串。调用方需已持有 a.mu 读锁或写锁。
+// 用于嵌套虚拟根：它的图片记在这个外层父根名下。
+func (a *App) owningRootLockedNorm(norm string) string {
+	best := ""
+	bestLen := -1
+	for root := range a.registeredRoots {
+		rn := strings.ToLower(strings.ReplaceAll(root, "\\", "/"))
+		if rn != norm && strings.HasPrefix(norm, rn+"/") && len(rn) > bestLen {
+			best = root
+			bestLen = len(rn)
+		}
+	}
+	return best
 }
 
 // rootSubtreeCount 返回 rootPath 目录下已索引的图片总数（含所有子目录）。
@@ -1268,15 +1288,28 @@ func (a *App) scanRootAsync(rootPath string) int {
 			a.mu.Unlock()
 			return
 		}
+		// ★ 幂等合并：本根目录的图片在扫描期间仍在内存里（末尾才 removeByRootFromMemory 重置），
+		//   原实现对每个批次无条件 append folderIndex + incrementFolderCounts，
+		//   会把已在内存的图片重复计入 —— 扫描中查看计数就是 2 倍；
+		//   扫描若被中断（如中途删除该根目录），重复状态会长期留在内存里。
+		//   已存在的 ID 只刷新条目数据，不重复追加、不重复计数。
+		newBatch := make(map[string]*ImageEntry, len(batchImages))
 		for k, v := range batchImages {
+			if _, exists := a.images[k]; !exists {
+				newBatch[k] = v
+			}
 			a.images[k] = v
 			localImages[k] = v
 		}
 		for k, v := range batchFolderIndex {
-			a.folderIndex[k] = append(a.folderIndex[k], v...)
 			localFolderIndex[k] = append(localFolderIndex[k], v...)
+			for _, id := range v {
+				if _, ok := newBatch[id]; ok {
+					a.folderIndex[k] = append(a.folderIndex[k], id)
+				}
+			}
 		}
-		a.incrementFolderCounts(batchImages)
+		a.incrementFolderCounts(newBatch)
 		a.mu.Unlock()
 
 		totalCount += batchCount
@@ -1329,8 +1362,9 @@ func (a *App) scanRootAsync(rootPath string) int {
 
 	a.mu.Lock()
 	a.evictLRU()
-	a.rebuildFolderCountsFromSQLLocked()
 	a.mu.Unlock()
+	// ★ 锁外重建计数：原来在写锁内跑全表 GROUP BY，扫描结束后会卡住所有读操作数秒
+	a.rebuildFolderCountsFromSQL()
 
 	// ★ 扫描完成：自动低优预生成缺失缩略图（后台 goroutine，不阻塞 scan:complete）。
 	//   新导入的文件夹在用户滚动前就补齐缩略图，避免首屏滚动卡顿。
@@ -1662,7 +1696,7 @@ func (a *App) refreshFolderInternal(folderPath string) *FolderDiffResult {
 
 	// ★ 正在被快速导入/全量扫描的根目录：跳过本次刷新。
 	//   否则 refreshFolderInternal 与在跑的扫描并发改同一批 memory/SQLite
-	//   （快照→删→写回→rebuildFolderCountsFromSQLLocked），会把导入中的
+	//   （快照→删→写回→rebuildFolderCountsFromSQL），会把导入中的
 	//   folderIndex/计数/SQLite 冲成残缺，表现为"导入中点刷新后文件夹消失/计数回退"。
 	a.scanMu.Lock()
 	beingScanned := a.scanningRoots[matchedRoot]
@@ -1871,10 +1905,8 @@ func (a *App) refreshFolderInternal(folderPath string) *FolderDiffResult {
 	if len(addedEntries) == 0 && len(removedIDs) == 0 {
 		// ★ 即使没有增删，也重建一次该根目录计数：可能上次导入/落库被并发扫描干扰，
 		//   导致 folderCount 停留在偏小/0 值（表现为"点刷新计数一直不变"）。数据已完整，
-		//   从 SQLite 重建一次最稳妥。
-		a.mu.Lock()
-		a.rebuildFolderCountsFromSQLLocked()
-		a.mu.Unlock()
+		//   从 SQLite 重建一次最稳妥（函数内部自己加锁，不在锁内跑全表 GROUP BY）。
+		a.rebuildFolderCountsFromSQL()
 		return &FolderDiffResult{Added: []SafeImage{}, Removed: []string{}, Unchanged: unchanged, Success: true}
 	}
 
@@ -2055,8 +2087,8 @@ func (a *App) refreshFolderInternal(folderPath string) *FolderDiffResult {
 	a.invalidateParamTags()
 	a.mu.Lock()
 	a.evictLRU()
-	a.rebuildFolderCountsFromSQLLocked()
 	a.mu.Unlock()
+	a.rebuildFolderCountsFromSQL()
 
 	// ★ 增量刷新完成：自动低优预生成新增图片的缺失缩略图（后台执行，不阻塞返回）
 	if len(addedEntries) > 0 {

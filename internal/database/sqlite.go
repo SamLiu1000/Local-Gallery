@@ -167,10 +167,6 @@ func (idb *ImageDB) initSchema() error {
 		INSERT INTO images_fts(rowid, name, prompt, negative_prompt, path, params_json)
 		VALUES (new.rowid, new.name, new.prompt, new.negative_prompt, new.path, new.params_json);
 	END;
-	CREATE TRIGGER IF NOT EXISTS images_fts_ad AFTER DELETE ON images BEGIN
-		INSERT INTO images_fts(images_fts, rowid, name, prompt, negative_prompt, path, params_json)
-		VALUES ('delete', old.rowid, old.name, old.prompt, old.negative_prompt, old.path, old.params_json);
-	END;
 	CREATE TRIGGER IF NOT EXISTS images_fts_au AFTER UPDATE ON images BEGIN
 		INSERT INTO images_fts(images_fts, rowid, name, prompt, negative_prompt, path, params_json)
 		VALUES ('delete', old.rowid, old.name, old.prompt, old.negative_prompt, old.path, old.params_json);
@@ -198,6 +194,12 @@ func (idb *ImageDB) initSchema() error {
 	`
 	_, err := idb.db.Exec(schema)
 	if err != nil {
+		return err
+	}
+	// ★ 全文索引删除触发器单独执行（定义在 ftsDeleteTriggerSQL）：
+	//   大目录删除会临时 DROP 它、删完再按同一份定义重建，保证两处定义永远一致。
+	//   每次启动都执行一次 IF NOT EXISTS，即使上次删除中途崩溃也能自动补回。
+	if _, err := idb.db.Exec(ftsDeleteTriggerSQL); err != nil {
 		return err
 	}
 	// 迁移：添加 created_at 列（列已存在时忽略错误）
@@ -322,36 +324,155 @@ func (idb *ImageDB) GetImageRecord(id string) *ImageRecord {
 // ==================== 删除操作 ====================
 
 func (idb *ImageDB) DeleteByRoot(rootPath string) (int, error) {
-	idb.mu.Lock()
-	defer idb.mu.Unlock()
-	// ★ 分批删除：images 表带 FTS5 全文搜索触发器（images_fts_ad），每删一行都会
-	//   同步更新搜索索引，删除大文件夹时单个长事务会长时间独占 idb.mu，卡住所有
-	//   需要读库的 UI 操作。分批提交让锁周期性释放，其它读操作可穿插执行。
+	// ★ 超大目录走"临时禁用全文索引删除触发器 + 删完重建索引"的快路径：
+	//   逐行维护 FTS 删除实测约 50µs/行（删 17.8 万行 ≈ 9 秒），而整表重建索引
+	//   约 15µs/行。当待删行数够多、且占整表比例够高时，重建明显更快。
+	if idb.shouldRebuildFTSForDelete(rootPath) {
+		return idb.deleteByRootWithFTSRebuild(rootPath)
+	}
+	// 普通规模：分批删除，且每批单独加锁：images 表带 FTS5 全文搜索触发器（images_fts_ad），
+	//   每删一行都会同步更新搜索索引。若整个删除过程一直持有 idb.mu（原实现如此），
+	//   删除大文件夹期间所有读查询（GetImages 等）都会被阻塞 ——
+	//   表现为"删除文件夹时点别的文件夹加载不出图"。批间释放锁，读操作可穿插执行。
 	const batchSize = 1000
 	var total int
 	for {
-		tx, err := idb.db.Begin()
+		affected, err := idb.deleteByRootBatch(rootPath, batchSize)
+		total += affected
 		if err != nil {
 			return total, err
 		}
-		res, err := tx.Exec(
-			"DELETE FROM images WHERE id IN (SELECT id FROM images WHERE root_path = ? LIMIT ?)",
-			rootPath, batchSize,
-		)
-		if err != nil {
-			tx.Rollback()
-			return total, err
-		}
-		if err := tx.Commit(); err != nil {
-			return total, err
-		}
-		affected, _ := res.RowsAffected()
-		total += int(affected)
 		if affected < batchSize {
+			return total, nil
+		}
+	}
+}
+
+// ftsDeleteTriggerSQL 是 images 表的全文索引删除触发器定义。
+// ★ 单独定义成常量：DeleteByRoot 的快路径会临时 DROP 它、删完再用这份定义重建，
+//   保证"建触发器"与"恢复触发器"永远用同一份 SQL。
+const ftsDeleteTriggerSQL = `CREATE TRIGGER IF NOT EXISTS images_fts_ad AFTER DELETE ON images BEGIN
+	INSERT INTO images_fts(images_fts, rowid, name, prompt, negative_prompt, path, params_json)
+	VALUES ('delete', old.rowid, old.name, old.prompt, old.negative_prompt, old.path, old.params_json);
+END;`
+
+// shouldRebuildFTSForDelete 判断本次删除是否值得走"删完重建索引"的快路径。
+// 判据：待删行数 ≥ minRows，且占 images 总行数 ≥ minPercent%。
+// ★ 阈值按实测标定：不删触发器约 50µs/行、删触发器约 26µs/行、重建索引约 18µs/行，
+//   代入 删D×50 = 删D×26 + 剩余R×18 得临界 D/R ≈ 0.75（即待删 ≥ 总行数的 ~43%）。
+//   取 50% 留出余量，避免在临界点附近反而变慢。
+func (idb *ImageDB) shouldRebuildFTSForDelete(rootPath string) bool {
+	const minRows = 30000
+	const minPercent = 50
+
+	idb.mu.RLock()
+	var toDelete int
+	err := idb.db.QueryRow(`SELECT COUNT(*) FROM images WHERE root_path = ?`, rootPath).Scan(&toDelete)
+	idb.mu.RUnlock()
+	if err != nil || toDelete < minRows {
+		return false
+	}
+
+	idb.mu.RLock()
+	var total int
+	err = idb.db.QueryRow(`SELECT COUNT(*) FROM images`).Scan(&total)
+	idb.mu.RUnlock()
+	if err != nil || total <= 0 {
+		return false
+	}
+	return toDelete*100 >= total*minPercent
+}
+
+// deleteByRootWithFTSRebuild 快路径：移除 FTS 删除触发器 → 快速批量删除 →
+// 恢复触发器 → 用独立连接重建全文索引（顺带清掉期间所有残留的旧索引条目）。
+func (idb *ImageDB) deleteByRootWithFTSRebuild(rootPath string) (int, error) {
+	// 1. 移除删除触发器。★ 崩溃兜底：下次启动 initSchema 的
+	//    CREATE TRIGGER IF NOT EXISTS 会把它补回来。
+	if _, err := idb.execLocked(`DROP TRIGGER IF EXISTS images_fts_ad`); err != nil {
+		return 0, err
+	}
+
+	// 2. 快速批量删除（此期间不再逐行维护全文索引）
+	const batchSize = 5000
+	var total int
+	var delErr error
+	for {
+		res, err := idb.execLocked(
+			`DELETE FROM images WHERE id IN (SELECT id FROM images WHERE root_path = ? LIMIT ?)`,
+			rootPath, batchSize)
+		if err != nil {
+			delErr = err
+			break
+		}
+		n, _ := res.RowsAffected()
+		total += int(n)
+		if int(n) < batchSize {
 			break
 		}
 	}
+
+	// 3. 先恢复触发器（无论删除成败），再做重建
+	_, trigErr := idb.execLocked(ftsDeleteTriggerSQL)
+	if delErr != nil {
+		return total, delErr
+	}
+	if trigErr != nil {
+		return total, trigErr
+	}
+
+	// 4. 重建全文索引
+	if err := idb.rebuildFTSIndex(); err != nil {
+		return total, err
+	}
+	fmt.Printf("[搜索索引] 大目录删除完成（%d 行），已重建全文索引\n", total)
 	return total, nil
+}
+
+// execLocked 持 idb.mu 执行一条 SQL。
+func (idb *ImageDB) execLocked(query string, args ...interface{}) (sql.Result, error) {
+	idb.mu.Lock()
+	defer idb.mu.Unlock()
+	return idb.db.Exec(query, args...)
+}
+
+// rebuildFTSIndex 用独立连接重建全文索引。
+// ★ 主连接池 MaxOpenConns=1，在它上面跑几十秒的重建会把应用所有 DB 操作冻结；
+//   独立连接下 WAL 并发读不受影响（与 rebuildSearchFTSIfNeeded 同一套做法）。
+func (idb *ImageDB) rebuildFTSIndex() error {
+	rebuildDB, err := sql.Open("sqlite", idb.dbPath+"?cache=shared&_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=60000")
+	if err != nil {
+		return err
+	}
+	defer rebuildDB.Close()
+	start := time.Now()
+	if _, err := rebuildDB.Exec(`INSERT INTO images_fts(images_fts) VALUES('rebuild')`); err != nil {
+		return err
+	}
+	fmt.Printf("[搜索索引] FTS 重建完成，耗时 %s\n", time.Since(start).Round(time.Millisecond))
+	return nil
+}
+
+// deleteByRootBatch 删除一批属于 rootPath 的 images 行（独立加锁，批间释放 idb.mu）。
+func (idb *ImageDB) deleteByRootBatch(rootPath string, batchSize int) (int, error) {
+	idb.mu.Lock()
+	defer idb.mu.Unlock()
+	tx, err := idb.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	res, err := tx.Exec(
+		"DELETE FROM images WHERE id IN (SELECT id FROM images WHERE root_path = ? LIMIT ?)",
+		rootPath, batchSize,
+	)
+	if err != nil {
+		tx.Rollback()
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	affected, _ := res.RowsAffected()
+	return int(affected), nil
 }
 
 func (idb *ImageDB) DeleteImage(id string) error {
@@ -1060,26 +1181,26 @@ func (idb *ImageDB) SaveImageCacheBatch(entries []ImageCacheEntry) error {
 
 // DeleteImageCacheByRoot 删除指定根目录下的所有 image_cache 记录
 func (idb *ImageDB) DeleteImageCacheByRoot(rootPath string) (int, error) {
-	idb.mu.Lock()
-	defer idb.mu.Unlock()
-	// ★ 分批删除：与 DeleteByRoot 同理，避免删除大文件夹时单事务长期独占 idb.mu。
+	// ★ 与 DeleteByRoot 同理：每批独立加锁，批间释放 idb.mu，
+	//   避免删除大文件夹期间独占数据库锁、卡住其它文件夹的读查询。
 	const batchSize = 1000
 	var total int
 	for {
+		idb.mu.Lock()
 		res, err := idb.db.Exec(
 			"DELETE FROM image_cache WHERE id IN (SELECT id FROM image_cache WHERE root_path = ? LIMIT ?)",
 			rootPath, batchSize,
 		)
+		idb.mu.Unlock()
 		if err != nil {
 			return total, err
 		}
 		affected, _ := res.RowsAffected()
 		total += int(affected)
-		if affected < batchSize {
-			break
+		if int(affected) < batchSize {
+			return total, nil
 		}
 	}
-	return total, nil
 }
 
 // DeleteImageCacheBatch 批量从 image_cache 删除指定 ID 的记录
@@ -1269,6 +1390,35 @@ func (idb *ImageDB) LoadImageCacheByRoot(rootPath string) ([]ImageCacheEntry, er
 	defer idb.mu.RUnlock()
 	rows, err := idb.db.Query(`SELECT id, path, name, size, last_modified, created_at,
 		folder, root_path, width, height, is_video FROM image_cache WHERE root_path=?`, rootPath)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var entries []ImageCacheEntry
+	for rows.Next() {
+		var e ImageCacheEntry
+		var isVideo int
+		if err := rows.Scan(&e.ID, &e.Path, &e.Name, &e.Size, &e.LastModified,
+			&e.CreatedAt, &e.Folder, &e.RootPath, &e.Width, &e.Height, &isVideo); err != nil {
+			return entries, err
+		}
+		e.IsVideo = isVideo != 0
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
+// LoadImageCacheByPathPrefix 加载某个文件夹（含其所有子目录）下的全部图片缓存记录。
+// ★ 专为"嵌套虚拟根"：这些记录在库里 root_path 记的是外层父根目录，按 root_path
+// 精确匹配会得到 0 条（点索引按钮就报"无图片需索引"）。必须按完整路径前缀取。
+// image_cache 有 path 索引，范围查询走索引。
+func (idb *ImageDB) LoadImageCacheByPathPrefix(pathPrefix string) ([]ImageCacheEntry, error) {
+	idb.mu.RLock()
+	defer idb.mu.RUnlock()
+	lower := pathPrefix + "\\"
+	upper := lower + "\uFFFF"
+	rows, err := idb.db.Query(`SELECT id, path, name, size, last_modified, created_at,
+		folder, root_path, width, height, is_video FROM image_cache WHERE path >= ? AND path < ?`, lower, upper)
 	if err != nil {
 		return nil, err
 	}

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"sync"
 )
@@ -38,11 +39,13 @@ func (a *App) SetThumbDir(path string) map[string]interface{} {
 	return map[string]interface{}{"success": true}
 }
 
-func (a *App) serveThumbnail(imageID string) ([]byte, error) {
+func (a *App) serveThumbnail(ctx context.Context, imageID string) ([]byte, error) {
 	return nil, errors.New("stub: not available in bindings build")
 }
 
 func (a *App) startPreGenThumbs(folder string, entries []*ImageEntry) {}
+
+func (a *App) clearThumbCountsForRoot(rootPath string) {}
 
 func (a *App) StartPreGenThumbs(folders []string) map[string]interface{} {
 	return map[string]interface{}{"success": false, "message": "stub: not available in bindings build"}
@@ -98,9 +101,9 @@ func (a *App) scheduleThumbCountPreload() {}
 
 func (a *App) getCachedThumbCounts() map[string]int { return nil }
 
-func (a *App) thumbDBKeyCount() int { return -1 }
+func (a *App) thumbCountsNeedRefresh() bool { return false }
 
-func (a *App) persistThumbCountsLocked() {}
+func (a *App) thumbDBKeyCount() int { return -1 }
 
 func (a *App) persistThumbCounts() {}
 

@@ -55,7 +55,7 @@ func (a *App) startLANServerWithPort(port int) {
 	// 缩略图
 	mux.HandleFunc("/thumb/", func(w http.ResponseWriter, r *http.Request) {
 		imageID := strings.TrimPrefix(r.URL.Path, "/thumb/")
-		jpegBytes, err := a.serveThumbnail(imageID)
+		jpegBytes, err := a.serveThumbnail(r.Context(), imageID)
 		if err != nil {
 			http.NotFound(w, r)
 			return

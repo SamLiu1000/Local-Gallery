@@ -537,6 +537,7 @@ const Gallery = (() => {
         // 滚动：每帧立即更新虚拟滚动，Observer 重连在滚动停止后的下一个宏任务执行
         let _scrollRafPending = false;
         let _observerDebounceTimer = null;
+        let _lastAbortAt = 0;
 
         galleryScroll.addEventListener('scroll', () => {
             scrollTop = galleryScroll.scrollTop;
@@ -553,6 +554,7 @@ const Gallery = (() => {
             }
 
             _isScrolling = true;
+            _thumbScrollBurst = true;
 
             // ★ 滚动时冻结卡片 transition，减少样式重算
             if (!galleryGrid.classList.contains('is-scrolling')) {
@@ -567,6 +569,14 @@ const Gallery = (() => {
                     if (currentLayout === 'grid' || currentLayout === 'masonry' || currentLayout === 'pinterest' || currentLayout === 'list') {
                         updateVirtualScroll();
                     }
+                    // ★ 视窗优先（限流）：滚动中定期把已进入视窗的缩略图立刻发起来，
+                    //   并中止已滚出视窗的在途请求，把连接槽让给当前视窗内的图。
+                    const now = performance.now();
+                    if (now - _lastAbortAt > 250) {
+                        _lastAbortAt = now;
+                        _resumeImageObserver();
+                        _abortOutOfViewportLoads();
+                    }
                     checkLoadMoreOnScroll(true);
                 });
             }
@@ -577,6 +587,7 @@ const Gallery = (() => {
                 _isScrolling = false;
                 _observerDebounceTimer = null;
                 galleryGrid.classList.remove('is-scrolling');
+                _thumbScrollBurst = false; // ★ 滚动停止：恢复预取，补上视窗外的图
                 _resumeImageObserver();
                 checkLoadMoreOnScroll();
             }, 150);
@@ -782,25 +793,26 @@ const Gallery = (() => {
     }
 
     function initIntersectionObserver() {
-        // rootMargin：视窗上下各扩展 3 屏，保证图片在进入视野前已经完成下载
+        // rootMargin：视窗上下各扩展 2 屏（预取窗口）。
+        // ★ 原来是 3 屏，配合"卡片一插入就赋 src"会让视窗外很远的图也抢连接；
+        //   现在预取严格排在"立即加载窗口"（视窗上 0.5 屏 / 下 1.5 屏）之后。
         function _getPreloadMargin() {
             const vh = galleryScroll ? galleryScroll.clientHeight : window.innerHeight;
-            return Math.max(vh * 3, 1200);
+            return Math.max(vh * 2, 800);
         }
 
         function _createObserver() {
             const margin = _getPreloadMargin();
             return new IntersectionObserver((entries) => {
                 for (const entry of entries) {
-                    if (entry.isIntersecting) {
-                        const img = entry.target;
-                        const dataSrc = img.dataset.src;
-                        if (dataSrc) {
-                            img.src = dataSrc;
-                            img.removeAttribute('data-src');
-                        }
-                        intersectionObserver.unobserve(img);
-                    }
+                    if (!entry.isIntersecting) continue;
+                    const img = entry.target;
+                    // ★ 滚动中不预取：卡片滚过 2 屏预取边界时不应立刻发请求。
+                    //   unobserve 以便滚动停止后重新观察并立即触发一次回调。
+                    if (_thumbScrollBurst) { intersectionObserver.unobserve(img); continue; }
+                    // 统一走 _startThumbLoad：清 _deferred 标志、武装超时兜底
+                    if (img.dataset.src) _startThumbLoad(img);
+                    else intersectionObserver.unobserve(img);
                 }
             }, {
                 root: galleryScroll,
@@ -826,26 +838,13 @@ const Gallery = (() => {
     }
 
     /**
-     * 滚动停止后：把新进入 DOM 但还未被 observe 的图片注册到 Observer。
-     * 同时对视窗前方 3 屏内的图片直接赋 src，跳过 Observer 回调延迟。
+     * 滚动停止后（以及滚动中节流调用）：把待加载的缩略图按当前视窗位置重新分派——
+     * 视窗内的立即赋 src，近处的交给 Observer 预取。
+     * ★ 原来是"视窗下方 4 屏内直接加载"，会把滚动路径上的图一次性全拉起来。
      */
     function _resumeImageObserver() {
-        if (!intersectionObserver) return;
-        const vh = galleryScroll ? galleryScroll.clientHeight : window.innerHeight;
-        const preloadBottom = galleryScroll.scrollTop + vh * 4; // 视窗下方 4 屏内直接加载
-
-        galleryGrid.querySelectorAll('img[data-src]').forEach(img => {
-            // 用卡片的 offsetTop 判断是否在预加载范围内（比 getBoundingClientRect 快）
-            const cardTop = img.closest('.image-card')?.offsetTop ?? img.offsetTop;
-            if (cardTop < preloadBottom) {
-                // 在预加载范围内：直接赋 src，不等 Observer 回调
-                img.src = img.dataset.src;
-                img.removeAttribute('data-src');
-                intersectionObserver.unobserve(img);
-            } else {
-                intersectionObserver.observe(img);
-            }
-        });
+        const win = _thumbLoadWindow();
+        galleryGrid.querySelectorAll('img[data-src]').forEach(img => _dispatchThumb(img, win));
     }
 
     /**
@@ -945,80 +944,33 @@ const Gallery = (() => {
     }
 
     /**
-     * ★ 触发分页加载前调用：中止视口外正在传输中的图片请求，释放 HTTP 连接槽。
+     * ★ 视窗优先：中止视口外正在传输中的图片请求，释放 HTTP 连接槽。
      *   视口内已在加载的图片不受影响，保证用户当前看到的内容不闪烁。
+     *   缓冲带 2.5 屏（大于预取窗口 2 屏），避免误杀即将进入视窗的预取图、来回抖动。
      */
     function _abortOutOfViewportLoads() {
         const galleryRect = galleryScroll.getBoundingClientRect();
-
-        // ★ 增加上下各 1.5 倍视窗高度的缓冲带，防止误杀预加载区域的卡片
-        const buffer = galleryRect.height * 1.5;
+        const buffer = galleryRect.height * 2.5;
         const viewTop = galleryRect.top - buffer;
         const viewBottom = galleryRect.bottom + buffer;
 
-        // 找出有 src（正在加载中）且位于视口外的图片
         const loadingImgs = galleryGrid.querySelectorAll('img[src]:not([src=""])');
         for (const img of loadingImgs) {
             // 跳过已完成加载的图片（naturalWidth > 0 表示已解码完成）
             if (img.complete && img.naturalWidth > 0) continue;
             const rect = img.getBoundingClientRect();
-            // 使用带缓冲的边界判定
-            const inViewport = rect.bottom >= viewTop && rect.top <= viewBottom;
-            if (!inViewport) {
-                // 中止：把 src 存回 data-src，清空 src 释放连接槽
-                if (!img.dataset.src) {
-                    img.dataset.src = img.src;
-                }
-                img.src = '';
-                img.classList.add('loading');
-            }
+            if (rect.bottom >= viewTop && rect.top <= viewBottom) continue;
+            _deferThumbLoad(img);
         }
     }
 
     /**
-     * ★ 缩略图预温热：只在当前视窗/渲染窗口紧邻后方预加载少量图片，
-     *   让滚动进入视野前已下载好（丝滑）；视窗之外的图片不做预加载，
-     *   由虚拟滚动删除 DOM + 停止加载，节省性能。
-     *   并发控制：同时最多发起 maxConcurrency 个请求，避免预加载占满
-     *   浏览器连接池导致可见区域图片排队等待。
+     * ★ 已由"视窗优先加载调度"取代（见 _queueThumbLoad / _flushThumbLoads / IntersectionObserver）。
+     *   原来这里用 new Image() 并发预取 10 个（共 12 个连接），会把视窗内图片的连接槽挤掉；
+     *   现在预取统一由 observer 的 1 屏 rootMargin 承担，且严格排在视窗内图片之后。
      */
-    let _prewarmActive = 0;
-    const _prewarmMaxConcurrent = 10; // 两个缩略图 origin 共 12 连接，预取留 2 给可见区域
-    let _prewarmPending = [];
-
     function _prewarmThumbnails(displayImages, currentStart, currentEnd) {
-        if (!displayImages || displayImages.length === 0) return;
-        // 只预加载紧邻渲染窗口后方的一屏余量（约 1 屏列数），
-        // 而不是一次 100 张——视窗外过远的图交给滚动时再加载，省性能。
-        const perScreen = getColumnCount();
-        const prewarmCount = Math.min(perScreen, 40);
-        const prewarmStart = currentEnd;
-        const prewarmEnd = Math.min(displayImages.length, currentEnd + prewarmCount);
-        for (let i = prewarmStart; i < prewarmEnd; i++) {
-            const imgData = displayImages[i];
-            if (imgData && imgData.thumbnailUrl) {
-                _prewarmPending.push(imgData.thumbnailUrl);
-            }
-        }
-        _drainPrewarm();
-    }
-
-    function _drainPrewarm() {
-        // 队列只保留最近一批，防止滚动期间无限堆积
-        if (_prewarmPending.length > 120) {
-            _prewarmPending = _prewarmPending.slice(-120);
-        }
-        while (_prewarmActive < _prewarmMaxConcurrent && _prewarmPending.length > 0) {
-            const url = _prewarmPending.shift();
-            _prewarmActive++;
-            const preImg = new Image();
-            preImg.decoding = 'async';
-            preImg.onload = preImg.onerror = () => {
-                _prewarmActive--;
-                _drainPrewarm();
-            };
-            preImg.src = url;
-        }
+        return;
     }
 
 
@@ -1598,7 +1550,7 @@ const Gallery = (() => {
 
             // ★ 导入后不渲染图片，只更新文件夹树（由 Sidebar 调用 refreshFolderTree）
             // 清空画廊显示，避免空白
-            galleryGrid.innerHTML = '';
+            _clearGrid();
             galleryGrid.className = 'gallery-grid';
             showGalleryPlaceholder('请点击左侧文件夹来浏览图片');
 
@@ -1855,7 +1807,7 @@ const Gallery = (() => {
         progressiveRenderCancel = false;
 
         // 清空画廊
-        galleryGrid.innerHTML = '';
+        _clearGrid();
         galleryGrid.className = 'gallery-grid';
         updateGridColumns();
 
@@ -2691,7 +2643,7 @@ const Gallery = (() => {
             showLoading(true);
             try {
                 // ★ 问题一修复：先清空图廊，避免显示旧内容
-                galleryGrid.innerHTML = '';
+                _clearGrid();
                 galleryGrid.className = 'gallery-grid';
 
                 // ★ 问题三修复：如果 forceRefresh，先调用后端重新扫描
@@ -2789,6 +2741,7 @@ const Gallery = (() => {
                         folderCacheMeta[normalizedFolder] = { total: retryResult.total };
                         if (serverImages.length === 0) {
                             showLoading(false);
+                            _harvestGridCards();
                             galleryGrid.innerHTML = `
                                 <div class="folder-empty">
                                     <div class="folder-empty-icon"><span class="icon icon-warning"></span></div>
@@ -2930,7 +2883,7 @@ const Gallery = (() => {
 
         // ★ 即时视觉反馈：清空格子 + 显示加载中
         showLoading(true);
-        galleryGrid.innerHTML = '';
+        _clearGrid();
         galleryGrid.className = 'gallery-grid';
         scrollTop = 0;
         if (galleryScroll) galleryScroll.scrollTop = 0;
@@ -3061,7 +3014,7 @@ const Gallery = (() => {
 
         // ★ 即时视觉反馈
         showLoading(true);
-        galleryGrid.innerHTML = '';
+        _clearGrid();
         galleryGrid.className = 'gallery-grid';
         scrollTop = 0;
         if (galleryScroll) galleryScroll.scrollTop = 0;
@@ -3135,7 +3088,7 @@ const Gallery = (() => {
         // 如果没有任何文件夹被加载过，不自动加载全部
         const hasAnyLoaded = images.some(img => img._loaded);
         if (!hasAnyLoaded) {
-            galleryGrid.innerHTML = '';
+            _clearGrid();
             galleryGrid.className = 'gallery-grid';
             showGalleryPlaceholder('请点击左侧文件夹来浏览图片');
             updateImageCount();
@@ -3191,6 +3144,7 @@ const Gallery = (() => {
      */
     function showScanningPlaceholder() {
         hideGalleryPlaceholder();
+        _harvestGridCards();
         galleryGrid.innerHTML = `
             <div class="folder-empty">
                 <div class="folder-empty-icon">⏳</div>
@@ -3267,6 +3221,7 @@ const Gallery = (() => {
         if (displayImages.length === 0) {
             if (currentFolderFilter) {
                 hideGalleryPlaceholder();
+                _harvestGridCards();
                 galleryGrid.innerHTML = `
                     <div class="folder-empty">
                         <div class="folder-empty-icon"><span class="icon icon-folder"></span></div>
@@ -3274,7 +3229,7 @@ const Gallery = (() => {
                         <p class="folder-empty-hint" data-i18n="gallery.folder_empty_hint">图片较多或硬盘较慢时可能需要一些时间</p>
                     </div>`;
             } else {
-                galleryGrid.innerHTML = '';
+                _clearGrid();
                 showGalleryPlaceholder(I18n.t('gallery.no_images'));
             }
             galleryGrid.className = 'gallery-grid';
@@ -3385,7 +3340,7 @@ const Gallery = (() => {
             spacerBottom.style.cssText = `grid-column:1/-1;height:${Math.max(0, remainingRows * rowHeight)}px`;
             fragment.appendChild(spacerBottom);
 
-            galleryGrid.innerHTML = '';
+            _clearGrid();
             galleryGrid.appendChild(fragment);
             _prewarmThumbnails(displayImages, startIndex, endIndex);
             return;
@@ -3415,6 +3370,7 @@ const Gallery = (() => {
                 // spacerTop 之后第一个卡片
                 const afterSpacer = spacerTop ? spacerTop.nextSibling : galleryGrid.firstChild;
                 if (afterSpacer && afterSpacer !== spacerBottom) {
+                    _retireCard(afterSpacer); // 收进复用池：滚回来直接复用
                     galleryGrid.removeChild(afterSpacer);
                 }
             }
@@ -3427,6 +3383,7 @@ const Gallery = (() => {
             for (let i = 0; i < toRemoveCount; i++) {
                 const beforeSpacer = spacerBottom ? spacerBottom.previousSibling : galleryGrid.lastChild;
                 if (beforeSpacer && beforeSpacer !== spacerTop) {
+                    _retireCard(beforeSpacer); // 收进复用池：滚回来直接复用
                     galleryGrid.removeChild(beforeSpacer);
                 }
             }
@@ -3513,7 +3470,7 @@ const Gallery = (() => {
     function renderMasonry(displayImages) {
         hideGalleryPlaceholder();
         galleryGrid.className = 'gallery-grid masonry';
-        galleryGrid.innerHTML = '';
+        _clearGrid();
 
         const rowH = thumbnailSize;
         const gap = 8;
@@ -3645,7 +3602,7 @@ const Gallery = (() => {
     function renderPinterest(displayImages) {
         hideGalleryPlaceholder();
         galleryGrid.className = 'gallery-grid pinterest';
-        galleryGrid.innerHTML = '';
+        _clearGrid();
 
         const gap = 8;
 
@@ -3706,7 +3663,7 @@ const Gallery = (() => {
     function renderList(displayImages) {
         hideGalleryPlaceholder();
         galleryGrid.className = 'gallery-grid list';
-        galleryGrid.innerHTML = '';
+        _clearGrid();
 
         const gap = 8;
         const padding = 24;
@@ -3777,7 +3734,7 @@ const Gallery = (() => {
         for (let i = 0; i < totalItems; i++) {
             fragment.appendChild(createImageCard(displayImages[i]));
         }
-        galleryGrid.innerHTML = '';
+        _clearGrid();
         galleryGrid.appendChild(fragment);
         // 重置渲染范围，确保后续 renderGrid 能正确全量重建
         renderedRange = { start: -1, end: -1 };
@@ -3837,10 +3794,314 @@ const Gallery = (() => {
         return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
     }
 
+    // ==================== 视窗优先的缩略图加载调度 ====================
+    // 背景：虚拟滚动的 DOM 窗口很大（视窗上下各 OVERSCAN=25 行），卡片一插入就赋 src 的话，
+    // 浏览器每个 origin 只有 6 个连接，队列会被视窗外的请求（尤其滚动路径上"路过"的图）排满，
+    // 当前视窗里的图反而要排队等 —— 表现为"滚动时一路加载过来"。
+    // 这里把"建卡片"和"发请求"解耦：
+    //   卡片先只写 data-src 挂起 → 插入 DOM 后按视窗位置决定谁先发请求
+    //   （视窗内立即发，视窗下方 1 屏交给 IntersectionObserver 预取），
+    //   滚出视窗的在途请求会被中止，把连接让给当前视窗。
+    const _pendingThumbImgs = new Set();
+    let _thumbFlushTimer = null;
+
+    // ★ 滚动进行中（含惯性）标志：暂停"视窗外预取"，只保证当前视窗内的图在加载。
+    //   否则快速滚动会把路径前方的图（下方 1.5 屏 + observer 2 屏）全部提前拉起，
+    //   这就是"滚动一路加载过来"的残留来源。滚动停止 150ms 后置回 false，
+    //   由 _resumeImageObserver 用完整窗口把预取补回来（见 bindEvents 的 settle 分支）。
+    let _thumbScrollBurst = false;
+
+    function _queueThumbLoad(img, url) {
+        img.dataset.src = url;
+        _pendingThumbImgs.add(img);
+        if (_thumbFlushTimer) return;
+        // 0ms：等这一批卡片插入 DOM 之后再统一测量/发起（createImageCard 里还没有位置）
+        _thumbFlushTimer = setTimeout(() => {
+            _thumbFlushTimer = null;
+            _flushThumbLoads();
+        }, 0);
+    }
+
+    // 立即加载的窗口：视窗上方 0.5 屏 + 下方 1.5 屏（回滚/下滚都能提前就位）；
+    // ★ 滚动中收紧到视窗本身（tight），不再预取——经过的位置不生成。
+    function _thumbLoadWindow() {
+        if (!galleryScroll) return null;
+        const rect = galleryScroll.getBoundingClientRect();
+        if (_thumbScrollBurst) {
+            return { top: rect.top, bottom: rect.bottom, tight: true };
+        }
+        const vh = rect.height || window.innerHeight;
+        return { top: rect.top - vh * 0.5, bottom: rect.bottom + vh * 1.5 };
+    }
+
+    function _flushThumbLoads() {
+        if (_pendingThumbImgs.size === 0) return;
+        const imgs = Array.from(_pendingThumbImgs);
+        _pendingThumbImgs.clear();
+        for (const img of imgs) _dispatchThumb(img);
+    }
+
+    // 按距离分派一张待加载的缩略图：
+    //   视窗内（上 0.5 屏 / 下 1.5 屏）→ 立即发请求；
+    //   近处（4 屏内）→ 交给 IntersectionObserver（rootMargin 2 屏）预取；
+    //   更远 / 已被虚拟滚动移除 → 挂起（滚近时由滚动调度捡起），不占用连接也不被 observer 持有。
+    function _dispatchThumb(img, win) {
+        if (!img || !img.dataset.src || img.src) return;
+        if (!img.isConnected) {
+            if (intersectionObserver) intersectionObserver.unobserve(img);
+            return;
+        }
+        if (win === undefined) win = _thumbLoadWindow();
+        if (!win) { _startThumbLoad(img); return; }
+        const r = img.getBoundingClientRect();
+        if (r.bottom >= win.top && r.top <= win.bottom) {
+            _startThumbLoad(img);
+            return;
+        }
+        // ★ 滚动中：视窗外的图一律不预取。unobserve 是必要的——停止滚动后
+        //   _resumeImageObserver 会重新 observe，而 IntersectionObserver 对
+        //   "新观察且已相交"的元素会立即回调一次，所以不会被漏掉。
+        if (win.tight) {
+            if (intersectionObserver) intersectionObserver.unobserve(img);
+            return;
+        }
+        const vh = galleryScroll ? galleryScroll.clientHeight : window.innerHeight;
+        const near = r.top <= win.bottom + vh * 2.5 && r.bottom >= win.top - vh * 2.5;
+        if (near) {
+            _observeThumb(img);
+        } else if (intersectionObserver) {
+            intersectionObserver.unobserve(img);
+        }
+    }
+
+    // 立即发起加载（视窗内/预取区内）
+    function _startThumbLoad(img) {
+        if (!img || !img.dataset.src || img.src) return;
+        img._deferred = false;
+        if (intersectionObserver) intersectionObserver.unobserve(img);
+        img.src = img.dataset.src;
+        img.removeAttribute('data-src');
+        armThumbTimeout(img);
+    }
+
+    // 交给 IntersectionObserver 预取（rootMargin = 1 屏）
+    function _observeThumb(img) {
+        if (!img || !img.dataset.src || img.src) return;
+        if (intersectionObserver) intersectionObserver.observe(img);
+        else _startThumbLoad(img);
+    }
+
+    // 中止在途请求并退回"待调度"状态（滚出视窗时调用，把连接槽让给视窗内的图）
+    function _deferThumbLoad(img) {
+        if (!img || !img.src || (img.complete && img.naturalWidth > 0)) return;
+        img._deferred = true; // 让 error 处理器忽略这次"人为中止"，不计入重试
+        if (!img.dataset.src) img.dataset.src = img.src;
+        clearTimeout(img._thumbTimeout);
+        img.src = '';
+        img.classList.add('loading');
+        if (intersectionObserver) intersectionObserver.observe(img);
+    }
+
+    // ★ 缩略图加载超时兜底：请求可能长时间挂起（后端排队/阻塞、切换文件夹后 worker
+    //   重启等），既不触发 load 也不触发 error → 卡片永远停在 opacity:0。
+    //   超时后主动派发 error，交给卡片上的重试逻辑。
+    function armThumbTimeout(img) {
+        clearTimeout(img._thumbTimeout);
+        img._thumbTimeout = setTimeout(() => {
+            if (img.complete && img.naturalWidth > 0) return; // 实际已加载，无需重试
+            img.dispatchEvent(new Event('error'));
+        }, 15000);
+    }
+
+    // ★ 自愈：缩略图最终生成成功后，把已经显示 "Load failed" 的卡片重新拉一次。
+    //   此前失败即永久黑块——后端其实已经生成好了，用户只能刷新/滚动才能看到。
+    //   由 thumb:progress 事件触发（后端每生成一张就节流通知，此时字节已落库）。
+    let _failedThumbHealAt = 0;
+    function retryFailedThumbs() {
+        if (!galleryGrid) return 0;
+        const now = Date.now();
+        // thumb:progress 每 300ms 一次，全量遍历失败卡片有成本 → 限制自愈频率
+        if (now - _failedThumbHealAt < 2000) return 0;
+        _failedThumbHealAt = now;
+        let healed = 0;
+        galleryGrid.querySelectorAll('.image-card .img-error').forEach((errDiv) => {
+            const img = errDiv.parentNode && errDiv.parentNode.querySelector('img');
+            if (!img) return;
+            const healCount = parseInt(img.dataset.healCount) || 0;
+            if (healCount >= 3) return; // 兜底：同一张图最多自愈 3 次（真损坏的图不再反复请求）
+            img.dataset.healCount = healCount + 1;
+            img.dataset.retryCount = '0'; // 重置普通重试计数，让它重新走完整重试流程
+            const baseUrl = (img.src || '').replace(/[&?]_r=[^&]*/g, '');
+            if (!baseUrl) return;
+            errDiv.remove();
+            img.style.display = img.dataset.prevDisplay || '';
+            img.src = '';
+            img.src = baseUrl + (baseUrl.includes('?') ? '&' : '?') + '_r=' + Math.random().toString(36).slice(2);
+            armThumbTimeout(img);
+            healed++;
+        });
+        if (healed > 0) trace('[thumb] 自愈重试已失败缩略图:', healed);
+        return healed;
+    }
+
+    // ============ 卡片复用池（滚动回去不再重新加载）============
+    // 虚拟滚动会把滑出渲染窗口的卡片从 DOM 移除。如果直接丢弃，滚回来时
+    // createImageCard 会新建一个 <img>：重新发请求 + 淡入，用户看到"图片消失又重载"。
+    // 这里把被移除的卡片按"布局几何 + 路径"收进池子，滚回原位置时复用同一个 DOM 节点
+    // （连带浏览器已解码的位图），瞬间恢复。池子有上限，超出按插入顺序淘汰最旧的。
+    const _cardPool = new Map();
+
+    // 池子上限按缩略图尺寸自适应：单张卡片持有的已解码位图约 size²×4 字节，
+    // 大缩略图下必须收紧张数，否则几百张就能吃掉几百 MB 内存（目标约 60MB 以内）。
+    function _cardPoolMax() {
+        if (thumbnailSize >= 360) return 150;
+        if (thumbnailSize >= 280) return 200;
+        return 320;
+    }
+
+    // 卡片的内联样式由布局几何决定，几何变了就不能复用（必须重建）。
+    function _cardPoolKey(imgData, masonryLayout) {
+        let geo;
+        if (masonryLayout && masonryLayout.layout === 'list') {
+            geo = 'list:' + masonryLayout.x + ',' + masonryLayout.y + ',' + masonryLayout.w + ',' + masonryLayout.h;
+        } else if (masonryLayout && masonryLayout.layout === 'pinterest') {
+            const it = masonryLayout.item || {};
+            geo = 'pin:' + it.x + ',' + it.y + ',' + it.w + ',' + it.h;
+        } else if (masonryLayout) {
+            geo = 'mas:' + masonryLayout.x + ',' + masonryLayout.y + ',' + masonryLayout.w + ',' + masonryLayout.h;
+        } else {
+            // 网格：几何只取决于缩略图尺寸
+            geo = 'grid:' + currentLayout + ':' + thumbnailSize;
+        }
+        return geo + '\u0000' + imgData.path;
+    }
+
+    function _cardPoolPut(card) {
+        if (!card || !card._poolKey) return;
+        // 已在池中的先删再插，保证 Map 迭代顺序 = 最近使用顺序
+        _cardPool.delete(card._poolKey);
+        _cardPool.set(card._poolKey, card);
+        while (_cardPool.size > _cardPoolMax()) {
+            const oldestKey = _cardPool.keys().next().value;
+            // ★ 淘汰即彻底拆掉：否则挂在 document.body 的标签菜单会永久留在页面里，
+            //   并反向引用把整张卡片（含 <img>）钉住，池子的内存上限就形同虚设。
+            _teardownCardDetails(_cardPool.get(oldestKey));
+            _cardPool.delete(oldestKey);
+        }
+    }
+
+    // 彻底拆掉一张卡片上的附属物：body 上的标签下拉菜单、悬停按钮、覆盖层，
+    // 以及尚未执行的详情构建任务。拆完复位 _detailsBuilt，卡片若再被复用会重建。
+    function _teardownCardDetails(card) {
+        if (!card) return;
+        if (card._detailsHandle !== undefined && card._detailsCancel) {
+            try { card._detailsCancel(card._detailsHandle); } catch (e) { /* 已执行完的 handle 取消无害 */ }
+        }
+        card._detailsHandle = undefined;
+        if (card._tagDropdown) {
+            card._tagDropdown._triggerBtn = null; // 断开反向引用，卡片才可能被回收
+            card._tagDropdown.remove();
+            card._tagDropdown = null;
+        }
+        if (card._overlay) { card._overlay.remove(); card._overlay = null; }
+        if (card._hoverActions) { card._hoverActions.remove(); card._hoverActions = null; }
+        card._detailsBuilt = false;
+    }
+
+    function _cardPoolTake(poolKey, imgData) {
+        const card = _cardPool.get(poolKey);
+        if (!card) return null;
+        _cardPool.delete(poolKey);
+        if (card.dataset.path !== imgData.path) return null;
+        // 缩略图 URL 变了（清过缓存/重新生成）→ 旧位图已作废，重建
+        if (card._thumbUrl !== imgData.thumbnailUrl) return null;
+        return card;
+    }
+
+    // 把一张卡片摘下来收进池子：先取消它的超时与观察，避免游离节点继续占资源
+    function _retireCard(card) {
+        if (!card || !card._poolKey) return;
+        const img = card._thumbImg;
+        if (img) {
+            clearTimeout(img._thumbTimeout);
+            if (intersectionObserver) intersectionObserver.unobserve(img);
+        }
+        // 卡片要离开视野了：收起可能开着的标签菜单，避免留下一个没有锚点的浮层
+        if (card._tagDropdown) card._tagDropdown.classList.remove('show');
+        _cardPoolPut(card);
+    }
+
+    // 把画廊里现有的卡片收进复用池（清 DOM 前调用）
+    function _harvestGridCards() {
+        if (!galleryGrid) return;
+        const kids = galleryGrid.children;
+        // 倒序收割：视口顶部的卡片最后入池 → 最先被重新取用时不会因超限被淘汰
+        for (let i = kids.length - 1; i >= 0; i--) {
+            const el = kids[i];
+            if (el.classList && el.classList.contains('image-card')) _retireCard(el);
+        }
+    }
+
+    // 清空画廊：先把已建好的卡片收进复用池，再清 DOM
+    function _clearGrid(html) {
+        _harvestGridCards();
+        if (galleryGrid) galleryGrid.innerHTML = html || '';
+    }
+
+    // 复用卡片时刷新"回收期间可能变了"的状态
+    function _refreshCard(card, imgData) {
+        card.classList.toggle('selected', selectedImages.has(imgData.path));
+        card.classList.toggle('active', imgData.path === activeImagePath);
+        card.classList.toggle('favorite', isFavCached(imgData.path));
+        card._imgData = imgData;
+        const img = card._thumbImg;
+        if (img) {
+            img.alt = imgData.name;
+            // 清掉上次"Load failed"留下的痕迹：隐藏的 img + 错误提示，否则复用后
+            // 图片即使加载成功也看不见
+            if (img.style.display === 'none') img.style.display = img.dataset.prevDisplay || '';
+            delete img.dataset.prevDisplay;
+            if (card._thumbWrapper) {
+                const errDiv = card._thumbWrapper.querySelector('.img-error');
+                if (errDiv) errDiv.remove();
+            }
+            const broken = img.complete && img.naturalWidth === 0 && !!img.src;
+            if (broken || (!img.src && !img.dataset.src)) {
+                // 位图已失效（blob 被 revoke / 缓存被清）→ 重新走一遍调度
+                img.removeAttribute('src');
+                img.dataset.retryCount = '0';
+                img.classList.add('loading');
+                if (imgData.thumbnailUrl) _queueThumbLoad(img, imgData.thumbnailUrl);
+            } else if (img.src && img.complete && img.naturalWidth > 0) {
+                img.classList.remove('loading');
+                img.style.opacity = '1';
+            } else if (img.src) {
+                // 仍在传输中：补回被 _retireCard 清掉的超时兜底
+                armThumbTimeout(img);
+            }
+        }
+        if (card._infoFilename) {
+            card._infoFilename.textContent = imgData.name;
+            card._infoFilename.title = imgData.name;
+        }
+        // 详情（overlay/收藏/标签按钮）还没构建过 → 用当前 imgData 补建
+        if (!card._detailsBuilt && card._thumbWrapper) {
+            _scheduleCardDetails(card, card._thumbWrapper, imgData);
+        }
+        return card;
+    }
+
     function createImageCard(imgData, masonryLayout) {
+        const poolKey = _cardPoolKey(imgData, masonryLayout);
+        const reused = _cardPoolTake(poolKey, imgData);
+        if (reused) return _refreshCard(reused, imgData);
+
         const card = document.createElement('div');
         card.className = 'image-card';
         card.dataset.path = imgData.path;
+        card._poolKey = poolKey;
+        card._thumbUrl = imgData.thumbnailUrl;
+        card._imgData = imgData;
 
         if (selectedImages.has(imgData.path)) {
             card.classList.add('selected');
@@ -3859,25 +4120,21 @@ const Gallery = (() => {
 
         const img = document.createElement('img');
         img.loading = 'lazy';
+        card._thumbWrapper = wrapper;
+        card._thumbImg = img;
 
         if (imgData.thumbnailUrl) {
             img.className = 'loading';
             img.alt = imgData.name;
             img.decoding = 'async';
 
-            // ★ 加载超时兜底：缩略图请求可能长时间挂起（后端排队生成、切换文件夹杀 worker 后
-            //   重新拉起等），既不发 load 也不发 error → img.loading 一直 opacity:0，
-            //   卡片永远不出图（表现为"一直加载中"）。超时后强制走重试，重试耗尽显示失败占位。
-            const armThumbTimeout = () => {
-                clearTimeout(img._thumbTimeout);
-                img._thumbTimeout = setTimeout(() => {
-                    if (img.complete && img.naturalWidth > 0) return; // 实际已加载，无需重试
-                    img.dispatchEvent(new Event('error'));
-                }, 15000);
-            };
-
+            // ★ 加载超时兜底见 armThumbTimeout（模块级）：超时后强制走重试，
+            //   重试耗尽显示失败占位；后端随后生成成功时由 retryFailedThumbs 自愈。
             img.addEventListener('error', function retryLoad() {
                 clearTimeout(img._thumbTimeout);
+                // ★ 人为中止（滚出视窗被 _deferThumbLoad 清空 src）不算加载失败：
+                //   直接返回，不消耗重试次数；滚回来时由调度器重新发起。
+                if (this._deferred) return;
                 let retries = parseInt(this.dataset.retryCount) || 0;
                 if (retries < 3) {
                     retries++;
@@ -3888,10 +4145,12 @@ const Gallery = (() => {
                         setTimeout(() => {
                             this.src = '';
                             this.src = baseUrl.replace(/[&?]_r=[^&]*/g, '') + (baseUrl.includes('?') ? '&' : '?') + '_r=' + Math.random().toString(36).slice(2);
-                            armThumbTimeout();
+                            armThumbTimeout(this);
                         }, delay);
                     }
                 } else {
+                    // 记录原始 display，供自愈时恢复（grid 模式下 img 是 display:block）
+                    if (this.dataset.prevDisplay === undefined) this.dataset.prevDisplay = this.style.display || '';
                     this.style.display = 'none';
                     const errorDiv = document.createElement('div');
                     errorDiv.className = 'img-error';
@@ -3900,10 +4159,10 @@ const Gallery = (() => {
                 }
             });
             img.addEventListener('load', () => clearTimeout(img._thumbTimeout));
-            // ★ 直接赋 src：卡片插入时立刻开始下载，不等 Observer 异步回调
-            //   对于虚拟滚动，只有视窗附近的卡片才会被创建，因此直接加载是正确的
-            img.src = imgData.thumbnailUrl;
-            armThumbTimeout();
+            // ★ 视窗优先：这里只挂起（写 data-src），等卡片插入 DOM 后由 _flushThumbLoads
+            //   按视窗位置决定加载顺序——视窗内的先发请求，视窗外的滚近了再发。
+            //   （以前是直接赋 src，DOM 窗口里上下各 25 行的卡片会同时抢连接。）
+            _queueThumbLoad(img, imgData.thumbnailUrl);
             trace('[thumb] 图廊请求缩略图 id=', imgData.id, 'url=', imgData.thumbnailUrl, 'folder=', imgData.folder);
         } else {
             img.className = 'loading placeholder-loading';
@@ -4228,6 +4487,8 @@ const Gallery = (() => {
         function build() {
             // 卡片已从 DOM 移除（虚拟滚动回收），放弃构建
             if (!card.isConnected) return;
+            // 复用卡片可能被重复调度 → 只构建一次，避免 overlay/按钮重复插入
+            if (card._detailsBuilt) return;
 
             // --- card-info 文字填充（文件名已在 createImageCard 立即填充，此处补充分辨率等）---
             if (card._infoResolution && imgData.metadata && imgData.metadata.params && imgData.metadata.params['Size']) {
@@ -4248,6 +4509,7 @@ const Gallery = (() => {
             //   底部渐变层保留（提升底部文字可读性），不再叠加重复的星标。
             const overlay = document.createElement('div');
             overlay.className = 'card-overlay';
+            card._overlay = overlay;
 
             wrapper.appendChild(overlay);
 
@@ -4297,6 +4559,9 @@ const Gallery = (() => {
             const tagDropdown = document.createElement('div');
             tagDropdown.className = 'card-tag-dropdown';
             tagDropdown._triggerBtn = tagBtn;
+            // ★ 记在卡片上：下拉菜单挂在 document.body，卡片被淘汰时必须显式移除，
+            //   否则它会一直留在页面里，并且通过 _triggerBtn 反向引用把整张卡片钉住。
+            card._tagDropdown = tagDropdown;
             document.body.appendChild(tagDropdown);
 
             tagBtn.addEventListener('click', async (e) => {
@@ -4318,6 +4583,9 @@ const Gallery = (() => {
             hoverActions.appendChild(favBtn);
             hoverActions.appendChild(tagBtn);
             wrapper.appendChild(hoverActions);
+            card._hoverActions = hoverActions;
+
+            card._detailsBuilt = true; // 复用卡片时据此判断要不要补建
         }
 
         handle = schedule(build);
@@ -5754,6 +6022,7 @@ const Gallery = (() => {
         refreshThumbGen,              // ★ 清缓存后刷新缩略图版本号
         makeThumbURL,                 // ★ 缩略图 URL 构造（侧边栏子文件夹预览复用同一方法）
         ensureBaseURLs,               // ★ 确保 http 基地址已初始化（侧边栏预览复用）
+        retryFailedThumbs,            // ★ 缩略图补齐后自愈图廊里 "Load failed" 的卡片
         saveImportedRootsToServer,    // ★ 跨浏览器持久化保存
         loadImportedRootsFromServer,  // ★ 跨浏览器持久化恢复
         reloadImportedRoot,

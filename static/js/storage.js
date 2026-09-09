@@ -29,28 +29,48 @@ const Storage = (() => {
 
     // ==================== 初始化 ====================
 
+    /** 初始同步就绪 Promise：读/写设置前必须等它。
+     *  ★ 否则在 syncFromServer 完成前读设置，serverDataCache.settings 还是空对象，
+     *    所有设置都会拿到默认值 —— 表现为"缩略图大小 / 惯性滚动等设置重启后不生效"；
+     *    而此刻写设置又会被随后的 syncFromServer 整体覆盖掉。 */
+    let readyPromise = null;
+
     async function init() {
-        // 先检测后端是否可用
-        serverAvailable = await checkServerAvailable();
+        if (readyPromise) return readyPromise;
+        readyPromise = (async () => {
+            // 先检测后端是否可用
+            serverAvailable = await checkServerAvailable();
 
-        if (serverAvailable) {
-            console.log('[Storage] 使用后端文件系统存储（user/ 目录）');
-            try {
-                await syncFromServer();
-                console.log('[Storage] 从后端加载用户数据成功');
-            } catch (err) {
-                console.warn('[Storage] 从后端加载数据失败:', err.message);
+            if (serverAvailable) {
+                console.log('[Storage] 使用后端文件系统存储（user/ 目录）');
+                try {
+                    await syncFromServer();
+                    console.log('[Storage] 从后端加载用户数据成功');
+                } catch (err) {
+                    console.warn('[Storage] 从后端加载数据失败:', err.message);
+                }
+
+                // 启动自动保存
+                startAutoSave();
+
+                return;
             }
-            
-            // 启动自动保存
-            startAutoSave();
-            
-            return;
-        }
 
-        // 回退到 IndexedDB
-        console.log('[Storage] 后端不可用，回退到 IndexedDB');
-        return initIndexedDB();
+            // 回退到 IndexedDB
+            console.log('[Storage] 后端不可用，回退到 IndexedDB');
+            return initIndexedDB();
+        })();
+        return readyPromise;
+    }
+
+    /** 等待初始同步完成（未调用 init 时立即返回，行为与改动前一致） */
+    async function whenReady() {
+        if (!readyPromise) return;
+        try {
+            await readyPromise;
+        } catch (e) {
+            /* init 内部已各自处理错误 */
+        }
     }
 
     function scheduleDebouncedSave() {
@@ -837,6 +857,8 @@ const Storage = (() => {
     // ==================== 设置操作 ====================
 
     async function getSetting(key, defaultValue = null) {
+        // ★ 等初始同步完成，否则会读到空的 serverDataCache 而返回默认值
+        await whenReady();
         if (serverAvailable) {
             return serverDataCache.settings[key] !== undefined ? serverDataCache.settings[key] : defaultValue;
         }
@@ -846,6 +868,8 @@ const Storage = (() => {
     }
 
     async function setSetting(key, value) {
+        // ★ 同样要等初始同步：否则这次写入会被随后的 syncFromServer 整体覆盖掉
+        await whenReady();
         if (serverAvailable) {
             serverDataCache.settings[key] = value;
             markDirty();

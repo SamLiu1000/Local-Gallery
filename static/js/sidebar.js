@@ -349,6 +349,11 @@ const Sidebar = (() => {
         try {
             if (window.runtime && window.runtime.EventsOn) {
                 window.runtime.EventsOn('thumb:progress', (data) => {
+                    // ★ 缩略图刚生成成功（字节已落库）→ 让图廊自愈已显示 "Load failed"
+                    //   的卡片。与侧栏树是否加载无关，所以放在最前面。
+                    try {
+                        if (typeof Gallery !== 'undefined' && Gallery.retryFailedThumbs) Gallery.retryFailedThumbs();
+                    } catch (e) { /* ignore */ }
                     if (!folderTreeLoaded) return;
                     const folders = data && data.folders;
                     const updatedAny = (folders && Object.keys(folders).length > 0)
@@ -404,7 +409,9 @@ const Sidebar = (() => {
 
         // 防抖全量刷新（空 payload / 节点不在 DOM 时的兜底）
         function scheduleFolderTreeRefresh() {
-            if (!folderTreeLoaded) return;
+            // ★ 不再因 folderTreeLoaded=false 直接跳过：首次加载失败/被阻塞时，
+            //   thumb:progress 等事件正是侧栏自愈的唯一机会，否则树会一直停在旧缓存
+            //   （表现为"导入中刷新页面，文件夹消失，要等扫描结束才回来"）。
             if (_pendingTreeRefresh) return; // 已有待执行的刷新，合并
             _pendingTreeRefresh = setTimeout(() => {
                 _pendingTreeRefresh = null;
@@ -612,9 +619,36 @@ const Sidebar = (() => {
     async function saveExpandedStates() {
         if (!expandedStateCache) return;
         try {
+            // ★ 先剔除"已不属于任何已注册根目录"的陈旧条目：实测这个 map 会积累到
+            //   1.4 万条 / 900KB（含大量已删除/已移除根目录的路径），每次切换都要
+            //   序列化这么大一坨再走 RPC，既慢又容易在退出时来不及写完。
+            //   注意：roots 取不到时（树还没加载）绝不清理，否则会把状态全清空。
+            let roots = [];
+            if (typeof Gallery !== 'undefined' && Gallery.getImportedRoots) {
+                try {
+                    roots = (Gallery.getImportedRoots() || [])
+                        .map(r => r.rootId || r.path).filter(Boolean);
+                } catch (e) { roots = []; }
+            }
+            if (roots.length === 0) roots = folderRoots.map(n => n.path).filter(Boolean);
+
             const expandedMap = {};
-            for (const [path, expanded] of expandedStateCache) {
-                expandedMap[path] = expanded;
+            if (roots.length === 0) {
+                for (const [path, expanded] of expandedStateCache) expandedMap[path] = expanded;
+            } else {
+                const normRoots = roots.map(r => r.replace(/\\/g, '/').toLowerCase()).filter(Boolean);
+                const stale = [];
+                for (const [path, expanded] of expandedStateCache) {
+                    const norm = path.replace(/\\/g, '/').toLowerCase();
+                    const under = normRoots.some(rn => norm === rn || norm.startsWith(rn + '/'));
+                    if (under) expandedMap[path] = expanded;
+                    else stale.push(path);
+                }
+                for (const p of stale) expandedStateCache.delete(p);
+                if (stale.length > 0) {
+                    console.log('[Sidebar] 已清理 ' + stale.length + ' 条失效展开状态，剩余 ' +
+                        Object.keys(expandedMap).length + ' 条');
+                }
             }
 
             if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails()) {
@@ -898,12 +932,73 @@ const Sidebar = (() => {
         };
     }
 
+    // ★ 权威兜底：把"后端已注册、但本次树里缺失"的导入根补回树里。
+    // 背景：刷新页面时侧栏先渲染本地缓存（可能不含刚导入的文件夹），随后等
+    // GetFolders 返回才补全。若 GetFolders 因扫描/落库持锁而迟迟不返回，侧栏就
+    // 一直停在旧缓存上——表现为"导入中刷新页面，文件夹消失，扫描完才回来"。
+    // 导入根列表来自后端 GetImportedRoots（SQLite），是权威数据源，据此补齐可保证
+    // 已导入的文件夹永远不消失（计数由后续刷新补正）。
+    function ensureImportedRootsPresent(treeNodes, importedRootsList) {
+        if (!importedRootsList || importedRootsList.length === 0) return 0;
+        const seen = new Set();
+        for (const n of treeNodes) seen.add(normalizeFolderPath(n.path));
+        let added = 0;
+        for (const r of importedRootsList) {
+            const p = r.rootId || r.path;
+            if (!p) continue;
+            const key = normalizeFolderPath(p);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            const fallbackName = p.split(/[\\/]/).filter(Boolean).pop() || p;
+            treeNodes.push({
+                name: r.name || fallbackName,
+                path: p,
+                displayPath: p,
+                displayName: r.displayName || r.name || fallbackName,
+                addedAt: r.addedAt || '',
+                expanded: false,
+                imageCount: 0,
+                thumbCount: 0,
+                isRoot: true,
+                children: []
+            });
+            added++;
+        }
+        return added;
+    }
+
+    // 树的根节点是否覆盖了全部已导入根（导入列表尚未加载时视为覆盖）
+    function treeCacheCoversImportedRoots(nodes) {
+        if (typeof Gallery === 'undefined' || !Gallery.getImportedRoots) return true;
+        let list = [];
+        try { list = Gallery.getImportedRoots() || []; } catch (e) { return true; }
+        if (list.length === 0) return true;
+        const seen = new Set((nodes || []).map(n => normalizeFolderPath(n.path)));
+        for (const r of list) {
+            const p = r.rootId || r.path;
+            if (p && !seen.has(normalizeFolderPath(p))) return false;
+        }
+        return true;
+    }
+
+    // ★ 绕过 3 秒节流立即写缓存（导入/删除等结构变化后调用）
+    function forceSaveFolderTreeCache() {
+        _lastTreeCacheSave = 0;
+        saveFolderTreeCache(folderRoots);
+    }
+
     // 节流保存：结构/计数刷新后写入 localStorage，供下次启动 0 秒渲染
     function saveFolderTreeCache(nodes) {
         const now = Date.now();
         if (now - _lastTreeCacheSave < 3000) {
             console.log('[删除诊断] saveFolderTreeCache 被节流跳过(3秒内): nodes=', nodes.map(n => n.path));
             return; // 节流
+        }
+        // ★ 不缓存"缺根"的树：刷新页面时 0 秒渲染用的就是这份缓存，若它少了某个已导入
+        //   文件夹，F5 后该文件夹会先消失、等 GetFolders 返回才回来（见 ensureImportedRootsPresent）。
+        if (!treeCacheCoversImportedRoots(nodes)) {
+            console.log('[删除诊断] saveFolderTreeCache 跳过：树缺少已导入根，不写入残缺缓存');
+            return;
         }
         _lastTreeCacheSave = now;
         try {
@@ -972,6 +1067,15 @@ const Sidebar = (() => {
         if (folderRoots.length === 0 && !options.sort) {
             const cachedTree = loadFolderTreeCache();
             if (cachedTree && cachedTree.length > 0) {
+                // ★ 缓存只是"结构快照"，它带的展开标记和顺序是"上次写缓存那一刻"的，
+                //   可能已过期（用户随后又展开/折叠过，或缓存被 3 秒节流跳过没更新）。
+                //   这里先用持久化的展开状态与顺序覆盖，保证首屏就是上次看到的样子，
+                //   而不是先渲染成旧的、等 GetFolders 回来再跳一下。
+                try {
+                    await initExpandedStates();
+                    await loadFolderOrder(cachedTree);
+                    applyExpandedStates(cachedTree);
+                } catch (e) { /* 读持久化失败则按缓存原样渲染 */ }
                 folderRoots = cachedTree;
                 renderFolderTree();
             }
@@ -1036,10 +1140,14 @@ const Sidebar = (() => {
             // 3. 合并
             const mergedTree = mergeFolderTrees(serverTree, frontendTree);
 
-            // 4. displayName
+            // 4. displayName + ★ 权威兜底：后端已导入的根必须全部在树里
             let importedRootsList = [];
             if (typeof Gallery !== 'undefined' && Gallery.getImportedRoots) {
                 importedRootsList = Gallery.getImportedRoots();
+            }
+            const restoredRoots = ensureImportedRootsPresent(mergedTree, importedRootsList);
+            if (restoredRoots > 0) {
+                console.warn('[Sidebar] GetFolders 返回的树缺少 ' + restoredRoots + ' 个已导入根，已按导入列表补齐');
             }
             applyDisplayNames(mergedTree, importedRootsList);
 
@@ -2384,6 +2492,11 @@ const Sidebar = (() => {
                     renderFolderTree();
                     throw new Error((result && result.message) || '扫描文件夹失败');
                 }
+
+                // ★ RPC 成功后立即把"含新文件夹"的树写进本地缓存（绕过 3 秒节流）：
+                //   刷新页面时 0 秒渲染用的就是这份缓存，否则缓存还是导入前的旧树，
+                //   F5 后新文件夹会短暂消失、要等 GetFolders 返回才出现。
+                forceSaveFolderTreeCache();
 
                 App.showToast(result.message || `正在添加文件夹: ${folderName}`, 'success');
 

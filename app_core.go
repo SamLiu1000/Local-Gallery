@@ -279,7 +279,8 @@ func (a *App) startHTTPServer() {
 	})
 	thumbMux.HandleFunc("/thumb/", func(w http.ResponseWriter, r *http.Request) {
 		imageID := strings.TrimPrefix(r.URL.Path, "/thumb/")
-		jpegBytes, err := a.serveThumbnail(imageID)
+		// ★ 传 r.Context()：浏览器 abort（滚动丢弃）后不再继续排队生成
+		jpegBytes, err := a.serveThumbnail(r.Context(), imageID)
 		if err != nil {
 			http.NotFound(w, r)
 			return
@@ -306,7 +307,7 @@ func (a *App) startHTTPServer() {
 		thumb2Mux := http.NewServeMux()
 		thumb2Mux.HandleFunc("/thumb/", func(w http.ResponseWriter, r *http.Request) {
 			imageID := strings.TrimPrefix(r.URL.Path, "/thumb/")
-			jpegBytes, err := a.serveThumbnail(imageID)
+			jpegBytes, err := a.serveThumbnail(r.Context(), imageID)
 			if err != nil {
 				http.NotFound(w, r)
 				return
@@ -694,7 +695,7 @@ func (a *App) ScanFolderQuick(path, folderType string, quick bool) *ScanResult {
 			fmt.Printf("[导入] 快速扫描开始: %s\n", resolvedPath)
 			// ★ 占住"扫描中"标记：GetImages 自愈会触发 scanAllFolders→scanRootAsync，
 			//   若与本次快速扫描并发改同一批 memory/SQLite，会被 scanRootAsync 末尾的
-			//   rebuildFolderCountsFromSQLLocked 覆盖成 0、子文件夹索引丢失。
+			//   rebuildFolderCountsFromSQL 覆盖成 0、子文件夹索引丢失。
 			//   占住 scanningRoots 让 scanRootAsync 直接拒绝，保证快速扫描独占该根目录。
 			a.scanMu.Lock()
 			if a.scanningRoots == nil {
@@ -709,6 +710,19 @@ func (a *App) ScanFolderQuick(path, folderType string, quick bool) *ScanResult {
 			}()
 
 			localImages, localFolderIndex, imageCount := a.countFilesQuick(resolvedPath)
+
+			// ★ 扫描期间该根目录被删除了（用户在导入中点了删除）→ 丢弃本次结果。
+			//   否则下面会把图片重新写回 image_cache / 计数，删除后再导入就出现
+			//   "数量翻倍 / 只重复一部分"（残留的旧数据 + 新扫描的数据叠在一起）。
+			a.mu.RLock()
+			stillRegistered := a.registeredRoots[resolvedPath]
+			a.mu.RUnlock()
+			if !stillRegistered {
+				fmt.Printf("[导入] 根目录已被移除，丢弃本次扫描结果: %s\n", resolvedPath)
+				a.setScanInProgress(resolvedPath, false)
+				return
+			}
+
 			normalizedRoot := strings.ReplaceAll(resolvedPath, "\\", "/")
 			a.mu.Lock()
 			// ★ 只增不减：countFilesQuick 幂等合并时，被即席扫描/并发扫描"先索引过"的图片
@@ -749,9 +763,8 @@ func (a *App) ScanFolderQuick(path, folderType string, quick bool) *ScanResult {
 			a.rebuildFolderIndexForRoot(resolvedPath)
 			// ★ 计数以 SQLite 为唯一真相：重新从 SQLite 重建 folderCount（而非仅从可能被 LRU
 			//   淘汰的 a.images），确保当前内存计数 == 数据库真实数量，刷新后不再出现偏差。
-			a.mu.Lock()
-			a.rebuildFolderCountsFromSQLLocked()
-			a.mu.Unlock()
+			//   （该函数自己加锁，且不再在锁内跑全表 GROUP BY。）
+			a.rebuildFolderCountsFromSQL()
 			// ★ 扫描完成，清除"扫描中"标记（中断退出时该标记残留，下次启动补扫）
 			a.setScanInProgress(resolvedPath, false)
 
@@ -1777,6 +1790,10 @@ func (a *App) GetFolders() []*FolderNode {
 	if thumbCounts == nil {
 		a.scheduleThumbCountPreload()
 		thumbCounts = make(map[string]int) // 返回空计数，不阻塞前端
+	} else if a.thumbCountsNeedRefresh() {
+		// ★ 已从磁盘恢复上次计数（侧栏先按上次值显示，不再闪 0），
+		//   但缩略图库有变化 → 后台重算纠正。重算在锁外进行，不影响浏览。
+		a.scheduleThumbCountPreload()
 	}
 	// ★ 已开启"子文件夹缩略图预览"的路径集合（读 SQLite，不放锁内）
 	previewRoots := a.loadPreviewRoots()
@@ -1994,6 +2011,9 @@ func (a *App) GetFolderProgress(folderPath string) map[string]int {
 		a.scheduleThumbCountPreload()
 	} else {
 		thumbCount = thumbCounts[normalized]
+		if a.thumbCountsNeedRefresh() {
+			a.scheduleThumbCountPreload()
+		}
 	}
 	return map[string]int{"count": count, "thumbCount": thumbCount}
 }
@@ -2040,7 +2060,8 @@ func (a *App) GetImageFile(imageID string) *FileData {
 }
 
 func (a *App) GetThumbnail(imageID string) *FileData {
-	jpegBytes, err := a.serveThumbnail(imageID)
+	// ★ 传应用上下文：程序退出时尚未开始的生成会跳过（不再空转）
+	jpegBytes, err := a.serveThumbnail(a.ctx, imageID)
 	if err != nil {
 		return nil
 	}

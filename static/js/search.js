@@ -46,6 +46,7 @@ const SearchModule = (() => {
     let paramTagsRefresh;
     let paramTagsGroups = [];      // 后端返回的类别分组缓存
     let paramTagsRendered = false; // 是否已渲染（避免每次打开重复请求）
+    let paramTagsDirty = false;    // ★ 语言切换后类别名需重渲染（切换时面板可能是关着的）
     let paramTagsExpanded = new Set(); // 已展开的类别 key（默认全部收缩，点击表头展开）
     const PARAM_TAGS_EXPANDED_KEY = 'paramTagsExpanded'; // 展开状态持久化（localStorage）
 
@@ -407,7 +408,7 @@ const SearchModule = (() => {
                     <option value="exclude" data-i18n="search.mode.exclude">排除</option>
                     <option value="word" data-i18n="search.mode.word">全词匹配</option>
                 </select>
-                <input type="text" class="condition-value" placeholder="输入关键词..." />
+                <input type="text" class="condition-value" data-i18n-placeholder="search.keyword_placeholder" placeholder="输入关键词..." />
                 <button class="condition-remove-btn btn-small"><span class="icon icon-close"></span></button>
             `;
             row.querySelector('.condition-remove-btn').addEventListener('click', (e) => {
@@ -474,7 +475,7 @@ const SearchModule = (() => {
                             <option value="exclude" data-i18n="search.mode.exclude">排除</option>
                             <option value="word" data-i18n="search.mode.word">全词匹配</option>
                         </select>
-                        <input type="text" class="condition-value" placeholder="输入关键词..." />
+                        <input type="text" class="condition-value" data-i18n-placeholder="search.keyword_placeholder" placeholder="输入关键词..." />
                         <button class="condition-remove-btn btn-small" style="display:none;"><span class="icon icon-close"></span></button>
                     </div>
                 `;
@@ -562,7 +563,11 @@ const SearchModule = (() => {
                 advancedSearchPanel.style.display = 'none';
                 if (advancedSearchToggle) advancedSearchToggle.classList.remove('active');
             }
-            if (paramTagsRendered) {
+            if (paramTagsRendered && paramTagsDirty) {
+                // ★ 语言切换后重渲染：类别名是 i18n 翻译的（chips 是数据，不需要翻译）
+                paramTagsDirty = false;
+                renderParamTags();
+            } else if (paramTagsRendered) {
                 applyParamTagFilter(); // 重新应用筛选
             } else {
                 loadParamTags(false);
@@ -592,8 +597,14 @@ const SearchModule = (() => {
         });
         // 语言切换后重渲染（类别名是 i18n 翻译的）
         window.addEventListener('i18n:changed', () => {
-            if (paramTagsPanel && paramTagsPanel.style.display !== 'none' && paramTagsRendered) {
-                renderParamTags();
+            if (!paramTagsRendered) return;
+            if (paramTagsPanel && paramTagsPanel.style.display !== 'none') {
+                renderParamTags();     // 面板开着：立即重渲染
+                paramTagsDirty = false;
+            } else {
+                // ★ 面板关着：标记为脏，下次打开时重渲染。
+                //   原来只在"面板开着"时重渲染，于是切语言后打开面板，类别名仍是旧语言。
+                paramTagsDirty = true;
             }
         });
     }

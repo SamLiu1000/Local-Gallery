@@ -576,6 +576,14 @@ func (a *App) GetFolderIndexStatus() []IndexRootInfo {
 		rootNorm := strings.ReplaceAll(rootPath, "\\", "/")
 		total := a.folderCount[rootNorm]
 		indexed := a.imageDB.CountByRoot(rootPath)
+		if indexed == 0 {
+			// ★ 嵌套虚拟根：图片记在外层父根目录名下，按 root_path 精确匹配恒为 0。
+			//   它的内容由父根目录的索引覆盖 → 用父根的已索引数判断是否完成，
+			//   否则索引图标永远停在"未完成"。
+			if parent := a.owningRootLockedNorm(strings.ToLower(rootNorm)); parent != "" {
+				indexed = a.imageDB.CountByRoot(parent)
+			}
+		}
 		a.indexingRootsMu.Lock()
 		_, isIndexing := a.indexingRoots[rootPath]
 		a.indexingRootsMu.Unlock()
@@ -626,8 +634,11 @@ func (a *App) IndexRoot(rootPath string) {
 			return
 		}
 
-		// ★ 直接从 SQL 读取该根目录所有图片元数据，避免 LRU 淘汰漏数据
-		entries, err := a.imageDB.LoadImageCacheByRoot(rootPath)
+		// ★ 按"文件夹路径前缀"读取该目录（含所有子目录）的图片元数据。
+		//   不能用 LoadImageCacheByRoot：嵌套虚拟根（在已导入的父目录之内再注册的根）
+		//   的图片在库里 root_path 记的是外层父根，精确匹配恒为 0 条 ——
+		//   索引按钮点了没反应、只打印"无图片需索引"就是这么来的。
+		entries, err := a.imageDB.LoadImageCacheByPathPrefix(rootPath)
 		if err != nil {
 			fmt.Printf("[索引] %s 读取 image_cache 失败: %v\n", rootPath, err)
 			return

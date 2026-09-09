@@ -222,7 +222,7 @@ func (a *App) loadFolderIndexLight() {
 	}
 	// ★ 冷启动优化：优先读取上次保存的轻量索引快照（小 JSON，毫秒级），
 	//   避免对 4.5GB 的 images.db 做 GROUP BY 全量统计（冷缓存下实测 2-10s）。
-	//   快照在每次扫描/刷新后由 rebuildFolderCountsFromSQLLocked 同步更新。
+	//   快照在每次扫描/刷新后由 rebuildFolderCountsFromSQL 同步更新。
 	// ★ 但快照可能过期：若导入/重扫没写完就重启（或 saveFolderIndexLight 写失败），
 	//   快照是旧数据，新导入的根不在里面 → 重启后该文件夹 count 显示 0。
 	//   因此必须验证快照覆盖了所有已注册根：缺任一根 → 视为过期，回退 SQL 重查。
@@ -364,8 +364,11 @@ func (a *App) saveFolderIndexLight(entries []database.ImageCacheEntry) {
 
 // rebuildFolderCountsFromSQL 从 SQL 重建 folderCount，覆盖所有根目录。
 // 用于扫描后或增量刷新后准确地刷新计数（a.images 是部分 LRU，不可信）。
-// 调用方需持写锁 a.mu.Lock()。
-func (a *App) rebuildFolderCountsFromSQLLocked() {
+// ★ 调用方【不要】再持 a.mu：原来这个函数要求持写锁，于是在写锁内跑
+//   image_cache 全表 GROUP BY（百万行，实测数秒）并写快照文件，
+//   期间所有 GetFolders/GetImages 全部阻塞 —— 表现为"删除/扫描后点别的文件夹不出图"。
+//   现在改成：无锁查询+计算 → 短暂持锁换入 → 无锁写快照。
+func (a *App) rebuildFolderCountsFromSQL() {
 	if a.imageDB == nil {
 		return
 	}
@@ -388,15 +391,12 @@ func (a *App) rebuildFolderCountsFromSQLLocked() {
 			}
 		}
 	}
+	a.mu.Lock()
 	a.folderCount = counts
+	a.mu.Unlock()
 	// ★ 同步更新轻量索引快照，让下次冷启动读到最新统计，避免快照过期。
 	a.saveFolderIndexLight(entries)
-	// ★ 诊断：重建后的根级计数
-	rootCounts := make([]string, 0, len(counts))
-	for k, v := range counts {
-		rootCounts = append(rootCounts, fmt.Sprintf("%s=%d", k, v))
-	}
-	fmt.Printf("[删除诊断] rebuildFolderCountsFromSQLLocked 完成: 共 %d 个 folderCount 键, 前 5 个=%v\n", len(counts), rootCounts[:min(5, len(rootCounts))])
+	fmt.Printf("[计数] rebuildFolderCountsFromSQL 完成: 共 %d 个 folderCount 键\n", len(counts))
 }
 
 // ensureFolderLoaded 同步加载某 folderKey 进缓存；带 double-check + LRU 淘汰。
@@ -464,7 +464,9 @@ func (a *App) ensureRootLoaded(rootPath string) {
 		return
 	}
 
-	entries, err := a.imageDB.LoadImageCacheByRoot(rootPath)
+	// ★ 按路径前缀取：嵌套虚拟根的记录 root_path 记在外层父根名下，按 root_path
+	//   精确匹配查不到 → 它的文件夹用不上缓存，每次都要重新扫盘。
+	entries, err := a.imageDB.LoadImageCacheByPathPrefix(rootPath)
 	if err != nil {
 		return
 	}

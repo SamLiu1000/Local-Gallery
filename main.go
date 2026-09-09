@@ -203,6 +203,7 @@ func main() {
 				app.instanceLockRelease()
 			}
 			logStartupf("=== 退出，总耗时 %s ===", time.Since(startupT0).Round(time.Millisecond))
+			FlushDebugSwitchLog() // ★ 缓冲日志刷盘（否则最多丢 0.5s 尾部）
 			closeStartupLogs()
 			shutdownVips()
 		},
