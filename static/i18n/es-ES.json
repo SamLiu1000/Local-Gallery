@@ -584,7 +584,7 @@
   "toolbar.edit_mode_title": "Modo edición: clic para seleccionar, Ctrl/Shift para selección múltiple",
   "toolbar.image_count": "imágenes",
   "toolbar.inertia": "Inercia",
-  "toolbar.inertia_title": "Desplazamiento por inercia: clic derecho en área vacía para ajustar parámetros",
+  "toolbar.inertia_title": "Desplazamiento por inercia: usa el botón de ajustes junto al botón de inercia para ajustar los parámetros",
   "toolbar.layout.grid": "Cuadrícula",
   "toolbar.layout.list": "Lista",
   "toolbar.layout.masonry": "Mampostería",

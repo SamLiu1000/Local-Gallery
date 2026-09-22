@@ -103,6 +103,7 @@ const Gallery = (() => {
     const FOLDER_LOOKAHEAD = 250;    // 视窗后方保持预加载的图片张数
     const FOLDER_FETCH_BATCH = 500;  // 后端单次分页上限，滚动中提前拉满一批
     let isLoadingMoreFolder = false;  // 防止重复触发增量加载
+    let _loadMoreStartedAt = 0;        // 增量加载开始时刻（超时自愈用）
     let _loadMoreFollowupTimer = null; // 增量加载后继续检查，避免停在批次边界
     let folderCacheMeta = {};         // { [normalizedFolderPath]: { total: number } }  切换文件夹时优先使用缓存，避免重复请求后端
     // ★ 标签视图增量加载状态（标签结果超过 FOLDER_LOOKAHEAD 时按路径分批拉取）
@@ -161,7 +162,27 @@ const Gallery = (() => {
     let containerHeight = 0;
     let renderedRange = { start: 0, end: 0 };
     let _lastRenderScrollTop = -1;    // 滞回：上次渲染时的 scrollTop，防止行边界振荡
-    const OVERSCAN = 25;
+    // ★ 虚拟滚动 DOM 缓冲：
+    //   - 小缩略图（<220px）：按像素预算（2000px）换算缓冲行数——小图列数多，
+    //     固定行数会让窗口内卡片暴涨 3 倍（120px 时 ~1700 张），惯性连续滚动
+    //     每帧都付布局/绘制这笔钱，表现为掉帧；按像素预算后卡片总数有上限。
+    //   - 大缩略图（≥220px）：固定 50 行（用户定版：宁多备、不露白）。
+    const OVERSCAN_PX = 2000;            // 视窗上/下各多备的像素量
+    const OVERSCAN_MIN_ROWS = 2;         // 行高极大时的最少缓冲行数
+    const OVERSCAN_LEGACY_ROWS = 50;     // 大缩略图（≥220px）固定缓冲行数
+    const OVERSCAN_THUMB_THRESHOLD = 220; // 小图/大图缓冲策略的分界尺寸
+    function overscanRows(rowH) {
+        if (thumbnailSize >= OVERSCAN_THUMB_THRESHOLD) return OVERSCAN_LEGACY_ROWS;
+        return Math.max(OVERSCAN_MIN_ROWS, Math.ceil(OVERSCAN_PX / Math.max(1, rowH)));
+    }
+
+    // ★ 图片预取窗口：前后各 50 行（与 DOM 缓冲对齐，用户定版）。
+    //   行高用 thumbnailSize+44 近似（网格卡片高 36px 信息栏 + 8px 间距；
+    //   瀑布流/列表行高略有出入，作为调度器的估算足够）。
+    const PREFETCH_ROWS = 50;
+    function prefetchPx() {
+        return PREFETCH_ROWS * (thumbnailSize + 44);
+    }
 
     // ★ 滚动状态（模块级，供 IntersectionObserver 和 scroll 防抖共享）
     let _isScrolling = false;
@@ -172,14 +193,30 @@ const Gallery = (() => {
     //   摩擦/停止阈值为内部常数，不再暴露散装调参项。
     let _inertiaEnabled = false;         // 用户是否开启惯性滚动（默认关闭）
     let _inertiaPower = 10;              // 滑行力度 0-100（默认 10：轻快跟手）
+    let _inertiaAnalog = false;          // 无级滚动模式：滚轮速率连续映射为滚动速度（默认关闭）
     let _inertiaV = 0;                   // 当前速度（px/帧）
+
+    // ★ 无级模式状态与常数：把离散的滚轮事件流当作连续输入的采样，
+    //   用事件间隔估计滚动速率（EMA 平滑），速度渐近追踪目标 →
+    //   "快甩快滑、慢滚慢移"，输出不再按格量化。无旁路、无停顿，
+    //   跟手优先：反向输入直接换向，停手后快速缓降 + 加强摩擦短促滑停。
+    let _analogRate = 0;                 // 平滑滚动速率（px/ms，有符号）
+    let _analogLastWheelTime = 0;        // 上一个 wheel 事件时刻
+    let _analogAccum = 0;                // 亚像素位移累加器（低速爬行时凑满整数像素才滚动）
+    const ANALOG_HOLD_MS = 300;          // 追踪窗口：窗口内目标速度由速率主导
+    const ANALOG_EMA = 0.5;              // 速率低通系数（越大越跟手，越小越平滑）
+    const ANALOG_FRICTION = 0.8;         // 无级模式停手滑行摩擦（比油门模式强：刹车跟手）
+    const ANALOG_TRACK_MS = 90;          // 速度渐近追踪时间常数（ms，减速/刹车平滑度）
+    const ANALOG_ACCEL_MS = 150;         // 加速斜坡时间常数（ms）：起步逐步加速，无突跳
 
     // ★ 拖拽滚动状态
     let _dragScroll = { active: false, pointerId: -1, startY: 0, startScroll: 0, lastY: 0, lastTime: 0, velocity: 0, rafId: 0 };
     let _inertiaId = null;               // requestAnimationFrame ID
     let _inertiaScrolling = false;       // 一次性令牌：保护本次 scrollBy 不被取消
     let _lastFrameTime = performance.now(); // 上一帧时间
-    const INERTIA_FRICTION = 0.865;      // 每帧速度保留比例（基准 60fps，按帧时长归一；0.93²≈0.865，滑停时间约为初版一半）
+    // ★ 惯性滑行曲线（恢复原始手感）：纯指数摩擦衰减——每格滚轮给一脚冲量，
+    //   速度按固定比例衰减至停止（每帧保留 0.865，60fps 基准按帧时长归一）
+    const INERTIA_FRICTION = 0.865;      // 每帧速度保留比例
     const INERTIA_MIN_V = 0.4;           // 停止阈值（px/帧）
 
     // 固定行高瀑布流布局缓存
@@ -189,6 +226,13 @@ const Gallery = (() => {
     let masonryContainerWidth = 0;   // 计算时的容器宽度（resize 时重新计算）
     let masonryLayoutVersion = 0;    // 递增以触发重渲染
     let masonryFirstId = '';         // 布局中第一张图片的 id（检测数据替换）
+    let masonryRenderedRange = null; // 上次实际渲染的可见行范围 {first,last,version,firstId}
+                                     // ★ 滚动帧守卫：范围未变就不重建 DOM，避免已加载图片
+                                     //   被拆掉重建而闪黑块（masonry 卡片是绝对定位，
+                                     //   位置只由布局决定，与滚动距离无关，可安全跳过）
+    let pinterestRenderedRange = null; // pinterest 同上 {band,version,firstId}（频带量化守卫）
+    const PINTEREST_BAND = 512;        // pinterest 滚动频带（px）：同带内跳过 DOM 操作
+    let listRenderedRange = null;      // list 同上 {firstIdx,lastIdx,version,firstId}
 
     // 竖版瀑布流（Pinterest 风格）布局缓存：固定列宽，不定高度
     let pinterestLayout = [];        // [{imgIndex, col, x, y, w, h}]
@@ -198,6 +242,11 @@ const Gallery = (() => {
     let pinterestContainerWidth = 0; // 计算时的容器宽度
     let pinterestLayoutVersion = 0;  // 递增以触发重渲染
     let pinterestFirstId = '';       // 布局中第一张图片的 id（检测数据替换）
+    // ★ y 排序索引：滚动帧的可见范围查询用二分（原实现每帧 O(N) filter/reduce，
+    //   图库上万张时是 pinterest 特有的掉帧源）
+    let pinterestByY = [];           // 按 y 升序的布局项引用
+    let pinterestPrefixMaxIdx = [];  // y 序前缀的最大 imgIndex（查视窗内最后一张图 O(logN)）
+    let pinterestMaxItemH = 0;       // 最高卡片高度（可见范围下界回退用）
 
     // 列表模式缓存：每行固定高度（thumbnailSize），绝对定位
     let listLayoutVersion = 0;       // 递增以触发重渲染
@@ -261,6 +310,9 @@ const Gallery = (() => {
                 // 恢复滑行力度（0-100；旧版散装参数不再读取）
                 const savedPower = await Storage.getSetting('inertiaPower', null);
                 if (savedPower !== null) _inertiaPower = Math.max(0, Math.min(100, parseInt(savedPower) || 10));
+                // 恢复无级滚动模式
+                const savedAnalog = await Storage.getSetting('inertiaAnalog', null);
+                if (savedAnalog !== null) _inertiaAnalog = !!savedAnalog;
             }
         } catch (e) { /* 静默 */ }
 
@@ -309,6 +361,19 @@ const Gallery = (() => {
                 let pendingScanFolder = null;  // 正在为这个文件夹进行首次加载
                 let loadedScanFolder = null;   // 已经为这个文件夹的 scan 加载完成
                 let _scanCompleteLast = 0;      // scan:complete 重取当前文件夹的防抖时间戳
+                let _scanCompleteTimer = null;  // ★ 尾随防抖：最后一次 scan:complete 后 1s 仍会重取
+                // ★ 正在扫描的根目录集合：导入期间 offset>=total 不再视为"已加载完"，
+                //   否则初期把首批拉满后（offset==total==当时的 total），扫描继续加图，
+                //   滚动分页与流式补图都被 offset>=total 挡死，表现为"导入初期偶发卡死，刷新才恢复"。
+                const _activeScanRoots = new Set();
+                function _scanActiveFor(folderPath) {
+                    if (!folderPath || _activeScanRoots.size === 0) return false;
+                    const n = folderPath.replace(/\\/g, '/');
+                    for (const r of _activeScanRoots) {
+                        if (n === r || n.startsWith(r + '/')) return true;
+                    }
+                    return false;
+                }
                 window.runtime.EventsOn('scan:complete', (data) => {
                     console.log('[Gallery] 收到扫描完成事件:', data);
                     _bgOpScanning = false;
@@ -320,6 +385,7 @@ const Gallery = (() => {
                     //   真正的图片缓存 images 其实还在；只有被扫描的 root 内容可能变化，才需要重拉。
                     //   非扫描 root 的元数据立即保留，下一次点击直接缓存命中、不加载。
                     if (scanRoot) {
+                        _activeScanRoots.delete(scanRoot);
                         for (const k of Object.keys(folderCacheMeta)) {
                             if (k === scanRoot || k.startsWith(scanRoot + '/')) {
                                 delete folderCacheMeta[k];
@@ -333,14 +399,30 @@ const Gallery = (() => {
                         //   扫描中途（image_cache 未写全）打开的，分页总数会冻结在部分数量上，
                         //   之后滚动不再加载（表现为"导入后只加载几百张就没反应"）。
                         //   统一重拉一次，用最终 total 校正分页状态。
-                        // ★ 防抖：导入多个根时 scan:complete 会频繁触发，每触发一次就重取/重渲染当前文件夹
-                        //   ——大导入下会反复发 GetImages（如 AmourAngels 被连续取 4-5 次），压垮 websocket。
-                        //   合并为 1 秒内最多重取一次。
+                        // ★ 防抖（尾随）：导入多个根时 scan:complete 会频繁触发。旧写法
+                        //   `if (now - last < 1000) return` 会把 1s 内的后续事件**整体丢弃**
+                        //   ——若最后被丢弃的那次才轮到当前文件夹扫完，就永远没人重取，
+                        //   分页总数冻结（表现为导入初期偶发卡死、刷新才恢复）。
+                        //   改成尾随触发：1s 内合并，但最后一次事件后 1s 必然重取一次。
                         const now = Date.now();
-                        if (_scanCompleteLast && now - _scanCompleteLast < 1000) return;
-                        _scanCompleteLast = now;
-                        console.log('[Gallery] 扫描完成，重新拉取当前文件夹:', currentFolderFilter);
-                        filterByFolder(currentFolderFilter, null, { forceRefresh: false });
+                        if (_scanCompleteTimer) return;
+                        const wait = _scanCompleteLast && now - _scanCompleteLast < 1000
+                            ? 1000 - (now - _scanCompleteLast) : 0;
+                        _scanCompleteTimer = setTimeout(() => {
+                            _scanCompleteTimer = null;
+                            _scanCompleteLast = Date.now();
+                            // ★ 用户已通过流式补图/翻页深入该文件夹（超过第一批）时，
+                            //   不做全量重取——重取会把已加载内容重置回 500 张并重建网格，
+                            //   销毁全部在途缩略图请求（表现为"导入完成后已出的图全部消失"）。
+                            //   流式补图每批都用后端返回的 total 校正 folderLoadTotal，
+                            //   扫描结束后 offset<total 的分页照常工作，无需重置。
+                            if (folderLoadOffset > FOLDER_FETCH_BATCH) {
+                                console.log('[Gallery] 扫描完成：已深入加载，跳过重取保持现场, offset=', folderLoadOffset);
+                                return;
+                            }
+                            console.log('[Gallery] 扫描完成，重新拉取当前文件夹:', currentFolderFilter);
+                            filterByFolder(currentFolderFilter, null, { forceRefresh: false });
+                        }, wait);
                     }
                     // ★ 扫描完成后刷新整棵树，导入后的子文件夹和展开按钮需要后端完整树数据
                     if (typeof Sidebar !== 'undefined' && Sidebar.refreshFolderTree) {
@@ -405,6 +487,7 @@ const Gallery = (() => {
                 window.runtime.EventsOn('scan:start', (data) => {
                     const rootPath = (data.rootPath || '').replace(/\\/g, '/');
                     console.log('[Gallery] scan:start root=' + rootPath);
+                    if (rootPath) _activeScanRoots.add(rootPath);
                     _bgOpScanning = true;
                     updateBgOpStatus();
                     showScanningPlaceholder();
@@ -544,13 +627,26 @@ const Gallery = (() => {
             btnInertiaToggle.addEventListener('click', toggleInertia);
         }
 
+        // ★ 惯性参数设置按钮（惯性按钮右侧的小齿轮）
+        const btnInertiaSettings = document.getElementById('btnInertiaSettings');
+        if (btnInertiaSettings) {
+            btnInertiaSettings.addEventListener('click', (e) => {
+                const r = btnInertiaSettings.getBoundingClientRect();
+                _showInertiaDialog();
+            });
+        }
+
         // 滚动：每帧立即更新虚拟滚动，Observer 重连在滚动停止后的下一个宏任务执行
         let _scrollRafPending = false;
         let _observerDebounceTimer = null;
         let _lastAbortAt = 0;
 
         galleryScroll.addEventListener('scroll', () => {
-            scrollTop = galleryScroll.scrollTop;
+            const newScrollTop = galleryScroll.scrollTop;
+            // 记录滚动方向（供加载调度做方向性预加载）
+            if (newScrollTop > scrollTop + 0.5) _scrollDir = 1;
+            else if (newScrollTop < scrollTop - 0.5) _scrollDir = -1;
+            scrollTop = newScrollTop;
             containerHeight = galleryScroll.clientHeight;
 
             // ★ 惯性滚动中：消耗一次性令牌，不取消动画
@@ -564,7 +660,15 @@ const Gallery = (() => {
             }
 
             _isScrolling = true;
-            _thumbScrollBurst = true;
+            // ★ 急停加速补载：惯性滑行减速到低速段（速度 < 封顶的 20%）时，
+            //   提前从"滚动中只喂视窗"（tight）切回正常预取窗口——人眼在慢速
+            //   滑行段已经开始看清内容，等完全停止 150ms 才开窗必然看到黑框。
+            //   高速段仍收紧，避免"滚动一路加载过来"挤占 6 连接池。
+            const inertiaCoastingSlow = _inertiaId !== null &&
+                Math.abs(_inertiaV) < (40 + _inertiaPower) * 0.2;
+            if (!inertiaCoastingSlow) {
+                _thumbScrollBurst = true;
+            }
 
             // ★ 滚动时冻结卡片 transition，减少样式重算
             if (!galleryGrid.classList.contains('is-scrolling')) {
@@ -603,28 +707,57 @@ const Gallery = (() => {
             }, 150);
         });
 
-        // ★ 惯性滚动：油门+滑行——每格滚轮给速度加冲量，rAF 每帧 scrollBy + 固定摩擦衰减
+        // ★ 惯性滚动：油门+匀速巡航——每格滚轮立即建立/维持速度（即时响应，
+        //   类似中键拖动的连续匀速感），连续滚动时速度维持在油门线附近；
+        //   停止输入后按两段式曲线滑停（前段近匀速 + 末段线性收敛，见 _tick）。
+        //   注：渲染层的逐帧卡顿已由增量虚拟滚动修复，主线程接管滚动不再掉帧。
         galleryScroll.addEventListener('wheel', (e) => {
             if (!_inertiaEnabled) return;
             if (e.buttons === 1) return;
             e.preventDefault();
 
-            // ★ 油门：每格滚轮给速度加冲量。deltaMode=1（行）按 ~40px/行 归一。
+            // 油门：每格滚轮的速度增量。deltaMode=1（行）按 ~40px/行 归一。
             const rawDelta = e.deltaMode === 1 ? e.deltaY * 40 : e.deltaY;
-            // 冲量系数：力度 0 → 0.06/px，100 → 1.26/px（一格 deltaY=100 的脉冲，
-            //   50 档约 v=66px/帧起步，配合 0.93 摩擦滑行约 900px）
-            const gain = 0.06 + (_inertiaPower / 100) * 1.2;
-            const delta = rawDelta * gain;
+            const now = performance.now();
 
-            // ★ 边界反向输入立即归零：到底部时 wheel 向上、到顶部时 wheel 向下
-            //   避免残留的同向速度吞掉用户的反向意图
-            if (_inertiaV !== 0 && Math.sign(delta) !== Math.sign(_inertiaV)) {
+            // 反向输入立即换向：到底/顶时的反向滚轮不被残留速度吞掉
+            if (_inertiaV !== 0 && Math.sign(rawDelta) !== Math.sign(_inertiaV)) {
                 const atBottom = galleryScroll.scrollTop + galleryScroll.clientHeight >= galleryScroll.scrollHeight - 1;
                 const atTop = galleryScroll.scrollTop <= 0;
-                if ((delta < 0 && atBottom) || (delta > 0 && atTop)) {
+                if ((rawDelta < 0 && atBottom) || (rawDelta > 0 && atTop)) {
                     _inertiaV = 0;
+                    _analogRate = 0;
                 }
             }
+
+            if (_inertiaAnalog) {
+                // ★ 无级模式：用事件间隔估计滚动速率（EMA 平滑），速度连续跟手速。
+                //   无旁路、无停顿：任何滚轮输入都进引擎，全程连续。
+                const dt = _analogLastWheelTime ? now - _analogLastWheelTime : Infinity;
+                _analogLastWheelTime = now;
+                // 间隔截断到 250ms：长间隔单格不把速率稀释到 0（小滑行而非停摆）
+                const instant = rawDelta / Math.min(Math.max(dt, 1), 250); // px/ms
+                if (!_inertiaId) {
+                    // ★ 起步：只播种速率（目标速度从第一格起就正确，无暖机问题），
+                    //   速度本身从 0 沿加速斜坡追上去——逐步加速，无阶跃突跳
+                    _analogRate = instant;
+                    _analogAccum = 0;
+                    _lastFrameTime = now;
+                    _inertiaId = requestAnimationFrame(_tick);
+                    return;
+                }
+                if (_analogRate !== 0 && Math.sign(instant) !== Math.sign(_analogRate)) {
+                    // ★ 反向输入直接换向（不经 EMA 渐变）：刹车跟手
+                    _analogRate = instant;
+                    _analogAccum = 0; // 换向后丢弃旧方向的亚像素余量
+                } else {
+                    _analogRate = _analogRate * (1 - ANALOG_EMA) + instant * ANALOG_EMA;
+                }
+                return;
+            }
+
+            const gain = 0.06 + (_inertiaPower / 100) * 1.2;
+            const delta = rawDelta * gain;
 
             // 速度上限：力度 0 → 40px/帧，100 → 140px/帧（连击封顶，防止失控）
             const maxV = 40 + _inertiaPower;
@@ -632,19 +765,10 @@ const Gallery = (() => {
             _inertiaV = Math.max(-maxV, Math.min(maxV, _inertiaV));
 
             if (!_inertiaId) {
-                _lastFrameTime = performance.now();
+                _lastFrameTime = now;
                 _inertiaId = requestAnimationFrame(_tick);
             }
         }, { passive: false });
-
-        // ★ 右键空白区域 → 惯性滚动参数调节（需开启惯性滚动）
-        galleryScroll.addEventListener('contextmenu', (e) => {
-            if (!_inertiaEnabled) return;
-            // 只在点击空白区域时弹出（卡片有自己的右键菜单）
-            if (e.target.closest('.image-card')) return;
-            e.preventDefault();
-            _showInertiaDialog(e.clientX, e.clientY);
-        });
 
         // ★ 拖拽滚动：按住左键拖拽空白区域丝滑滚动
         galleryScroll.addEventListener('pointerdown', (e) => {
@@ -689,7 +813,7 @@ const Gallery = (() => {
             galleryScroll.style.cursor = '';
             galleryScroll.style.userSelect = '';
 
-            // 惯性滑行
+            // 惯性滑行（原始手感：固定摩擦衰减）
             const v = _dragScroll.velocity;
             if (Math.abs(v) > 0.1) {
                 const friction = 0.92;
@@ -810,13 +934,13 @@ const Gallery = (() => {
     }
 
     function initIntersectionObserver() {
-        // rootMargin：上方 2 屏、下方 4 屏（预取窗口，向下深、向上够用）。
-        // ★ 新文件夹缩略图走按需生成（约 100-200ms/张），下方只预取 2 屏会被
-        //   正常滚动速度追上——表现为"往下滚全是黑块"。加深到 4 屏后，
-        //   用户停下滚动到继续下滚之间，下方图大多已在生成/已就绪。
+        // rootMargin：预取窗口 = 视窗前后各 50 行（用户定版，与 DOM 缓冲对齐）。
+        // ★ 预取量大（50 行 × 列数），靠 fetchpriority=low + 滚动中收紧
+        //   （tight）保证不挤占视窗内加载；新文件夹按需生成的排队由
+        //   "滚动中不预取"机制自然摊开。
         function _getPreloadMargin() {
-            const vh = galleryScroll ? galleryScroll.clientHeight : window.innerHeight;
-            return `${Math.max(vh * 2, 800)}px 0px ${Math.max(vh * 4, 1600)}px`;
+            const m = Math.max(prefetchPx(), 3200);
+            return `${m}px 0px ${m}px`;
         }
 
         function _createObserver() {
@@ -862,7 +986,36 @@ const Gallery = (() => {
      */
     function _resumeImageObserver() {
         const win = _thumbLoadWindow();
-        galleryGrid.querySelectorAll('img[data-src]').forEach(img => _dispatchThumb(img, win));
+        const pending = galleryGrid.querySelectorAll('img[data-src]');
+        // ★ 两遍派发：先立即加载窗口（视窗内），再预取区——并发预算腾出名额时
+        //   保证视窗内的图优先拿到，不会被 DOM 顺序靠前的预取图抢走名额
+        const immediate = [];
+        const deferredImgs = [];
+        for (const img of pending) {
+            const r = img.getBoundingClientRect();
+            if (!win || (r.bottom >= win.top && r.top <= win.bottom)) immediate.push(img);
+            else deferredImgs.push(img);
+        }
+        for (const img of immediate) _dispatchThumb(img, win);
+        for (const img of deferredImgs) _dispatchThumb(img, win);
+        // ★ 重试耗尽的失败卡（"Load failed"）：重新进入立即加载窗口时就地重置
+        //   并重新调度——不再单纯依赖 thumb:progress 自愈事件。压测中冷区
+        //   超时风暴会批量烧光 5 次重试，只靠自愈会留下成片黑框。
+        galleryGrid.querySelectorAll('.image-card .img-error').forEach(errDiv => {
+            const img = errDiv.parentNode && errDiv.parentNode.querySelector('img');
+            if (!img || img.dataset.src) return;
+            const r = img.getBoundingClientRect();
+            if (!win || r.bottom < win.top || r.top > win.bottom) return;
+            const card = img.closest('.image-card');
+            const baseUrl = (card && card._thumbUrl) || (img.src || '').replace(/[&?]_r=[^&]*/g, '');
+            if (!baseUrl) return;
+            img.dataset.retryCount = '0'; // 重新进入窗口：重置普通重试计数
+            errDiv.remove();
+            img.style.display = img.dataset.prevDisplay || '';
+            delete img.dataset.prevDisplay;
+            img.classList.add('loading');
+            _queueThumbLoad(img, baseUrl);
+        });
     }
 
     /**
@@ -873,40 +1026,108 @@ const Gallery = (() => {
         const deltaTime = now - _lastFrameTime;
         _lastFrameTime = now;
 
-        // 速度太小就停止
-        if (Math.abs(_inertiaV) < INERTIA_MIN_V) {
+        // ★ 无级模式：目标速度 = 平滑速率 × 增益（力度 0→0.5，100→1.25），
+        //   当前速度渐近追踪（连续加减速，无逐格台阶）；跟手优先——
+        //   停手后速率快速缓降 + 加强摩擦，滑行短促即停
+        const analogTracking = _inertiaAnalog && _analogLastWheelTime !== 0 &&
+            (now - _analogLastWheelTime) < ANALOG_HOLD_MS;
+        if (analogTracking) {
+            const analogMaxV = 40 + _inertiaPower;
+            // ★ 增益对齐原生节奏：以 200ms/格 正常滚动（≈600px/s）时目标速度
+            //   与原生滚动相当，无"拖刹车"感；力度只向上增强
+            const gain = 0.9 + (_inertiaPower / 100) * 0.6;
+            let targetV = _analogRate * 16.7 * gain;
+            const sinceWheel = now - _analogLastWheelTime;
+            // ★ 低速下限：慢滚（两格间隔 200-300ms）的瞬时速率天然很小，
+            //   若不加下限，目标速度会贴着停止阈值导致"滚了但几乎不动"。
+            //   下限只在输入新鲜（150ms 内有过滚轮）时生效，停手后不封底。
+            const minTrack = 1.5 + _inertiaPower * 0.03;
+            if (sinceWheel <= 150 && Math.abs(targetV) < minTrack) {
+                targetV = (targetV < 0 ? -1 : 1) * minTrack;
+            }
+            targetV = Math.max(-analogMaxV, Math.min(analogMaxV, targetV));
+            // ★ 非对称追踪：加速温和（150ms 斜坡，起步平滑无突跳）、
+            //   减速快（90ms，刹车跟手）
+            const trackMs = Math.abs(targetV) > Math.abs(_inertiaV) ? ANALOG_ACCEL_MS : ANALOG_TRACK_MS;
+            _inertiaV += (targetV - _inertiaV) * Math.min(1, deltaTime / trackMs);
+            // ★ 停手后的缓降（跟手优先）：半衰期 90ms，目标速度迅速归零；
+            //   慢滚间隔（≤250ms 截断）内衰减可控，不会把速率压垮。
+            if (sinceWheel > 100) {
+                _analogRate *= Math.pow(0.5, deltaTime / 90);
+            }
+        } else {
+            _analogRate = 0;
+        }
+
+        // ★ 停止判定：
+        //   - 油门模式：速度低于阈值即停（原行为）。
+        //   - 无级模式：追踪中目标仍有速度时绝不停（起步斜坡期间 v 从 0 爬升，
+        //     必然低于阈值——此处停机会把引擎扼杀在起步帧，表现为"微微抖动
+        //     无法启动"）；目标归零后由摩擦把 v 压到阈值再停。
+        const analogTargetAlive = analogTracking && Math.abs(_analogRate) > 0.01;
+        if (Math.abs(_inertiaV) < INERTIA_MIN_V && !analogTargetAlive) {
             _inertiaV = 0;
             _inertiaId = null;
             _inertiaScrolling = false;
             return;
         }
 
-        // ★ 一次性令牌：保护本次 scrollBy 触发的 scroll 事件不被取消
-        const prevScrollTop = galleryScroll.scrollTop;
-        _inertiaScrolling = true;
-        galleryScroll.scrollBy(0, _inertiaV);
-        const newScrollTop = galleryScroll.scrollTop;
+        // ★ 亚像素累加：低速爬行时 v 可能 < 1px/帧，scrollBy 因像素取整
+        //   不产生位移，还会被下方边界检查误判为"到顶/底"而停机。
+        //   位移跨帧累加，凑满整数像素才真正滚动。
+        if (_inertiaAnalog) {
+            _analogAccum += _inertiaV;
+            const step = Math.trunc(_analogAccum);
+            if (step !== 0) {
+                _analogAccum -= step;
+                // ★ 一次性令牌：保护本次 scrollBy 触发的 scroll 事件不被取消
+                const prevScrollTop = galleryScroll.scrollTop;
+                _inertiaScrolling = true;
+                galleryScroll.scrollBy(0, step);
 
-        // ★ 边界停止：scrollBy 未实际改变 scrollTop（已到顶/底），立即归零速度
-        //   否则惯性引擎会空转，_inertiaV 缓慢衰减期间用户的反向 wheel 输入被吞掉
-        if (Math.abs(newScrollTop - prevScrollTop) < 0.5) {
-            _inertiaV = 0;
-            _inertiaId = null;
-            _inertiaScrolling = false;
-            return;
+                // ★ 边界停止：仅在实际位移需求 ≥1px 却被挡住时判定（真到顶/底）。
+                //   亚像素累计帧（step 可能只有 1px）不算边界。
+                if (Math.abs(galleryScroll.scrollTop - prevScrollTop) < 0.5 && Math.abs(step) >= 1) {
+                    _inertiaV = 0;
+                    _analogAccum = 0;
+                    _inertiaId = null;
+                    _inertiaScrolling = false;
+                    return;
+                }
+            }
+        } else {
+            // ★ 一次性令牌：保护本次 scrollBy 触发的 scroll 事件不被取消
+            const prevScrollTop = galleryScroll.scrollTop;
+            _inertiaScrolling = true;
+            galleryScroll.scrollBy(0, _inertiaV);
+
+            // ★ 边界停止：scrollBy 未实际改变 scrollTop（已到顶/底），立即归零速度
+            //   否则惯性引擎会空转，_inertiaV 缓慢衰减期间用户的反向 wheel 输入被吞掉
+            if (Math.abs(galleryScroll.scrollTop - prevScrollTop) < 0.5) {
+                _inertiaV = 0;
+                _inertiaId = null;
+                _inertiaScrolling = false;
+                return;
+            }
         }
 
         // 固定摩擦（帧时长归一）：松手后自然滑停，无"滚动中/松手后"双曲线
-        _inertiaV *= Math.pow(INERTIA_FRICTION, deltaTime / 16.7);
+        // ★ 无级模式追踪期间由目标速度主导，不叠摩擦（否则稳态速度被拉低）；
+        //   窗口结束后用加强摩擦（ANALOG_FRICTION）短促滑停——刹车跟手
+        if (!analogTracking) {
+            const friction = _inertiaAnalog ? ANALOG_FRICTION : INERTIA_FRICTION;
+            _inertiaV *= Math.pow(friction, deltaTime / 16.7);
+        }
 
         // 继续下一帧
         _inertiaId = requestAnimationFrame(_tick);
     }
 
     /**
-     * ★ 右键弹出 → 惯性滚动"滑行力度"调节（0-100 单滑杆）
+     * ★ 惯性滚动"滑行力度"调节（0-100 任意整数：滑杆 + 手动输入框双向同步）。
+     *   由惯性按钮右侧的设置按钮打开（原右键交互已移除）。
      */
-    function _showInertiaDialog(mx, my) {
+    function _showInertiaDialog() {
         const overlay = document.getElementById('modalOverlay');
         const content = document.getElementById('modalContent');
 
@@ -916,12 +1137,17 @@ const Gallery = (() => {
             <div class="settings-dialog">
                 <h2>${t('inertia.title')}</h2>
                 <div class="inertia-params">
-                    <label style="display:flex;align-items:center;gap:10px;">
+                    <label style="grid-column:1/-1;display:flex;flex-direction:row;align-items:center;gap:10px;">
                         <span style="white-space:nowrap;">${t('inertia.power')}</span>
-                        <input type="range" id="ipPower" min="0" max="100" step="5" value="${_inertiaPower}" style="flex:1;">
-                        <span id="ipPowerVal" style="min-width:34px;text-align:right;">${_inertiaPower}</span>
+                        <input type="range" id="ipPower" min="0" max="100" step="1" value="${_inertiaPower}" class="ip-power-slider" style="flex:1;">
+                        <input type="number" id="ipPowerNum" min="0" max="100" step="1" value="${_inertiaPower}" class="ip-power-num">
                     </label>
-                    <div style="font-size:11px;color:var(--text-muted,#888);margin-top:6px;">${t('inertia.power_hint')}</div>
+                    <div style="grid-column:1/-1;font-size:11px;color:var(--text-muted,#888);margin-top:2px;">${t('inertia.power_hint')}</div>
+                    <label style="grid-column:1/-1;display:flex;flex-direction:row;align-items:center;gap:8px;margin-top:8px;cursor:pointer;">
+                        <input type="checkbox" id="ipAnalog" ${_inertiaAnalog ? 'checked' : ''} style="width:auto;padding:0;margin:0;flex:none;accent-color:var(--accent);">
+                        <span style="white-space:nowrap;font-size:13px;color:var(--text-primary);">${t('inertia.analog')}</span>
+                    </label>
+                    <div style="grid-column:1/-1;font-size:11px;color:var(--text-muted,#888);margin-top:2px;">${t('inertia.analog_hint')}</div>
                 </div>
             </div>
             <div class="modal-actions">
@@ -930,6 +1156,9 @@ const Gallery = (() => {
             </div>
         `;
 
+        // ★ 弹窗使用遮罩默认居中布局（与其他设置弹窗一致）。
+        //   不要对面板做 fixed 定位：modal-actions 在 .settings-dialog 之外，
+        //   分别定位会造成"面板与按钮漂移错位"。
         overlay.style.display = 'flex';
 
         const close = () => { overlay.style.display = 'none'; };
@@ -940,15 +1169,32 @@ const Gallery = (() => {
         });
 
         const slider = document.getElementById('ipPower');
+        const numInput = document.getElementById('ipPowerNum');
+        const clampPower = (v) => Math.max(0, Math.min(100, Math.round(parseInt(v, 10) || 0)));
+        // 滑杆 → 数字框
         slider.addEventListener('input', () => {
-            document.getElementById('ipPowerVal').textContent = slider.value;
+            numInput.value = slider.value;
+        });
+        // 数字框 → 滑杆（手动输入任意 0-100 整数）
+        numInput.addEventListener('input', () => {
+            const v = clampPower(numInput.value);
+            if (numInput.value !== '' && String(v) !== String(parseInt(numInput.value, 10))) numInput.value = v;
+            slider.value = v;
         });
 
         document.getElementById('btnApplyInertia').addEventListener('click', () => {
-            _inertiaPower = Math.max(0, Math.min(100, parseInt(slider.value) || 10));
+            _inertiaPower = clampPower(numInput.value || slider.value);
+            // ★ 无级滚动开关：切换时清掉速率估计状态，避免残留速度混入新模式
+            const analogOn = document.getElementById('ipAnalog').checked;
+            if (analogOn !== _inertiaAnalog) {
+                _analogRate = 0;
+                _analogLastWheelTime = 0;
+            }
+            _inertiaAnalog = analogOn;
             // ★ 持久化
             if (typeof Storage !== 'undefined' && Storage.setSetting) {
                 Storage.setSetting('inertiaPower', _inertiaPower);
+                Storage.setSetting('inertiaAnalog', _inertiaAnalog);
             }
             close();
         });
@@ -957,12 +1203,14 @@ const Gallery = (() => {
     /**
      * ★ 视窗优先：中止视口外正在传输中的图片请求，释放 HTTP 连接槽。
      *   视口内已在加载的图片不受影响，保证用户当前看到的内容不闪烁。
-     *   缓冲带 4.5 屏：必须大于下方预取深度（4 屏），否则深预取的在途请求
-     *   会被下一次滚动误杀，预加载永远到不了"提前就位"。
+     *   缓冲带 = 预取深度（前后各 50 行）+ 视窗本身，必须大于预取深度，
+     *   否则深预取的在途请求会被下一次滚动误杀，预加载永远到不了"提前就位"。
      */
     function _abortOutOfViewportLoads() {
         const galleryRect = galleryScroll.getBoundingClientRect();
-        const buffer = galleryRect.height * 4.5;
+        // ★ 缓冲带必须大于预取深度（前后各 50 行 + 视窗本身），否则深预取的
+        //   在途请求会被下一次滚动误杀，预加载永远到不了"提前就位"
+        const buffer = prefetchPx() + galleryRect.height;
         const viewTop = galleryRect.top - buffer;
         const viewBottom = galleryRect.bottom + buffer;
 
@@ -2041,6 +2289,7 @@ const Gallery = (() => {
 
     // ★ 节流时间戳，防止 scroll 事件连续触发多次加载
     let _lastScrollCheckTime = 0;
+    let _lastPageDiagAt = 0; // 分页诊断节流
 
     function getViewportLastImageIndex() {
         if (!galleryScroll || filteredImages.length === 0) return 0;
@@ -2050,18 +2299,18 @@ const Gallery = (() => {
         if (currentLayout === 'masonry') {
             const rowH = thumbnailSize + 8;
             const lastVisibleRow = Math.floor(viewBottom / rowH);
-            const lastItem = masonryLayout.findLast ?
-                masonryLayout.findLast(item => item.row <= lastVisibleRow) :
-                [...masonryLayout].reverse().find(item => item.row <= lastVisibleRow);
-            return lastItem ? lastItem.imgIndex : 0;
+            // ★ 二分（masonryLayout 按 row 单调递增；原实现 findLast/reverse 是 O(N)）
+            let lo = 0, hi = masonryLayout.length;
+            while (lo < hi) { const mid = (lo + hi) >> 1; if (masonryLayout[mid].row <= lastVisibleRow) lo = mid + 1; else hi = mid; }
+            return lo > 0 ? masonryLayout[lo - 1].imgIndex : 0;
         }
 
         if (currentLayout === 'pinterest') {
-            return pinterestLayout.length > 0 ?
-                pinterestLayout.reduce((best, item) => {
-                    if (item.y <= viewBottom && item.imgIndex > best) return item.imgIndex;
-                    return best;
-                }, 0) : 0;
+            // ★ 二分 y 排序索引 + 前缀最大 imgIndex（原实现 O(N) reduce）
+            if (pinterestByY.length === 0) return 0;
+            let lo = 0, hi = pinterestByY.length;
+            while (lo < hi) { const mid = (lo + hi) >> 1; if (pinterestByY[mid].y <= viewBottom) lo = mid + 1; else hi = mid; }
+            return lo > 0 ? pinterestPrefixMaxIdx[lo - 1] : 0;
         }
 
         if (currentLayout === 'list') {
@@ -2098,7 +2347,18 @@ const Gallery = (() => {
     function checkLoadMoreOnScroll(allowDuringScroll = false) {
         if (!isFilteringActive || (!currentFolderFilter && !currentTagFilter && !currentFavoriteFilter)) return;
         if (!allowDuringScroll && _isScrolling) return;
-        if (isLoadingMoreFolder) return;
+        if (isLoadingMoreFolder) {
+            // ★ exe 实测：增量加载的 RPC 在后端忙于扫描时可能长时间不返回，
+            //   isLoadingMoreFolder 被永久锁住 → 拖到底部再也不触发"加载更多"。
+            //   超过 30s 强制解锁，允许下一次滚动重新发起。
+            if (_loadMoreStartedAt && Date.now() - _loadMoreStartedAt > 30000) {
+                trace('[Gallery] 增量加载超过 30s 未返回，强制解锁重试');
+                isLoadingMoreFolder = false;
+                _showLoadMoreIndicator(false);
+            } else {
+                return;
+            }
+        }
 
         // ★ 标签视图：按标签路径分批加载（与文件夹分页一致）。
         //   仅当没有文件夹过滤时（纯标签视图）走标签分支；
@@ -2135,8 +2395,12 @@ const Gallery = (() => {
         }
 
         // ★ 首次批次加载未完成时（folderLoadTotal===0）跳过增量加载，避免
-        //    scroll 事件在 filterByFolder 等待 RPC 期间触发重复的 loadImagesFromServer
-        if (folderLoadTotal === 0 || folderLoadOffset >= folderLoadTotal) return;
+        //    scroll 事件在 filterByFolder 等待 RPC 期间触发重复的 loadImagesFromServer。
+        //    offset>=total 正常视为"已加载完"，但当前文件夹所属的扫描根还在导入时例外：
+        //    后端 total 在涨，前端门槛若不同步会永久挡住分页（导入初期偶发卡死）。
+        //    扫描期越过门槛多拉一次是安全的：空批次只会原样返回，不会冻结状态。
+        if (folderLoadTotal === 0) return;
+        if (folderLoadOffset >= folderLoadTotal && !_scanActiveFor(currentFolderFilter)) return;
 
         const now = Date.now();
         const throttleMs = allowDuringScroll ? 80 : 200;
@@ -2148,7 +2412,20 @@ const Gallery = (() => {
 
         if (shouldLoadMoreFolderImages(imagesAheadOfViewport)) {
             _abortOutOfViewportLoads();
+            trace('[分页] 触发增量加载: ahead=' + imagesAheadOfViewport +
+                ' total=' + folderLoadTotal + ' offset=' + folderLoadOffset);
             loadMoreFolderImages();
+        } else {
+            // 接近底部却不触发时打出判定状态（1 秒一次），定位"拖到底不加载更多"
+            const bottomDist = getLoadedBottomDistance();
+            if (bottomDist < Math.max(galleryScroll.clientHeight * 1.5, thumbnailSize * 3) &&
+                Date.now() - _lastPageDiagAt > 1000) {
+                _lastPageDiagAt = Date.now();
+                trace('[分页] 底部未触发: ahead=' + imagesAheadOfViewport +
+                    ' bottomDist=' + bottomDist.toFixed(0) +
+                    ' total=' + folderLoadTotal + ' offset=' + folderLoadOffset +
+                    ' busy=' + isLoadingMoreFolder);
+            }
         }
     }
 
@@ -2170,7 +2447,9 @@ const Gallery = (() => {
     async function loadMoreFolderImages() {
         if (!currentFolderFilter || isLoadingMoreFolder) return;
         isLoadingMoreFolder = true;
+        _loadMoreStartedAt = Date.now();
         _showLoadMoreIndicator(true);
+        trace('[分页] loadMoreFolderImages 开始: offset=' + folderLoadOffset + '/' + folderLoadTotal);
 
         // ★ 修复：把 folderPath 提到 try 外声明，finally 中需要用它判断文件夹是否已切换
         const folderPath = currentFolderFilter;
@@ -2192,7 +2471,10 @@ const Gallery = (() => {
             }
 
             if (result.images.length === 0) {
-                folderLoadTotal = folderLoadOffset;
+                // ★ 空批次≠没有更多：导入期间后端可能暂时返回空（扫描未推进到该位置），
+                //   此时冻结 folderLoadTotal=offset 会在扫描恢复后永久挡住分页。
+                //   仅在无相关扫描进行时才视为加载完。
+                if (!_scanActiveFor(folderPath)) folderLoadTotal = folderLoadOffset;
                 _showLoadMoreIndicator(false);
                 return;
             }
@@ -2237,8 +2519,9 @@ const Gallery = (() => {
                 isLoadingMoreFolder = false;
                 // 重置节流时间戳，允许下次合法触发
                 _lastScrollCheckTime = 0;
-                if (folderLoadTotal <= 0 || folderLoadOffset < folderLoadTotal) {
-                    // 还有更多：保持底部提示显示，等用户继续滚动/自动加载下一批
+                if (folderLoadTotal <= 0 || folderLoadOffset < folderLoadTotal ||
+                    _scanActiveFor(folderPath)) {
+                    // 还有更多（或扫描仍在推进，total 还会涨）：保持底部提示显示，等用户继续滚动/自动加载下一批
                     scheduleLoadMoreFollowup();
                 } else {
                     // 已全部加载完成：隐藏底部提示
@@ -2267,7 +2550,9 @@ const Gallery = (() => {
             _scanStreamTimer = null;
             if (!currentFolderFilter) return;
             // 全量加载交给滚动；这里只在"还没全量加载完"时补拉下一批
-            if (folderLoadTotal > 0 && folderLoadOffset >= folderLoadTotal) return;
+            // （扫描期间 offset>=total 可能只是门槛过期，仍要补拉）
+            if (folderLoadTotal > 0 && folderLoadOffset >= folderLoadTotal &&
+                !_scanActiveFor(currentFolderFilter)) return;
             _scanStreamLoad();
         }, 300);
     }
@@ -2293,7 +2578,11 @@ const Gallery = (() => {
             folderLoadTotal = result.total;
             folderCacheMeta[normFolder] = { total: result.total };
             if (added.length === 0) {
-                folderLoadOffset = Math.max(folderLoadOffset, folderLoadTotal);
+                // ★ 不能把 offset 跳到 total：批次去重后全为重复（前端计数与
+                //   后端位置漂移，导入期常见）不代表后端没有更多了——跳过去
+                //   分页就永久失效（表现为"导入后无法继续滚动、不会加载，
+                //   必须刷新"）。按后端实际返回条数推进即可。
+                folderLoadOffset += result.images.length;
                 updateImageCount();
                 return;
             }
@@ -2324,7 +2613,9 @@ const Gallery = (() => {
         if (!currentTagFilter || isLoadingMoreFolder) return;
         if (tagLoadOffset >= tagLoadTotal) return;
         isLoadingMoreFolder = true;
+        _loadMoreStartedAt = Date.now();
         _showLoadMoreIndicator(true);
+        trace('[分页] loadMoreFolderImages 开始: offset=' + folderLoadOffset + '/' + folderLoadTotal);
         const tagId = currentTagFilter;
         try {
             const result = await loadImagesByPaths(tagPaths, tagLoadOffset, FOLDER_FETCH_BATCH);
@@ -2366,7 +2657,9 @@ const Gallery = (() => {
         if (!currentFavoriteFilter || isLoadingMoreFolder) return;
         if (favLoadOffset >= favLoadTotal) return;
         isLoadingMoreFolder = true;
+        _loadMoreStartedAt = Date.now();
         _showLoadMoreIndicator(true);
+        trace('[分页] loadMoreFolderImages 开始: offset=' + folderLoadOffset + '/' + folderLoadTotal);
         const inFavView = currentFavoriteFilter;
         try {
             const result = await loadImagesByPaths(favPaths, favLoadOffset, FOLDER_FETCH_BATCH);
@@ -2400,6 +2693,18 @@ const Gallery = (() => {
         }
     }
 
+    // ★ 重置缩略图调度器（名额/待处理/泵定时器全清）。
+    //   文件夹切换（abortFolderSwitch）和同文件夹重取（filterByFolder 重建网格）都会
+    //   销毁在途请求的卡片——load 事件永远不来，名额若不立即释放，账本永久占满，
+    //   之后什么都不再派发（表现为"重取后全部变黑框、等多久都不出图"）。
+    function resetThumbScheduler() {
+        _inflightThumbs.clear();
+        _pendingThumbImgs.clear();
+        if (_thumbPumpTimer) { clearTimeout(_thumbPumpTimer); _thumbPumpTimer = null; }
+        _lastThumbDispatchAt = performance.now();
+        _scheduleThumbPump();
+    }
+
     function abortFolderSwitch() {
         // ★ 文件夹切换取消：通知后端"遗弃"当前离开的文件夹，
         //   取消其排队中的缩略图生成（避免为已不看的内容读盘生成）
@@ -2410,6 +2715,10 @@ const Gallery = (() => {
             folderAbortController.abort();
             folderAbortController = null;
         }
+        // ★ 重置缩略图调度器：旧文件夹的在途请求已被后端遗弃（生成取消），
+        //   名额若不立即释放，新文件夹的图片要排在 ~165 个已死请求后面
+        //   （实测：新加载文件夹时一半正常一半黑框，卡一会儿才继续出图）
+        resetThumbScheduler();
     }
 
     // ★ 后台刷新节流：记录每个文件夹上次后台刷新的时间戳，避免快速来回切换时，
@@ -2701,6 +3010,9 @@ const Gallery = (() => {
                 // ★ 使用实际返回数量，而非固定批次大小，避免跳过数据
                 folderLoadOffset = serverImages.length;
                 isLoadingMoreFolder = false;
+                // ★ 即将重建网格替换 images：在途请求的卡片会被销毁（load 事件永不触发），
+                //   先重置调度器名额，否则账本卡满、此后不再派发（重取后全屏黑框）。
+                resetThumbScheduler();
 
                 // ★ 保存缓存元数据
                 folderCacheMeta[normalizedFolder] = { total: firstResult.total };
@@ -3249,6 +3561,11 @@ const Gallery = (() => {
             return;
         }
 
+        // 数据/筛选/排序变化的渲染入口：重置滚动帧守卫，
+        // 确保显示集合变化后一定重建 DOM（滚动帧走 updateVirtualScroll，不经过这里）
+        masonryRenderedRange = null;
+        pinterestRenderedRange = null;
+        listRenderedRange = null;
         if (currentLayout === 'masonry') {
             renderMasonry(displayImages);
         } else if (currentLayout === 'pinterest') {
@@ -3297,12 +3614,13 @@ const Gallery = (() => {
         const cardHeight = thumbnailSize + 36;
         const gap = 8;
         const rowHeight = cardHeight + gap;
-        const rowsPerView = Math.ceil(containerHeight / rowHeight) + OVERSCAN;
-        const startRow = Math.max(0, Math.floor(scrollTop / rowHeight) - OVERSCAN);
+        const overRows = overscanRows(rowHeight);
+        const rowsPerView = Math.ceil(containerHeight / rowHeight) + overRows;
+        const startRow = Math.max(0, Math.floor(scrollTop / rowHeight) - overRows);
         const startIndex = startRow * columns;
-        // ★ 底部缓冲与顶部对称：顶部有 OVERSCAN 行保护，底部也需要足够的行数，
+        // ★ 底部缓冲与顶部对称：顶部有缓冲行保护，底部也需要足够的行数，
         //   否则往上滚动时被删除的卡片距离视窗底边太近，用户会看到最后一行消失。
-        const BOTTOM_PAD = Math.max(6, Math.floor(OVERSCAN / 4));
+        const BOTTOM_PAD = Math.max(2, Math.floor(overRows / 4));
         const endIndex = Math.min(totalItems, startIndex + rowsPerView * columns + columns * BOTTOM_PAD);
 
         // ★ 滞回：仅在索引变化微小（≤1 行）且实际滚动距离也很小（<1.5 行高）时跳过，
@@ -3326,6 +3644,7 @@ const Gallery = (() => {
         const prevStart = renderedRange.start;
         const prevEnd = renderedRange.end;
         renderedRange = { start: startIndex, end: endIndex };
+        _lastWindowCardCount = endIndex - startIndex;
 
         // ★ 检测 DOM 结构是否来自其他渲染器（瀑布流 / progressiveRender），
         //   这类 DOM 没有 vs-spacer，增量更新逻辑不兼容，必须全量重建
@@ -3482,7 +3801,8 @@ const Gallery = (() => {
     function renderMasonry(displayImages) {
         hideGalleryPlaceholder();
         galleryGrid.className = 'gallery-grid masonry';
-        _clearGrid();
+        // ★ 注意：_clearGrid（拆 DOM）被移到下方的滚动帧守卫之后——
+        //   守卫命中时必须原样保留 DOM，已加载的图片才不会闪黑块
 
         const rowH = thumbnailSize;
         const gap = 8;
@@ -3515,28 +3835,65 @@ const Gallery = (() => {
         // ★ 修复：containerHeight 可能在首次渲染时为 0，fallback 到 clientHeight
         const viewH = containerHeight || galleryScroll.clientHeight;
 
-        // 计算可见行范围
-        const firstVisibleRow = Math.max(0, Math.floor(scrollTop / rowStep) - OVERSCAN);
+        // 计算可见行范围（缓冲按像素预算换算行数，DOM 规模与缩略图尺寸无关）
+        const masonryOverRows = overscanRows(rowStep);
+        const firstVisibleRow = Math.max(0, Math.floor(scrollTop / rowStep) - masonryOverRows);
         const lastVisibleRow = Math.min(
             totalRows - 1,
-            Math.ceil((scrollTop + viewH) / rowStep) + OVERSCAN
+            Math.ceil((scrollTop + viewH) / rowStep) + masonryOverRows
         );
 
-        // 筛选可见图片
-        const visibleItems = masonryLayout.filter(
-            item => item.row >= firstVisibleRow && item.row <= lastVisibleRow
-        );
+        // 筛选可见图片（masonryLayout 按 row 单调递增，二分取切片，避免每帧 O(N) filter）
+        let lo = 0, hi = masonryLayout.length;
+        while (lo < hi) { const mid = (lo + hi) >> 1; if (masonryLayout[mid].row < firstVisibleRow) lo = mid + 1; else hi = mid; }
+        const sliceStart = lo;
+        hi = masonryLayout.length;
+        while (lo < hi) { const mid = (lo + hi) >> 1; if (masonryLayout[mid].row <= lastVisibleRow) lo = mid + 1; else hi = mid; }
+        const visibleItems = masonryLayout.slice(sliceStart, lo);
+        _lastWindowCardCount = visibleItems.length;
+
+        // ★ 滚动帧守卫 A：可见行范围、布局版本、数据首 id 均未变化 → DOM 原样保留。
+        if (masonryRenderedRange &&
+            masonryRenderedRange.first === firstVisibleRow &&
+            masonryRenderedRange.last === lastVisibleRow &&
+            masonryRenderedRange.version === masonryLayoutVersion &&
+            masonryRenderedRange.firstId === firstId &&
+            galleryGrid._absRendered === true) {
+            updateImageCount();
+            return;
+        }
+
+        // ★ 滚动帧守卫 B（增量）：布局与数据未变 → 只增删进出窗口的卡片，
+        //   不拆窗口内已加载的卡片（防止图片闪黑、避免每帧 300+ 卡片的 DOM 重建掉帧）
+        if (galleryGrid._absRendered === true &&
+            masonryRenderedRange &&
+            masonryRenderedRange.version === masonryLayoutVersion &&
+            masonryRenderedRange.firstId === firstId) {
+            const needed = new Map();
+            for (const item of visibleItems) needed.set(item.imgIndex, item);
+            _applyLayoutDiff(displayImages, needed);
+            masonryRenderedRange = { first: firstVisibleRow, last: lastVisibleRow, version: masonryLayoutVersion, firstId };
+            updateImageCount();
+            return;
+        }
+
+        // 全量重建：首次渲染 / 布局重算 / 数据变化
+        masonryRenderedRange = { first: firstVisibleRow, last: lastVisibleRow, version: masonryLayoutVersion, firstId };
+        _clearGrid();
 
         const fragment = document.createDocumentFragment();
 
         // 创建可见卡片（spacer 已由父容器 height 撑开，不再需要绝对定位占位块）
         for (const item of visibleItems) {
             if (item.imgIndex < displayImages.length) {
-                fragment.appendChild(createImageCard(displayImages[item.imgIndex], item));
+                const card = createImageCard(displayImages[item.imgIndex], item);
+                card.dataset.imgIndex = item.imgIndex;
+                fragment.appendChild(card);
             }
         }
 
         galleryGrid.appendChild(fragment);
+        galleryGrid._absRendered = true;
         updateImageCount();
 
         // 预温渲染范围外的缩略图
@@ -3609,12 +3966,26 @@ const Gallery = (() => {
 
         pinterestTotalHeight = Math.max(...colHeights) - gap;
         pinterestLayoutVersion++;
+
+        // 构建 y 排序索引（滚动帧二分查询用）
+        pinterestByY = pinterestLayout.slice().sort((a, b) => a.y - b.y);
+        pinterestPrefixMaxIdx = new Array(pinterestByY.length);
+        let maxIdx = -1;
+        let maxH = 0;
+        for (let i = 0; i < pinterestByY.length; i++) {
+            if (pinterestByY[i].imgIndex > maxIdx) maxIdx = pinterestByY[i].imgIndex;
+            pinterestPrefixMaxIdx[i] = maxIdx;
+            if (pinterestByY[i].h > maxH) maxH = pinterestByY[i].h;
+        }
+        pinterestMaxItemH = maxH;
     }
 
     function renderPinterest(displayImages) {
         hideGalleryPlaceholder();
         galleryGrid.className = 'gallery-grid pinterest';
-        _clearGrid();
+        // ★ 注意：_clearGrid（拆 DOM）已移到下方守卫之后——若每帧先清空 DOM，
+        //   _absRendered 恒为 false，频带守卫永远失效，退化为每帧全量重建
+        //   （这正是竖版瀑布流比 masonry/grid 卡的根因）。
 
         const gap = 8;
 
@@ -3644,22 +4015,71 @@ const Gallery = (() => {
             : 200;
         const avgFullRowH = avgItemH + gap; // 一个"列满行"的平均高度
 
-        const firstVisibleY = Math.max(0, scrollTop - avgFullRowH * OVERSCAN);
-        const lastVisibleY = scrollTop + viewH + avgFullRowH * OVERSCAN;
+        // ★ 滚动帧守卫（频带量化）：可见范围按 PINTEREST_BAND 对齐。
+        //   原 firstY/lastY 是浮点、每帧都变 → 守卫永不命中 → 每帧全量 diff
+        //   （遍历全部 DOM 子节点 + 重建 Map）→ 惯性滑行时掉帧。
+        //   窗口按 band 边界外扩 OVERSCAN，band 内任意滚动位置都被覆盖，
+        //   同一 band 内可安全跳过（与 masonry 的行量化守卫等价）。
+        const band = Math.floor(scrollTop / PINTEREST_BAND);
+        const pinterestOverRows = overscanRows(avgFullRowH);
+        const firstVisibleY = Math.max(0, band * PINTEREST_BAND - avgFullRowH * pinterestOverRows);
+        const lastVisibleY = (band + 1) * PINTEREST_BAND + viewH + avgFullRowH * pinterestOverRows;
 
-        // 筛选可见范围内的图片（用每张图实际 y 坐标判断）
-        const visibleItems = pinterestLayout.filter(
-            item => (item.y + item.h + gap) >= firstVisibleY && item.y <= lastVisibleY
-        );
+        // 筛选可见范围内的图片：★ 二分 y 排序索引取候选切片（原实现每帧
+        // 对全量布局做 O(N) filter，图库上万张时是 pinterest 特有掉帧源）
+        let lo = 0, hi = pinterestByY.length;
+        const yLower = firstVisibleY - pinterestMaxItemH - gap;
+        while (lo < hi) { const mid = (lo + hi) >> 1; if (pinterestByY[mid].y < yLower) lo = mid + 1; else hi = mid; }
+        const sliceStart = lo;
+        hi = pinterestByY.length;
+        while (lo < hi) { const mid = (lo + hi) >> 1; if (pinterestByY[mid].y <= lastVisibleY) lo = mid + 1; else hi = mid; }
+        const visibleItems = [];
+        for (let i = sliceStart; i < lo; i++) {
+            const item = pinterestByY[i];
+            if ((item.y + item.h + gap) >= firstVisibleY && item.y <= lastVisibleY) {
+                visibleItems.push(item);
+            }
+        }
+        _lastWindowCardCount = visibleItems.length;
+
+        // ★ 守卫 A：同一频带且布局/数据未变 → DOM 原样保留
+        if (pinterestRenderedRange &&
+            pinterestRenderedRange.band === band &&
+            pinterestRenderedRange.version === pinterestLayoutVersion &&
+            pinterestRenderedRange.firstId === firstId &&
+            galleryGrid._absRendered === true) {
+            updateImageCount();
+            return;
+        }
+
+        // ★ 守卫 B（增量）：换 band 时只增删进出窗口的卡片
+        if (galleryGrid._absRendered === true &&
+            pinterestRenderedRange &&
+            pinterestRenderedRange.version === pinterestLayoutVersion &&
+            pinterestRenderedRange.firstId === firstId) {
+            const needed = new Map();
+            for (const item of visibleItems) needed.set(item.imgIndex, { layout: 'pinterest', item: item });
+            _applyLayoutDiff(displayImages, needed);
+            pinterestRenderedRange = { band: band, version: pinterestLayoutVersion, firstId: firstId };
+            updateImageCount();
+            return;
+        }
+
+        // 全量重建
+        pinterestRenderedRange = { band: band, version: pinterestLayoutVersion, firstId: firstId };
+        _clearGrid();
 
         const fragment = document.createDocumentFragment();
         for (const item of visibleItems) {
             if (item.imgIndex < displayImages.length) {
-                fragment.appendChild(createImageCard(displayImages[item.imgIndex], { layout: 'pinterest', item: item }));
+                const card = createImageCard(displayImages[item.imgIndex], { layout: 'pinterest', item: item });
+                card.dataset.imgIndex = item.imgIndex;
+                fragment.appendChild(card);
             }
         }
 
         galleryGrid.appendChild(fragment);
+        galleryGrid._absRendered = true;
         updateImageCount();
 
         const maxVisibleIndex2 = visibleItems.length > 0
@@ -3712,10 +4132,43 @@ const Gallery = (() => {
         const rowStep = rowH + gap;
         const totalItems = displayImages.length;
 
-        const firstVisibleRow = Math.max(0, Math.floor(scrollTop / rowStep) - OVERSCAN);
-        const lastVisibleRow = Math.min(Math.ceil(totalItems / 2) - 1, Math.ceil((scrollTop + viewH) / rowStep) + OVERSCAN);
+        const listOverRows = overscanRows(rowStep);
+        const firstVisibleRow = Math.max(0, Math.floor(scrollTop / rowStep) - listOverRows);
+        const lastVisibleRow = Math.min(Math.ceil(totalItems / 2) - 1, Math.ceil((scrollTop + viewH) / rowStep) + listOverRows);
         const firstVisibleIdx = firstVisibleRow * 2;
         const lastVisibleIdx = Math.min(totalItems - 1, (lastVisibleRow + 1) * 2 - 1);
+        _lastWindowCardCount = lastVisibleIdx - firstVisibleIdx + 1;
+
+        // ★ 滚动帧守卫 A：可见范围与布局均未变化 → DOM 原样保留
+        if (listRenderedRange &&
+            listRenderedRange.firstIdx === firstVisibleIdx &&
+            listRenderedRange.lastIdx === lastVisibleIdx &&
+            listRenderedRange.version === listLayoutVersion &&
+            listRenderedRange.firstId === firstId &&
+            galleryGrid._absRendered === true) {
+            updateImageCount();
+            return;
+        }
+
+        // ★ 滚动帧守卫 B（增量）：只增删进出窗口的卡片
+        if (galleryGrid._absRendered === true &&
+            listRenderedRange &&
+            listRenderedRange.version === listLayoutVersion &&
+            listRenderedRange.firstId === firstId) {
+            const needed = new Map();
+            for (let i = firstVisibleIdx; i <= lastVisibleIdx; i++) {
+                const row = Math.floor(i / 2);
+                const col = i % 2;
+                needed.set(i, { layout: 'list', x: col * (colW + gap), y: row * rowStep, w: colW, h: rowH });
+            }
+            _applyLayoutDiff(displayImages, needed);
+            listRenderedRange = { firstIdx: firstVisibleIdx, lastIdx: lastVisibleIdx, version: listLayoutVersion, firstId };
+            updateImageCount();
+            return;
+        }
+
+        // 全量重建
+        listRenderedRange = { firstIdx: firstVisibleIdx, lastIdx: lastVisibleIdx, version: listLayoutVersion, firstId };
 
         const fragment = document.createDocumentFragment();
         for (let i = firstVisibleIdx; i <= lastVisibleIdx; i++) {
@@ -3724,10 +4177,13 @@ const Gallery = (() => {
             const x = col * (colW + gap);
             const y = row * rowStep;
             const layoutInfo = { layout: 'list', x: x, y: y, w: colW, h: rowH };
-            fragment.appendChild(createImageCard(displayImages[i], layoutInfo));
+            const card = createImageCard(displayImages[i], layoutInfo);
+            card.dataset.imgIndex = i;
+            fragment.appendChild(card);
         }
 
         galleryGrid.appendChild(fragment);
+        galleryGrid._absRendered = true;
         updateImageCount();
         _prewarmThumbnails(displayImages, 0, lastVisibleIdx + 1);
     }
@@ -3807,7 +4263,7 @@ const Gallery = (() => {
     }
 
     // ==================== 视窗优先的缩略图加载调度 ====================
-    // 背景：虚拟滚动的 DOM 窗口很大（视窗上下各 OVERSCAN=25 行），卡片一插入就赋 src 的话，
+    // 背景：虚拟滚动的 DOM 窗口很大（视窗上下各 50 行缓冲），卡片一插入就赋 src 的话，
     // 浏览器每个 origin 只有 6 个连接，队列会被视窗外的请求（尤其滚动路径上"路过"的图）排满，
     // 当前视窗里的图反而要排队等 —— 表现为"滚动时一路加载过来"。
     // 这里把"建卡片"和"发请求"解耦：
@@ -3835,12 +4291,20 @@ const Gallery = (() => {
     }
 
     // 立即加载的窗口：视窗上方 0.5 屏 + 下方 2.5 屏（回滚/下滚都能提前就位）；
-    // ★ 滚动中收紧到视窗本身（tight），不再预取——经过的位置不生成。
+    // ★ 滚动中收紧到"视窗 + 沿滚动方向前方 1.5 屏"：底/顶边新进入视窗的图
+    //   在滚动中就开始加载，不再等停止后补载——消除慢速滚动时持续从边缘
+    //   进入的黑框。方向前方 1.5 屏量很小，不会挤占连接池（视窗内仍是
+    //   high 优先级插队）。
+    let _scrollDir = 1; // 滚动方向：1 向下，-1 向上（scroll 监听器更新）
     function _thumbLoadWindow() {
         if (!galleryScroll) return null;
         const rect = galleryScroll.getBoundingClientRect();
         if (_thumbScrollBurst) {
-            return { top: rect.top, bottom: rect.bottom, tight: true };
+            const ahead = (rect.height || window.innerHeight) * 1.5;
+            if (_scrollDir >= 0) {
+                return { top: rect.top - rect.height * 0.5, bottom: rect.bottom + ahead, tight: true };
+            }
+            return { top: rect.top - ahead, bottom: rect.bottom + rect.height * 0.5, tight: true };
         }
         const vh = rect.height || window.innerHeight;
         return { top: rect.top - vh * 0.5, bottom: rect.bottom + vh * 2.5 };
@@ -3855,10 +4319,120 @@ const Gallery = (() => {
 
     // 按距离分派一张待加载的缩略图：
     //   视窗内（上 0.5 屏 / 下 1.5 屏）→ 立即发请求；
-    //   近处（4 屏内）→ 交给 IntersectionObserver（rootMargin 2 屏）预取；
+    //   近处（8 屏内）→ 交给 IntersectionObserver（rootMargin 8 屏）预取；
     //   更远 / 已被虚拟滚动移除 → 挂起（滚近时由滚动调度捡起），不占用连接也不被 observer 持有。
+    // ★ 缩略图加载并发上限（压测结论：进入未缓存区时，前后 50 行的预取洪流
+    //   会同时灌满浏览器 6 连接与后端生成队列——视窗内的图被淹没，表现为整页
+    //   黑框、停稳后还要等队列排空才出图，手动滚动触发中止/重排才救活）。
+    //   同一时刻真正在途的请求封顶 THUMB_MAX_INFLIGHT，其余保持 data-src 挂起；
+    //   每释放一个名额立即按当前窗口重新调度（视窗内永远最优先）。
+    const THUMB_MAX_INFLIGHT = 64;
+    // ★ 预算 = max(64, 一屏可见数 + 16)：管道保持满载。
+    //   ★ 教训：不要按"冷区"收缩预算——冷区生成是后端吞吐瓶颈（4-12 并发），
+    //     前端收缩管道只会把所有请求串行化，反而更慢（实测）。视窗优先靠
+    //     "两遍派发 + 身后优先抢占"保证，不靠缩管道。
+    function thumbMaxInflight() {
+        if (!galleryScroll) return THUMB_MAX_INFLIGHT;
+        const cols = getColumnCount();
+        const rows = Math.ceil(galleryScroll.clientHeight / (thumbnailSize + 44)) + 2;
+        return Math.max(THUMB_MAX_INFLIGHT, cols * rows + 16);
+    }
+    const _inflightThumbs = new Set();
+    let _thumbPumpTimer = null;
+    function _thumbInflightRelease(img) {
+        if (_inflightThumbs.delete(img)) _scheduleThumbPump();
+    }
+    // ★ 预算抢占：视窗要加载但名额满时，中止低价值的在途请求腾位。
+    //   ★ 关键教训：不能简单踢"离视窗最远"——快滚时那往往是前方即将到达的图，
+    //     冷区生成需要数秒，反复抢占会让任何一张都活不到完成（后端
+    //     clientGone 放弃生成）→ 全屏黑框。正确的牺牲顺序：
+    //     1) 滚动方向"身后"的（用户已看过/不会再看，浪费最小）；
+    //     2) 同类中最年轻的（刚发出、后端多半还没开始生成，损失小）；
+    //     3) 身后的都没有时，才牺牲 2 屏外的前方预取。
+    function _thumbEvictStale() {
+        if (!galleryScroll) return _inflightThumbs.size < thumbMaxInflight();
+        const rect = galleryScroll.getBoundingClientRect();
+        const vh = rect.height || window.innerHeight;
+        let victim = null, best = Infinity;
+        for (const img of _inflightThumbs) {
+            if (!img.isConnected) { _inflightThumbs.delete(img); continue; } // 已脱离 DOM:直接回收
+            const r = img.getBoundingClientRect();
+            // 视窗 ±0.5 屏内不动（正在看的和刚看过一眼的）
+            if (r.bottom >= rect.top - vh * 0.5 && r.top <= rect.bottom + vh * 0.5) continue;
+            const behind = _scrollDir >= 0 ? r.bottom < rect.top : r.top > rect.bottom;
+            const age = performance.now() - (img._thumbSentAt || 0);
+            const cost = (behind ? 0 : 1e9) + age;
+            if (cost < best) { best = cost; victim = img; }
+        }
+        if (!victim) return _inflightThumbs.size < thumbMaxInflight();
+        // 身后没有可牺牲的时，只允许牺牲 2 屏外的前方预取（近处前方是马上要看的）
+        if (best >= 1e9) {
+            const r = victim.getBoundingClientRect();
+            const dist = Math.max(rect.top - r.bottom, r.top - rect.bottom, 0);
+            if (dist < vh * 2) return _inflightThumbs.size < thumbMaxInflight();
+        }
+        // ★ 强制保证名额真正归还：_deferThumbLoad 对"已完成但 load 事件未处理"
+        //   的图会提前 return（不释放）——若不兜底，名额只增不减（实测
+        //   inflight=87/48），上限形同虚设，连接池再次被洪流灌死 → 全屏黑框
+        const before = _inflightThumbs.size;
+        _deferThumbLoad(victim);
+        if (_inflightThumbs.size >= before) _inflightThumbs.delete(victim);
+        return true;
+    }
+    function _scheduleThumbPump() {
+        if (_thumbPumpTimer || _inflightThumbs.size >= thumbMaxInflight()) return;
+        _thumbPumpTimer = setTimeout(() => {
+            _thumbPumpTimer = null;
+            if (_inflightThumbs.size < thumbMaxInflight()) _resumeImageObserver();
+        }, 0);
+    }
+
+    // ★ 调度状态监视 + 看门狗：每 3 秒记录在途/挂起/失败数量（进 trace + console）。
+    //   看门狗：视窗内有挂起图片、名额有空位、但 4 秒内没有任何一次派发成功
+    //   （调度链某环节死亡：泵定时器丢失/观察器不再回调/事件未触发）→
+    //   强制跑一遍 _resumeImageObserver 并在 trace 里记录。完全空闲时静默。
+    let _lastThumbDispatchAt = performance.now();
+    setInterval(() => {
+        if (!galleryGrid) return;
+        // ★ 账本自检：名额超限说明有泄漏（卡片被重建/释放事件丢失），强制回收，
+        //   绝不让上限失效——上限失效 = 洪流回归 = 全屏黑框。
+        //   两步回收：先删确定已死的（已完成/已断开），仍超限则按入账顺序
+        //   硬裁到预算内（Set 保持插入序，最老的先出账）。删账只影响计数，
+        //   请求本身照常完成，load 事件里的释放是幂等的。
+        if (_inflightThumbs.size > thumbMaxInflight()) {
+            for (const img of [..._inflightThumbs]) {
+                if (img.complete || !img.isConnected) _inflightThumbs.delete(img);
+            }
+            while (_inflightThumbs.size > thumbMaxInflight()) {
+                const oldest = _inflightThumbs.values().next().value;
+                _inflightThumbs.delete(oldest);
+            }
+            trace('[thumbq] 账本超限已强制回收, inflight=' + _inflightThumbs.size);
+        }
+        const pending = galleryGrid.querySelectorAll('img[data-src]').length;
+        const errs = galleryGrid.querySelectorAll('.img-error').length;
+        const budget = thumbMaxInflight();
+        if (pending === 0 && errs === 0 && _inflightThumbs.size === 0) {
+            _lastThumbDispatchAt = performance.now();
+            return;
+        }
+        // ★ 看门狗：有空位、有挂起、4s 无派发 → 强制补一次调度
+        const idleFor = performance.now() - _lastThumbDispatchAt;
+        if (_inflightThumbs.size < budget && pending > 0 && idleFor > 4000) {
+            trace('[thumbq] 看门狗触发: inflight=' + _inflightThumbs.size + '/' + budget +
+                ' pending=' + pending + ' 距上次派发=' + idleFor.toFixed(0) + 'ms → 强制重调度');
+            _lastThumbDispatchAt = performance.now();
+            _resumeImageObserver();
+            return;
+        }
+        trace('[thumbq] inflight=' + _inflightThumbs.size + '/' + budget +
+            ' pending=' + pending + ' err=' + errs +
+            ' burst=' + _thumbScrollBurst + ' dir=' + _scrollDir);
+    }, 3000);
+
     function _dispatchThumb(img, win) {
-        if (!img || !img.dataset.src || img.src) return;
+        // ★ 用属性级判断而非 img.src：src='' 的 IDL 属性会解析成页面地址（truthy）
+        if (!img || !img.dataset.src || img.getAttribute('src')) return;
         if (!img.isConnected) {
             if (intersectionObserver) intersectionObserver.unobserve(img);
             return;
@@ -3870,15 +4444,16 @@ const Gallery = (() => {
             _startThumbLoad(img);
             return;
         }
-        // ★ 滚动中：视窗外的图一律不预取。unobserve 是必要的——停止滚动后
+        // ★ 预取窗口 = 视窗前后各 50 行（用户定版）：窗口内的图交给 Observer
+        //   预取（low 优先级），更远的挂起。unobserve 是必要的——滚近后
         //   _resumeImageObserver 会重新 observe，而 IntersectionObserver 对
         //   "新观察且已相交"的元素会立即回调一次，所以不会被漏掉。
         if (win.tight) {
             if (intersectionObserver) intersectionObserver.unobserve(img);
             return;
         }
-        const vh = galleryScroll ? galleryScroll.clientHeight : window.innerHeight;
-        const near = r.top <= win.bottom + vh * 2.5 && r.bottom >= win.top - vh * 2.5;
+        const prefetch = prefetchPx();
+        const near = r.top <= win.bottom + prefetch && r.bottom >= win.top - prefetch;
         if (near) {
             _observeThumb(img);
         } else if (intersectionObserver) {
@@ -3888,12 +4463,24 @@ const Gallery = (() => {
 
     // 立即发起加载（视窗内/预取区内）
     function _startThumbLoad(img) {
-        if (!img || !img.dataset.src || img.src) return;
+        if (!img || !img.dataset.src || img.getAttribute('src')) return;
+        // ★ 并发预算：满载时循环抢占（每次必须真正腾出一个名额）；
+        //   抢不到（名额都被视窗附近占用）才保持挂起，腾位后由 _scheduleThumbPump
+        //   重新调度——挂起的图仍带 data-src，不会被漏掉
+        let guard = 0;
+        while (_inflightThumbs.size >= thumbMaxInflight() && guard++ < 96) {
+            if (!_thumbEvictStale()) return;
+        }
         img._deferred = false;
+        _lastThumbDispatchAt = performance.now();
         if (intersectionObserver) intersectionObserver.unobserve(img);
         // ★ 视窗内请求插队：fetchpriority=high 让浏览器把这条请求排到连接池最前，
         //   预取图（low）不会挤占当前视窗的加载
         img.setAttribute('fetchpriority', 'high');
+        _inflightThumbs.add(img);
+        img._thumbSentAt = performance.now(); // 抢占时判断"浪费了多少工作"用
+        img.addEventListener('load', () => _thumbInflightRelease(img), { once: true });
+        img.addEventListener('error', () => _thumbInflightRelease(img), { once: true });
         img.src = img.dataset.src;
         img.removeAttribute('data-src');
         armThumbTimeout(img);
@@ -3901,7 +4488,7 @@ const Gallery = (() => {
 
     // 交给 IntersectionObserver 预取（rootMargin = 1 屏）
     function _observeThumb(img) {
-        if (!img || !img.dataset.src || img.src) return;
+        if (!img || !img.dataset.src || img.getAttribute('src')) return;
         // ★ 预取请求降权：不与视窗内图片抢连接
         img.setAttribute('fetchpriority', 'low');
         if (intersectionObserver) intersectionObserver.observe(img);
@@ -3910,11 +4497,18 @@ const Gallery = (() => {
 
     // 中止在途请求并退回"待调度"状态（滚出视窗时调用，把连接槽让给视窗内的图）
     function _deferThumbLoad(img) {
-        if (!img || !img.src || (img.complete && img.naturalWidth > 0)) return;
+        if (!img) return;
+        const attrSrc = img.getAttribute('src');
+        if (!attrSrc || (img.complete && img.naturalWidth > 0)) return;
+        _thumbInflightRelease(img); // 人为中止：立即归还并发名额
         img._deferred = true; // 让 error 处理器忽略这次"人为中止"，不计入重试
-        if (!img.dataset.src) img.dataset.src = img.src;
+        if (!img.dataset.src) img.dataset.src = attrSrc;
         clearTimeout(img._thumbTimeout);
-        img.src = '';
+        // ★ 必须用 removeAttribute('src')，不能 img.src = ''：空串 src 的
+        //   IDL 属性会解析成"当前页面地址"（truthy）——所有 `if (img.src)`
+        //   的"已加载"判断从此对这张图永远为真，调度器再也不派发它
+        //   （实测：看门狗强制重调度后依然一张都发不出去 → 整屏黑框）。
+        img.removeAttribute('src');
         img.classList.add('loading');
         if (intersectionObserver) intersectionObserver.observe(img);
     }
@@ -3952,7 +4546,7 @@ const Gallery = (() => {
             if (!baseUrl) return;
             errDiv.remove();
             img.style.display = img.dataset.prevDisplay || '';
-            img.src = '';
+            img.removeAttribute('src');
             img.src = baseUrl + (baseUrl.includes('?') ? '&' : '?') + '_r=' + Math.random().toString(36).slice(2);
             armThumbTimeout(img);
             healed++;
@@ -3970,10 +4564,13 @@ const Gallery = (() => {
 
     // 池子上限按缩略图尺寸自适应：单张卡片持有的已解码位图约 size²×4 字节，
     // 大缩略图下必须收紧张数，否则几百张就能吃掉几百 MB 内存（目标约 60MB 以内）。
+    let _lastWindowCardCount = 0;    // 最近一次渲染的可见窗口卡片数（渲染器更新），
+                                     // ★ 缩略图调小时 列数×行数 会爆炸（如 120px 行高 × 14 列
+                                     //   × 50 行 ≈ 700 张），复用池必须罩住窗口，
+                                     //   否则每帧滚动都在淘汰已加载的卡片 → 图片闪黑框
     function _cardPoolMax() {
-        if (thumbnailSize >= 360) return 150;
-        if (thumbnailSize >= 280) return 200;
-        return 320;
+        const base = thumbnailSize >= 360 ? 180 : thumbnailSize >= 280 ? 240 : 400;
+        return Math.max(base, _lastWindowCardCount + 80);
     }
 
     // 卡片的内联样式由布局几何决定，几何变了就不能复用（必须重建）。
@@ -4040,7 +4637,11 @@ const Gallery = (() => {
         if (!card || !card._poolKey) return;
         const img = card._thumbImg;
         if (img) {
-            clearTimeout(img._thumbTimeout);
+            // ★ 释放并发名额（退休卡片的请求不再受调度管辖），但保留超时兜底：
+            //   清掉 _thumbTimeout 会让在途请求永远不完成也不报错 → 名额被占死
+            //   （实测 inflight=51/16 挂 60 秒不动）。让 25s 超时自然触发，
+            //   触发时 release 是幂等的，重复释放无副作用。
+            _thumbInflightRelease(img);
             if (intersectionObserver) intersectionObserver.unobserve(img);
         }
         // 卡片要离开视野了：收起可能开着的标签菜单，避免留下一个没有锚点的浮层
@@ -4061,8 +4662,43 @@ const Gallery = (() => {
 
     // 清空画廊：先把已建好的卡片收进复用池，再清 DOM
     function _clearGrid(html) {
+        if (!galleryGrid) return;
         _harvestGridCards();
-        if (galleryGrid) galleryGrid.innerHTML = html || '';
+        // DOM 被任何渲染器重建后，masonry 的"范围未变即跳过"守卫必须失效一次，
+        // 否则从 grid/list 切回 masonry 时会误判"DOM 还在"而跳过渲染
+        galleryGrid._absRendered = false;
+        galleryGrid.innerHTML = html || '';
+    }
+
+    // ★ 绝对定位布局（masonry/pinterest/list）的增量差异更新。
+    //   卡片位置由布局数据决定、无 DOM 顺序依赖，滚动帧只需要：
+    //   把滑出窗口的卡片 retire 回池，把新滑入的卡片从池里取/新建并 append。
+    //   工作量 O(进出窗口的卡片数)，代替原先 O(整个窗口) 的全量拆建——
+    //   后者正是惯性滚动 landing 在未缓存区域后掉帧的主因（每帧拆建 300+ 卡片，
+    //   复用池跟不上就把已加载的图拆成空 <img>，表现为"滑动变慢、图片变黑"）。
+    //   needed: Map(imgIndex -> createImageCard 的第二个参数 geometry)
+    function _applyLayoutDiff(displayImages, needed) {
+        const children = Array.from(galleryGrid.children);
+        for (const card of children) {
+            const idx = parseInt(card.dataset.imgIndex);
+            if (needed.has(idx)) {
+                needed.delete(idx); // 保留：已在 DOM 里
+            } else {
+                _retireCard(card);
+                card.remove();
+            }
+        }
+        if (needed.size > 0) {
+            const frag = document.createDocumentFragment();
+            for (const [idx, geo] of needed) {
+                if (idx >= displayImages.length) continue;
+                const card = createImageCard(displayImages[idx], geo);
+                card.dataset.imgIndex = idx;
+                frag.appendChild(card);
+            }
+            galleryGrid.appendChild(frag);
+        }
+        galleryGrid._absRendered = true;
     }
 
     // 复用卡片时刷新"回收期间可能变了"的状态
@@ -4082,9 +4718,11 @@ const Gallery = (() => {
                 const errDiv = card._thumbWrapper.querySelector('.img-error');
                 if (errDiv) errDiv.remove();
             }
-            const broken = img.complete && img.naturalWidth === 0 && !!img.src;
-            if (broken || (!img.src && !img.dataset.src)) {
+            const attrSrc = img.getAttribute('src'); // 属性级：img.src 会被 src='' 污染成页面地址
+            const broken = img.complete && img.naturalWidth === 0 && !!attrSrc;
+            if (broken || (!attrSrc && !img.dataset.src)) {
                 // 位图已失效（blob 被 revoke / 缓存被清）→ 重新走一遍调度
+                _thumbInflightRelease(img);
                 img.removeAttribute('src');
                 img.dataset.retryCount = '0';
                 img.classList.add('loading');
@@ -4092,8 +4730,8 @@ const Gallery = (() => {
             } else if (img.src && img.complete && img.naturalWidth > 0) {
                 img.classList.remove('loading');
                 img.style.opacity = '1';
-            } else if (img.src) {
-                // 仍在传输中：补回被 _retireCard 清掉的超时兜底
+            } else if (attrSrc) {
+                // 仍在传输中：补回超时兜底
                 armThumbTimeout(img);
             }
         }
@@ -4113,12 +4751,22 @@ const Gallery = (() => {
     //   与库中记录缺失或偏差 >5% 时更新数据对象并去抖重排（只影响本次会话，
     //   后台 backfillImageDimensions 用头部快解析写库后新会话直接命中真实尺寸）。
     let _aspectFixTimer = null;
+    let _lastAspectRenderAt = -Infinity;
+    const ASPECT_RELAYOUT_MIN_INTERVAL = 1200; // 两次重排的最小间隔
     function scheduleAspectRelayout() {
-        if (_aspectFixTimer) return;
+        if (_aspectFixTimer) return; // 已排程：本次校正随下一次 render 一并生效
+        // ★ 最小间隔 1.2s：并发预算化后缩略图细水长流地到货，每张到货都可能
+        //   触发校正——不加间隔就是每 400ms 一次全量重排（"页面不停地刷新"）。
+        //   多张图的校正在间隔内自动攒批，一次 render 全部生效。
+        const wait = Math.max(400, ASPECT_RELAYOUT_MIN_INTERVAL - (performance.now() - _lastAspectRenderAt));
         _aspectFixTimer = setTimeout(() => {
             _aspectFixTimer = null;
+            _lastAspectRenderAt = performance.now();
+            // 滚动中就执行重排：滚动锚定已由 .gallery-scroll 的
+            // overflow-anchor:none 禁用，重排不会再推偏滚动条；
+            // 若推迟到停稳，滚动途中窗口会残留空白（实测）。
             try { render(); } catch (e) { /* 静默 */ }
-        }, 400);
+        }, wait);
     }
     function noteRealAspect(imgData, img) {
         if (!imgData || !img || !img.naturalWidth || !img.naturalHeight) return;
@@ -4166,7 +4814,10 @@ const Gallery = (() => {
         wrapper.className = 'card-img-wrapper';
 
         const img = document.createElement('img');
-        img.loading = 'lazy';
+        // ★ 不能用原生 loading='lazy'：缩略图调度器已自管加载窗口（视窗+预取行）。
+        //   原生 lazy 只加载 Chrome 视窗阈值内的图，预取区设了 src 也不取 → 无 load 事件
+        //   → inflight 名额永久占用 → 预算假满、调度停摆（表现为导入初期黑框、
+        //   请求根本不到后端、硬盘无活动，随滚动才涓流恢复）。取回调度权。
         card._thumbWrapper = wrapper;
         card._thumbImg = img;
 
@@ -4203,7 +4854,7 @@ const Gallery = (() => {
                     const baseUrl = imgData.thumbnailUrl || this.dataset.src || this.src;
                     if (baseUrl) {
                     setTimeout(() => {
-                        this.src = '';
+                        this.removeAttribute('src');
                         this.setAttribute('fetchpriority', 'high');
                         this.src = baseUrl.replace(/[&?]_r=[^&]*/g, '') + (baseUrl.includes('?') ? '&' : '?') + '_r=' + Math.random().toString(36).slice(2);
                         armThumbTimeout(this);
@@ -6007,124 +6658,52 @@ const Gallery = (() => {
         if (currentLayout === 'masonry') {
             // ★ 追加前重算整体布局，更新容器高度，确保滚动条范围正确
             const allDisplayImages = isFilteringActive ? filteredImages : images;
-            // 记录追加前的布局坐标，用于检测重算是否移动了旧卡片
-            const oldLayout = masonryLayout;
-            const oldCount = oldLayout.length;
             computeMasonryLayout(allDisplayImages);
             galleryGrid.style.height = masonryTotalHeight + 'px';
             galleryGrid.style.minHeight = '';
 
-            // ★ 修复：若重算导致旧卡片位置变化（新增图片改变了行划分），
-            //   旧卡片 DOM 仍是旧坐标，直接追加会错位 → 全量重渲染。
-            //   仅当旧卡片坐标全部未变时才增量追加，保证滚动时布局稳定不跳动。
-            let layoutStable = oldCount === 0 || (oldCount <= masonryLayout.length);
-            if (layoutStable && oldCount > 0) {
-                for (let i = 0; i < oldCount; i++) {
-                    const a = oldLayout[i], b = masonryLayout[i];
-                    if (!b || a.x !== b.x || a.y !== b.y || a.row !== b.row) {
-                        layoutStable = false;
-                        break;
-                    }
-                }
+            // ★ 同步滚动帧守卫标记：computeMasonryLayout 递增了 masonryLayoutVersion，
+            //   不同步的话下一个滚动帧守卫失效 → 每个分页批次后都全量重建整个窗口
+            //   （数量超过 FOLDER_LOOKAHEAD 触发分页加载时表现为周期性掉帧）。
+            //   新增图片只追加在末尾、不会移动旧卡片坐标，增量 diff 是安全的。
+            if (masonryRenderedRange) {
+                masonryRenderedRange.version = masonryLayoutVersion;
+                masonryRenderedRange.firstId = masonryFirstId;
             }
-            if (!layoutStable) {
-                renderMasonry(allDisplayImages);
-                updateImageCount();
-                return;
-            }
-
-            // 只为新增图片创建卡片（布局坐标已在 masonryLayout 末尾）
-            const startIdx = allDisplayImages.length - newImages.length;
-            const BATCH = getOptimalBatchSize() * 3; // 30~60 张/帧
-            const newLayoutItems = masonryLayout.slice(startIdx);
-
-            if (newLayoutItems.length <= BATCH) {
-                const fragment = document.createDocumentFragment();
-                for (const item of newLayoutItems) {
-                    if (item.imgIndex < allDisplayImages.length) {
-                        fragment.appendChild(createImageCard(allDisplayImages[item.imgIndex], item));
-                    }
-                }
-                galleryGrid.appendChild(fragment);
-            } else {
-                let i = 0;
-                function insertBatch() {
-                    const fragment = document.createDocumentFragment();
-                    const end = Math.min(i + BATCH, newLayoutItems.length);
-                    for (; i < end; i++) {
-                        const item = newLayoutItems[i];
-                        if (item.imgIndex < allDisplayImages.length) {
-                            fragment.appendChild(createImageCard(allDisplayImages[item.imgIndex], item));
-                        }
-                    }
-                    galleryGrid.appendChild(fragment);
-                    if (i < newLayoutItems.length) {
-                        requestAnimationFrame(insertBatch);
-                    }
-                }
-                requestAnimationFrame(insertBatch);
-            }
+            // 新进入渲染窗口的卡片交给增量 diff 补齐（不在窗口内的由后续滚动帧处理）
+            updateVirtualScroll();
         } else if (currentLayout === 'pinterest') {
             // Pinterest：重算整体布局，更新容器高度
             const allDisplayImages = isFilteringActive ? filteredImages : images;
-            const oldPinterestLayout = pinterestLayout;
-            const oldPCount = oldPinterestLayout.length;
             computePinterestLayout(allDisplayImages);
             galleryGrid.style.height = pinterestTotalHeight + 'px';
             galleryGrid.style.minHeight = '';
 
-            // ★ 修复：与 masonry 一致——若重算改变了旧卡片坐标则全量重渲染，
-            //   否则增量追加。避免增量加载后旧卡片错位导致的滚动跳动。
-            let pLayoutStable = oldPCount === 0 || oldPCount <= pinterestLayout.length;
-            if (pLayoutStable && oldPCount > 0) {
-                for (let i = 0; i < oldPCount; i++) {
-                    const a = oldPinterestLayout[i], b = pinterestLayout[i];
-                    if (!b || a.x !== b.x || a.y !== b.y) {
-                        pLayoutStable = false;
-                        break;
-                    }
-                }
+            // ★ 同上：同步守卫标记，避免分页批次后下一帧全量重建
+            if (pinterestRenderedRange) {
+                pinterestRenderedRange.version = pinterestLayoutVersion;
+                pinterestRenderedRange.firstId = pinterestFirstId;
             }
-            if (!pLayoutStable) {
-                renderPinterest(allDisplayImages);
-                updateImageCount();
-                return;
-            }
-
-            const startIdx = allDisplayImages.length - newImages.length;
-            const newLayoutItems = pinterestLayout.slice(startIdx);
-
-            const fragment = document.createDocumentFragment();
-            for (const item of newLayoutItems) {
-                if (item.imgIndex < allDisplayImages.length) {
-                    fragment.appendChild(createImageCard(allDisplayImages[item.imgIndex], { layout: 'pinterest', item: item }));
-                }
-            }
-            galleryGrid.appendChild(fragment);
+            updateVirtualScroll();
         } else if (currentLayout === 'list') {
-            // 列表模式：两列，重算容器高度
+            // 列表模式：两列，重算容器高度 + 同步守卫标记（同 masonry/pinterest）
             const allDisplayImages = isFilteringActive ? filteredImages : images;
             const gap = 8;
             const padding = 24;
             const containerW = Math.max(300, (galleryScroll ? galleryScroll.clientWidth : 800) - padding);
-            const colW = Math.floor((containerW - gap) / 2);
             const rowStep = thumbnailSize + gap;
             const totalRows = Math.ceil(allDisplayImages.length / 2);
             listTotalHeight = totalRows * rowStep;
+            listLayoutVersion++;
             galleryGrid.style.height = listTotalHeight + 'px';
             galleryGrid.style.minHeight = '';
 
-            const fragment = document.createDocumentFragment();
-            const startIdx = allDisplayImages.length - newImages.length;
-            for (let k = startIdx; k < allDisplayImages.length; k++) {
-                const row = Math.floor(k / 2);
-                const col = k % 2;
-                const x = col * (colW + gap);
-                const y = row * rowStep;
-                const layoutInfo = { layout: 'list', x: x, y: y, w: colW, h: thumbnailSize };
-                fragment.appendChild(createImageCard(allDisplayImages[k], layoutInfo));
+            if (listRenderedRange) {
+                listRenderedRange.version = listLayoutVersion;
+                listRenderedRange.firstId = listFirstId;
             }
-            galleryGrid.appendChild(fragment);
+            // 增量 diff 补齐新进入渲染窗口的卡片
+            updateVirtualScroll();
         } else {
             // 网格模式：失效渲染范围后调用 renderGrid 全量重建虚拟滚动 DOM
             // 直接追加卡片会破坏虚拟滚动的 spacer 结构，导致滚动条失效

@@ -1781,11 +1781,13 @@ button {
     gap: 8px;
 }
 /* ★ 收缩策略：右栏（提示词/锁/排序）永不缩让、绝不被遮挡；
-   左栏允许收缩并优雅截断（溢出隐藏），配合下方媒体查询逐级收纳 */
+   左栏允许收缩，配合下方媒体查询逐级收纳。
+   ★ 不能在 .toolbar-left 上用 overflow:hidden：会把布局下拉菜单
+     （.layout-dropdown-menu，绝对定位在其内部）一并裁掉，导致
+     切换瀑布流/列表时菜单"点了没反应"。截断职责移交给 .thumbnail-slider */
 .toolbar-left {
     flex: 1 1 auto;
     min-width: 0;
-    overflow: hidden;
 }
 .toolbar-right {
     flex-shrink: 0;
@@ -1870,6 +1872,8 @@ button {
     display: flex;
     align-items: center;
     gap: 6px;
+    min-width: 0;
+    overflow: hidden;
 }
 .thumbnail-slider label {
     font-size: 11px;
@@ -1981,6 +1985,10 @@ button {
     padding: 12px;
     position: relative;
     cursor: grab;
+    /* ★ 禁用浏览器滚动锚定：虚拟滚动用上下 spacer 精确撑高度来维持位置，
+       分页追加/宽高比重排会销毁重建窗口 DOM，锚点元素被移除时 Chrome 的
+       锚定补偿会把 scrollTop 推偏一段（表现为"滚动条突然跳动一下"） */
+    overflow-anchor: none;
 }
 .gallery-scroll:active {
     cursor: grabbing;
@@ -5333,6 +5341,37 @@ body.mobile .image-viewer-container.fullscreen .image-viewer-shortcuts {
 .inertia-params input:focus {
     border-color: var(--accent);
     outline: none;
+}
+
+/* ★ 惯性参数：滑条两端可达（负外边距抵消滑块半宽），数字框手动输入 0-100 */
+.inertia-params input[type="range"].ip-power-slider {
+    margin: 0 -8px;
+    width: calc(100% + 16px);
+    flex: 1;
+    /* ★ 关键：去掉 .inertia-params input 的水平内边距（10px），
+       否则滑块被内边距挡住，拉到最右也到不了轨道尽头 */
+    padding: 6px 0;
+}
+.inertia-params input[type="number"].ip-power-num {
+    width: 58px;
+    min-width: 58px;
+    padding: 4px 6px;
+    text-align: center;
+    -moz-appearance: textfield;
+    appearance: textfield;
+}
+.inertia-params input[type="number"].ip-power-num::-webkit-outer-spin-button,
+.inertia-params input[type="number"].ip-power-num::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+
+/* ★ 惯性按钮右侧的参数设置小按钮：贴紧惯性按钮、去左边圆角形成一体 */
+.inertia-settings-btn {
+    margin-left: -4px;
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+    padding: 6px 8px;
 }
 
 /* ============================================================

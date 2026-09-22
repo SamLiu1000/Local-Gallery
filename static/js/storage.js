@@ -97,7 +97,7 @@ const Storage = (() => {
     // 页面关闭前保存
     window.addEventListener('beforeunload', () => {
         // ★ 首次同步完成前禁止保存（与 saveToServer 一致，防止空缓存覆盖服务端数据）
-        if (hasUnsavedChanges && serverAvailable && hasSynced) {
+        if (hasUnsavedChanges && serverAvailable && hasSynced && !suspended) {
             const data = JSON.stringify({
                 data: {
                     tags: serverDataCache.tags,
@@ -115,7 +115,12 @@ const Storage = (() => {
         }
     });
 
+    // ★ 数据目录热切换期间挂起一切写回：此时后端可能已指向新目录，
+    //   而前端内存缓存还是旧目录的数据/设置，任何写回都会把旧数据污染进新目录
+    let suspended = false;
+
     function markDirty() {
+        if (suspended) return;
         hasUnsavedChanges = true;
         scheduleDebouncedSave();
     }
@@ -211,7 +216,7 @@ const Storage = (() => {
     let hasSynced = false;
 
     async function syncFromServer() {
-        if (!serverAvailable) return;
+        if (!serverAvailable || suspended) return;
         try {
             let result;
             // ★ Wails 环境：直接调用 Go 函数
@@ -250,8 +255,32 @@ const Storage = (() => {
         }
     }
 
+    /**
+     * ★ 数据目录热切换前调用：挂起一切写回并作废内存缓存。
+     *   此时后端即将（或已经）指向新目录，而前端缓存仍是旧目录的内容——
+     *   任何 markDirty/防抖保存/beforeunload 兜底保存都会把旧目录的
+     *   标签/收藏/设置写进新目录造成污染；读取也会拿到过期的设置值。
+     *   挂起后由调用方决定：切换成功 → 整页重载（所有状态重新初始化）；
+     *   切换失败 → resumeAfterDataDirSwitch 恢复 + 重新 syncFromServer。
+     */
+    function suspendForDataDirSwitch() {
+        suspended = true;
+        if (autoSaveTimer) {
+            clearTimeout(autoSaveTimer);
+            autoSaveTimer = null;
+        }
+        hasUnsavedChanges = false;
+        hasSynced = false;
+        serverDataCache = { tags: [], apiConfigs: [], settings: {}, favorites: [], imageTags: [] };
+    }
+
+    /** 热切换失败回滚后恢复读写（成功路径走整页重载，不需要恢复） */
+    function resumeAfterDataDirSwitch() {
+        suspended = false;
+    }
+
     async function saveToServer() {
-        if (!serverAvailable) return;
+        if (!serverAvailable || suspended) return;
         try {
             const dataToSave = {
                 tags: serverDataCache.tags,
@@ -1003,6 +1032,7 @@ const Storage = (() => {
         getAllApiConfigs, addApiConfig, updateApiConfig, deleteApiConfig, getDefaultApiConfig,
         getPromptVersions, addPromptVersion, deletePromptVersion, updatePromptVersion, getAllPromptVersionCounts,
         getSetting, setSetting,
-        exportAllData, importAllData
+        exportAllData, importAllData,
+        suspendForDataDirSwitch, resumeAfterDataDirSwitch
     };
 })();

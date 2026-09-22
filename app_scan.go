@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -756,7 +757,13 @@ func (a *App) scanRootAsync(rootPath string) int {
 	}
 	a.scanningRoots[rootPath] = true
 	a.scanMu.Unlock()
-	defer func() { a.scanMu.Lock(); delete(a.scanningRoots, rootPath); a.scanMu.Unlock() }()
+	atomic.AddInt32(&activeScanOps, 1)
+	defer func() {
+		atomic.AddInt32(&activeScanOps, -1)
+		a.scanMu.Lock()
+		delete(a.scanningRoots, rootPath)
+		a.scanMu.Unlock()
+	}()
 	// ★ 持久化"扫描中"标记：扫描中途退出时残留，下次启动 ensureImageIndex 补扫
 	a.setScanInProgress(rootPath, true)
 	fmt.Printf("[后台扫描] 开始扫描: %s\n", rootPath)
@@ -842,21 +849,19 @@ func (a *App) scanRootAsync(rootPath string) int {
 	a.invalidatePreviewCache()
 	a.invalidateParamTags()
 
-	// ★ 扫描完成：自动低优预生成缺失缩略图（后台 goroutine，不阻塞 scan:complete）。
+	// ★ 优先级：扫描已完成 → 先补齐缩略图（用户看图优先），索引排最后。
+	//   索引会用最多 8 个 CPU 逐张读原图解析元数据 + 大 FTS 写入，
+	//   与预生成/浏览并行时抢 CPU 和数据库锁（表现为导入后出图慢）。
 	if totalCount > 0 && len(localImages) > 0 {
 		entries := make([]*ImageEntry, 0, len(localImages))
 		for _, e := range localImages {
 			entries = append(entries, e)
 		}
-		go a.triggerAutoPreGen(filepath.Base(rootPath), entries)
-	}
-
-	ft := a.folderTypes[rootPath]
-	if ft == "" {
-		ft = "ai"
-	}
-	if ft != "photo" {
-		go a.batchIndexImages(localImages, ft)
+		label := filepath.Base(rootPath)
+		go func() {
+			a.triggerAutoPreGen(label, entries)
+			a.runIndexWhenIdle(localImages, rootPath)
+		}()
 	}
 	fmt.Printf("[后台扫描] 完成: %s，共 %d 张图片\n", rootPath, totalCount)
 	if a.ctx != nil {
@@ -1121,7 +1126,11 @@ func (a *App) refreshFolderInternal(folderPath string) *FolderDiffResult {
 
 	// ★ 标记扫描中；defer 清除覆盖所有返回路径。
 	a.setScanInProgress(folderPath, true)
-	defer a.setScanInProgress(folderPath, false)
+	atomic.AddInt32(&activeScanOps, 1)
+	defer func() {
+		atomic.AddInt32(&activeScanOps, -1)
+		a.setScanInProgress(folderPath, false)
+	}()
 
 	// === Phase 1: IO 阶段（无锁）===
 

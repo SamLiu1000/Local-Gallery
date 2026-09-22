@@ -16,6 +16,17 @@ package main
 
 import "sync"
 
+// ★ activeScanOps：当前进行中的扫描/增量刷新数量（原子）。
+//   声明在这个无 build-tag 的文件里，主构建与 bindings 构建都能引用
+//   （app_thumbnail.go 带 !bindings tag，bindings 构建看不到它）。
+//   triggerAutoPreGen 据此判断"导入仍在进行"，期间不做后台预生成，
+//   避免与扫描写库、FTS 索引、尺寸回填抢磁盘把前台缩略图生成拖慢数十倍。
+var activeScanOps int32
+
+// ★ onDemandActive：正在生成的前台 on-demand 缩略图数量（原子）。
+//   同样声明在无 build-tag 文件里供两种构建共用；预生成/索引据此让出 CPU。
+var onDemandActive int32
+
 // prioTask 一个待执行任务。done 非空时执行完毕后关闭，供等待方唤醒。
 type prioTask struct {
 	fn   func()

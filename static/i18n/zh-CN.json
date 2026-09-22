@@ -587,7 +587,7 @@
   "toolbar.edit_mode_title": "编辑模式：单击选择图片，支持 Ctrl/Shift 批量选择",
   "toolbar.image_count": "张图片",
   "toolbar.inertia": "惯性",
-  "toolbar.inertia_title": "惯性滚动：开启后滚轮有惯性滑行效果，右键空白区域可调参",
+  "toolbar.inertia_title": "惯性滚动：开启后滚轮有惯性滑行效果，点击右侧齿轮可调参",
   "toolbar.layout.grid": "网格布局",
   "toolbar.layout.list": "列表",
   "toolbar.layout.masonry": "瀑布流",
@@ -660,5 +660,7 @@
   "status.bgop.scan": "正在扫描导入…",
   "status.bgop.pregen": "正在预生成缩略图 {done}/{total}",
   "inertia.power": "滑行力度 (0-100)",
-  "inertia.power_hint": "每格滚轮的冲量与最高速度；越高滑得越远。右键再开此面板微调。"
+  "inertia.power_hint": "每格滚轮的冲量与最高速度；越高滑得越远。点击惯性按钮右侧的齿轮可随时微调。",
+  "inertia.analog": "无级滚动（连续速率模式）",
+  "inertia.analog_hint": "根据滚轮转速连续调节滚动速度：快甩快滑、慢滚慢移，不再逐格跳变；停顿后的单格滚动为精确步进。"
 }

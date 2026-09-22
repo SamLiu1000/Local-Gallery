@@ -746,24 +746,19 @@ func (a *App) ScanFolderQuick(path, folderType string, quick bool) *ScanResult {
 			a.invalidatePreviewCache()
 			a.invalidateParamTags()
 
-			// ★ 扫描完成：自动低优预生成缺失缩略图（后台 goroutine，不阻塞 scan:complete）。
+			// ★ 优先级：扫描已完成 → 先补齐缩略图（用户看图优先），索引排最后。
+			//   索引会用最多 8 个 CPU 逐张读原图解析元数据 + 大 FTS 写入，
+			//   与预生成/浏览并行时抢 CPU 和数据库锁（表现为导入后出图慢）。
 			if totalSoFar > 0 && len(localEntries) > 0 {
 				preEntries := make([]*ImageEntry, 0, len(localEntries))
 				for _, e := range localEntries {
 					preEntries = append(preEntries, e)
 				}
-				go a.triggerAutoPreGen(filepath.Base(resolvedPath), preEntries)
-			}
-
-			// ★ 元数据索引（与全量扫描一致：ai 类型全量索引）
-			if totalSoFar > 0 {
-				ft := a.folderTypes[resolvedPath]
-				if ft == "" {
-					ft = "ai"
-				}
-				if ft != "photo" {
-					go a.batchIndexImages(localEntries, ft)
-				}
+				label := filepath.Base(resolvedPath)
+				go func() {
+					a.triggerAutoPreGen(label, preEntries)
+					a.runIndexWhenIdle(localEntries, resolvedPath)
+				}()
 			}
 
 			if a.ctx != nil {

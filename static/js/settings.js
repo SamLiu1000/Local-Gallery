@@ -443,26 +443,33 @@ const Settings = (() => {
             await refreshAfterDataDirChange();
             return;
         }
+        // ★ 切换前挂起前端一切写回并作废内存缓存：防止切换窗口内（以及切换后
+        //   重载前）旧目录的标签/收藏/设置被防抖保存或 beforeunload 兜底写进新目录
+        if (typeof Storage !== 'undefined' && Storage.suspendForDataDirSwitch) {
+            Storage.suspendForDataDirSwitch();
+        }
         try {
             const result = await WailsBridge.restartWithNewPaths();
             if (result && result.success) {
                 console.log('[设置] 数据目录已热切换:', result.userDataDir);
-                // ★ 路径已生效，不再需要关闭时 Quit 重启
-                await refreshAfterDataDirChange();
-                if (typeof Gallery !== 'undefined' && Gallery.refreshRootFromServer) {
-                    const roots = Gallery.getImportedRoots ? Gallery.getImportedRoots() : [];
-                    for (const r of roots) {
-                        try { await Gallery.refreshRootFromServer(r.rootId || r.path); } catch (e) {}
-                    }
-                }
-            } else {
-                console.warn('[设置] 热切换失败:', result && result.error);
-                App.showToast((result && result.error) || t('settings.switch_failed'), 'error');
-                // ★ 失败时后端已回滚（.gallery-userdir 恢复旧值、旧库保持打开），
-                //   当前数据完整可用，清掉标记避免关闭设置时触发 Quit 旧兜底
-                await refreshAfterDataDirChange();
+                // ★ 整体重载前端：导航栏布局/收纳夹/主题色/深浅色等所有设置与
+                //   侧栏状态（含 user-data.db 里 sidebar_settings 的内存缓存标志）
+                //   一律从新目录重新初始化，避免逐个重置内存缓存造成遗漏
+                window.location.reload();
+                return;
             }
+            // ★ 失败时后端已回滚（.gallery-userdir 恢复旧值、旧库保持打开），
+            //   恢复读写并重新同步，当前数据完整可用
+            if (typeof Storage !== 'undefined' && Storage.resumeAfterDataDirSwitch) {
+                Storage.resumeAfterDataDirSwitch();
+            }
+            console.warn('[设置] 热切换失败:', result && result.error);
+            App.showToast((result && result.error) || t('settings.switch_failed'), 'error');
+            await refreshAfterDataDirChange();
         } catch (e) {
+            if (typeof Storage !== 'undefined' && Storage.resumeAfterDataDirSwitch) {
+                Storage.resumeAfterDataDirSwitch();
+            }
             console.warn('[设置] 热切换异常:', e.message);
             App.showToast(t('settings.switch_failed') + ': ' + e.message, 'error');
             await refreshAfterDataDirChange();

@@ -584,7 +584,7 @@
   "toolbar.edit_mode_title": "Bearbeitungsmodus: Klicken zum Auswählen, Strg/Umschalt für Mehrfachauswahl",
   "toolbar.image_count": "Bilder",
   "toolbar.inertia": "Trägheit",
-  "toolbar.inertia_title": "Trägheitsscrollen: Rechtsklick auf leere Fläche zum Anpassen der Parameter",
+  "toolbar.inertia_title": "Trägheitsscrollen: Parameter über den Einstellungen-Button neben der Trägheits-Schaltfläche",
   "toolbar.layout.grid": "Raster",
   "toolbar.layout.list": "Liste",
   "toolbar.layout.masonry": "Masonry",

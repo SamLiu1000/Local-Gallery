@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
@@ -363,6 +364,21 @@ func (a *App) indexImageMetadata(id, path, name string, size, lastModified, crea
 	}
 }
 
+// runIndexWhenIdle 在后台执行元数据索引，但保持最低优先级：
+// 排在扫描和缩略图补齐之后调用（见各扫描完成处），且解析 worker 在
+// 前台 on-demand 缩略图生成进行时（onDemandActive>0）让出 CPU，
+// 保证"看图永远比索引快"。
+func (a *App) runIndexWhenIdle(images map[string]*ImageEntry, folderPath string) {
+	ft := a.folderTypes[folderPath]
+	if ft == "" {
+		ft = "ai"
+	}
+	if ft == "photo" {
+		return
+	}
+	a.batchIndexImages(images, ft)
+}
+
 // batchIndexImages 批量索引图片元数据（后台调用，不阻塞扫描完成通知）
 // folderType: "ai"=全部索引, "mixed"=仅索引有元数据的文件, "photo"=不调用
 // ★ 并行解析：ParseMetadataFast 是 IO 密集的小读，多 worker 可把整根索引时间
@@ -396,6 +412,11 @@ func (a *App) batchIndexImages(images map[string]*ImageEntry, folderType string)
 		go func() {
 			defer wg.Done()
 			for j := range jobs {
+				// ★ 浏览优先：前台 on-demand 缩略图正在生成时让出 CPU，
+				//   索引解析不与用户看图抢核（等待期间随时让路）。
+				for atomic.LoadInt32(&onDemandActive) > 0 {
+					time.Sleep(200 * time.Millisecond)
+				}
 				results <- a.buildIndexRecord(j.id, j.entry, j.meta, folderType)
 			}
 		}()

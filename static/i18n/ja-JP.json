@@ -584,7 +584,7 @@
   "toolbar.edit_mode_title": "編集モード: クリックで選択、Ctrl/Shift で複数選択",
   "toolbar.image_count": "画像",
   "toolbar.inertia": "慣性",
-  "toolbar.inertia_title": "慣性スクロール: 右クリックでパラメータ調整",
+  "toolbar.inertia_title": "慣性スクロール: 慣性ボタン横の設定ボタンでパラメータ調整",
   "toolbar.layout.grid": "グリッド",
   "toolbar.layout.list": "リスト",
   "toolbar.layout.masonry": "マンソリー",

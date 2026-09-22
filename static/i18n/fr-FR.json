@@ -584,7 +584,7 @@
   "toolbar.edit_mode_title": "Mode édition : cliquer pour sélectionner, Ctrl/Maj pour multi-sélection",
   "toolbar.image_count": "images",
   "toolbar.inertia": "Inertie",
-  "toolbar.inertia_title": "Défilement inertiel : clic droit dans la zone vide pour ajuster les paramètres",
+  "toolbar.inertia_title": "Défilement inertiel : utilisez le bouton de réglages à côté du bouton Inertie pour ajuster les paramètres",
   "toolbar.layout.grid": "Grille",
   "toolbar.layout.list": "Liste",
   "toolbar.layout.masonry": "Mosaïque",

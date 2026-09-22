@@ -584,7 +584,7 @@
   "toolbar.edit_mode_title": "وضع التحرير: انقر للتحديد، Ctrl/Shift للتحديد المتعدد",
   "toolbar.image_count": "صور",
   "toolbar.inertia": "القصور الذاتي",
-  "toolbar.inertia_title": "التمرير بالقصور الذاتي: انقر بزر الماوس الأيمن في منطقة فارغة لضبط المعلمات",
+  "toolbar.inertia_title": "التمرير بالقصور الذاتي: لضبط المعلمات استخدم زر الإعدادات بجانب زر القصور الذاتي",
   "toolbar.layout.grid": "شبكة",
   "toolbar.layout.list": "قائمة",
   "toolbar.layout.masonry": "البناء المتدرج",

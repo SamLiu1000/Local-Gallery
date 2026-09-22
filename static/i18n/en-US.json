@@ -587,7 +587,7 @@
   "toolbar.edit_mode_title": "Edit Mode: click to select, Ctrl/Shift for multi-select",
   "toolbar.image_count": "images",
   "toolbar.inertia": "Inertia",
-  "toolbar.inertia_title": "Inertia Scroll: right-click blank area to tune parameters",
+  "toolbar.inertia_title": "Inertia Scroll: use the settings button next to the inertia button to tune parameters",
   "toolbar.layout.grid": "Grid",
   "toolbar.layout.list": "List",
   "toolbar.layout.masonry": "Masonry",
@@ -660,5 +660,7 @@
   "status.bgop.scan": "Scanning & importing…",
   "status.bgop.pregen": "Pre-generating thumbnails {done}/{total}",
   "inertia.power": "Glide power (0-100)",
-  "inertia.power_hint": "Impulse per wheel notch and top speed; higher glides farther."
+  "inertia.power_hint": "Impulse per wheel notch and top speed; higher glides farther.",
+  "inertia.analog": "Analog scrolling (continuous rate)",
+  "inertia.analog_hint": "Scroll speed follows wheel speed continuously: flick fast to glide, roll slow to crawl — no per-notch steps. A single notch after a pause scrolls exactly one step."
 }

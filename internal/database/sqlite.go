@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -56,7 +57,17 @@ func New(dbPath string) (*ImageDB, error) {
 		return nil, fmt.Errorf("打开数据库失败: %w", err)
 	}
 
-	db.SetMaxOpenConns(1)
+	// ★ 连接数不能是 1：此前所有读写共用一条连接，一个慢查询（如 GetImages
+	//   翻页查询）会把所有缩略图请求的"查路径"全部堵住——实测单请求卡 2-5 秒、
+	//   十几个请求同时停顿（表现为导入初期大面积黑框、查看大图无响应）。
+	//   WAL 模式支持"多读并发 + 单写"；写入已由 ImageDB.mu 全局锁串行化，
+	//   放开读连接是安全的。busy_timeout 兜底偶发的写写碰撞。
+	maxConns := goruntime.NumCPU()
+	if maxConns < 8 {
+		maxConns = 8
+	}
+	db.SetMaxOpenConns(maxConns)
+	db.SetMaxIdleConns(maxConns)
 	db.Exec("PRAGMA journal_mode=WAL")
 	db.Exec("PRAGMA synchronous=NORMAL")
 	db.Exec("PRAGMA cache_size=-10000")

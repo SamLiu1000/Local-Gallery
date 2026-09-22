@@ -47,11 +47,6 @@ var (
 	//   后台预生成仍用 thumbSem 限流、互不干扰。onDemandActive 已使预生成让位，
 	//   两者不会叠加超订阅主进程 vips。
 	onDemandSem = make(chan struct{}, onDemandSemBudget())
-
-	// ★ onDemandActive：是否有前台按需缩略图生成正在进行（正读原图）。
-	//   自动预生成据此让出磁盘——用户点击/浏览文件夹时，on-demand 优先获得
-	//   磁盘读原图，预生成暂停，避免大批量导入时前台点击被子文件夹缩略图排队拖慢。
-	onDemandActive int32
 )
 
 var thumbBucket = []byte("thumbs")
@@ -326,6 +321,13 @@ func (a *App) ensureThumbDB() error {
 
 // generateThumbnail 用 libvips thumbnail API 生成 JPEG 缩略图（shrink-on-load），写入 BoltDB
 func (a *App) generateThumbnail(srcPath string, imageID string) error {
+	tGen := time.Now()
+	phase := tGen
+	defer func() {
+		if d := time.Since(tGen); d > 1000*time.Millisecond {
+			debugSwitchf("[thumb] ★生成总耗时: id=%s 耗时=%.0fms", imageID, d.Seconds()*1000)
+		}
+	}()
 	if err := a.ensureThumbDB(); err != nil {
 		return err
 	}
@@ -346,6 +348,10 @@ func (a *App) generateThumbnail(srcPath string, imageID string) error {
 		a.markThumbFailed(imageID)
 		return fmt.Errorf("文件为空: %s", srcPath)
 	}
+	if d := time.Since(phase); d > 300*time.Millisecond {
+		debugSwitchf("[thumb] ★慢段 os.Stat: id=%s 耗时=%.0fms", imageID, d.Seconds()*1000)
+	}
+	phase = time.Now()
 
 	// 视频文件：存储黑色占位 JPEG（无需帧提取）
 	if isVideoFile(filepath.Base(srcPath)) {
@@ -363,11 +369,25 @@ func (a *App) generateThumbnail(srcPath string, imageID string) error {
 		a.markThumbFailed(imageID)
 		return fmt.Errorf("文件头魔数不匹配任何已知图片格式: %s", srcPath)
 	}
+	if d := time.Since(phase); d > 300*time.Millisecond {
+		debugSwitchf("[thumb] ★慢段 isImageByMagic(读文件头): id=%s 耗时=%.0fms", imageID, d.Seconds()*1000)
+	}
+	phase = time.Now()
+
+	// ★ 在途读取记账：从魔数检查到 worker 生成完成算"正在读原图"，
+	//   AbandonFolder 据此决定是否杀 worker 硬中断（见该函数注释）。
+	fkRead := a.imageFolderKey(srcPath)
+	inflightReadStart(fkRead)
+	defer inflightReadEnd(fkRead)
 
 	// ★ 生成：优先经独立 worker 进程（可被杀 = 可立即停读原图）。
 	//   worker 失败时若文件夹已不再被关注（切换走了）则直接放弃、不回退；
 	//   仅当文件夹仍被关注才回退进程内 libvips（保证生成不中断）。
 	jpegBytes, err := a.generateViaWorker(srcPath)
+	if d := time.Since(phase); d > 300*time.Millisecond {
+		debugSwitchf("[thumb] ★慢段 generateViaWorker: id=%s 耗时=%.0fms", imageID, d.Seconds()*1000)
+	}
+	phase = time.Now()
 	if err != nil {
 		if fk := a.imageFolderKey(srcPath); fk != "" && isFolderAbandoned(fk) {
 			return fmt.Errorf("文件夹已切换，取消缩略图生成: %s", imageID)
@@ -392,6 +412,9 @@ func (a *App) generateThumbnail(srcPath string, imageID string) error {
 		b := tx.Bucket(thumbBucket)
 		return b.Put([]byte(imageID), jpegBytes)
 	})
+	if d := time.Since(phase); d > 300*time.Millisecond {
+		debugSwitchf("[thumb] ★慢段 bbolt.Batch写: id=%s 耗时=%.0fms", imageID, d.Seconds()*1000)
+	}
 	if err != nil {
 		a.markThumbFailed(imageID)
 		return fmt.Errorf("写入 BoltDB 失败: %w", err)
@@ -574,11 +597,15 @@ func clientGone(ctx context.Context) bool {
 // ctx 为发起方请求的上下文：客户端断开后（前端滚动丢弃了这张图）跳过尚未开始的生成，
 // 让生成队列跟着"当前视窗"走，而不是跟着滚动路径走。
 func (a *App) serveThumbnail(ctx context.Context, imageID string) ([]byte, error) {
+	t0 := time.Now()
 	debugSwitchf("[thumb] serveThumbnail 进入: id=%s", imageID)
 	if clientGone(ctx) {
 		return nil, errClientGone
 	}
 	imagePath := a.resolveImagePath(imageID)
+	if d := time.Since(t0); d > 300*time.Millisecond {
+		debugSwitchf("[thumb] ★慢段 resolveImagePath: id=%s 耗时=%.0fms", imageID, d.Seconds()*1000)
+	}
 	if imagePath == "" {
 		a.markThumbFailed(imageID)
 		return nil, fmt.Errorf("图片未找到: %s", imageID)
@@ -598,6 +625,7 @@ func (a *App) serveThumbnail(ctx context.Context, imageID string) ([]byte, error
 	// 先从 BoltDB 读取
 	if a.thumbDB != nil {
 		var jpegBytes []byte
+		tView := time.Now()
 		err := a.thumbDB.View(func(tx *bbolt.Tx) error {
 			b := tx.Bucket(thumbBucket)
 			v := b.Get([]byte(imageID))
@@ -607,6 +635,9 @@ func (a *App) serveThumbnail(ctx context.Context, imageID string) ([]byte, error
 			}
 			return nil
 		})
+		if d := time.Since(tView); d > 300*time.Millisecond {
+			debugSwitchf("[thumb] ★慢段 bbolt.View: id=%s 耗时=%.0fms", imageID, d.Seconds()*1000)
+		}
 		if err == nil && len(jpegBytes) > 0 {
 			// 检查是否是失败标记
 			if len(jpegBytes) == 1 && jpegBytes[0] == 0 {
@@ -634,8 +665,12 @@ func (a *App) serveThumbnail(ctx context.Context, imageID string) ([]byte, error
 	// per-image 锁：同一张图不重复生成
 	muI, _ := thumbGenLocks.LoadOrStore(imageID, &sync.Mutex{})
 	mu := muI.(*sync.Mutex)
+	tMu := time.Now()
 	mu.Lock()
 	defer mu.Unlock()
+	if d := time.Since(tMu); d > 300*time.Millisecond {
+		debugSwitchf("[thumb] ★慢段 per-image锁等待: id=%s 耗时=%.0fms", imageID, d.Seconds()*1000)
+	}
 
 	// 双重检查
 	if a.thumbDB != nil {
@@ -1102,7 +1137,16 @@ func (a *App) stopAutoPreGen() bool {
 // 与手动预生成（StartPreGenThumbs）互不干扰：独立取消通道、固定低并发、
 // 不写 preGenStatus（设置页进度条不会被自动任务污染）。
 // 生成是幂等的：bbolt 双重检查 + per-image 锁，与 on-demand / 手动预生成并发安全。
+//
+// ★ 扫描进行中直接跳过：预生成要把每张新增原图完整读一遍（vips 解码），
+//   与扫描的 SQLite 批量写入、FTS 索引、尺寸回填抢同一块磁盘——实测会把
+//   前台 on-demand 缩略图的生成从 ~100ms 拖到 ~5000ms（50 倍），表现为
+//   "导入初期浏览长时间黑框卡顿"。根级扫描结束（scan:complete 路径）再统一补齐。
 func (a *App) triggerAutoPreGen(label string, entries []*ImageEntry) {
+	if atomic.LoadInt32(&activeScanOps) > 0 {
+		fmt.Printf("[自动预生成] 跳过（扫描进行中）: %s\n", label)
+		return
+	}
 	if len(entries) == 0 || a.thumbDB == nil {
 		return
 	}
@@ -1263,19 +1307,59 @@ func (a *App) triggerAutoPreGen(label string, entries []*ImageEntry) {
 var (
 	abandonedFoldersMu sync.Mutex
 	abandonedFolders   = map[string]int64{} // folderKey → 被遗弃时间戳(毫秒)
+
+	// ★ 在途原图读取计数：folderKey → 数量（原子）。
+	//   generateThumbnail 在真正开始读原图（魔数检查 → worker 生成）期间记账，
+	//   AbandonFolder 据此判断"切走后是否还有读取在飞"——有则杀 worker 进程硬中断。
+	inflightReads sync.Map
 )
+
+func inflightReadStart(key string) {
+	if key == "" {
+		return
+	}
+	v, _ := inflightReads.LoadOrStore(key, new(int32))
+	atomic.AddInt32(v.(*int32), 1)
+}
+
+func inflightReadEnd(key string) {
+	if key == "" {
+		return
+	}
+	if v, ok := inflightReads.Load(key); ok {
+		if atomic.AddInt32(v.(*int32), -1) <= 0 {
+			inflightReads.Delete(key)
+		}
+	}
+}
+
+// inflightReadsFor 返回某文件夹（含其子目录）当前在途原图读取的数量。
+func inflightReadsFor(key string) int {
+	if key == "" {
+		return 0
+	}
+	total := 0
+	inflightReads.Range(func(k, v any) bool {
+		ks := k.(string)
+		if ks == key || strings.HasPrefix(ks, key+"/") {
+			total += int(atomic.LoadInt32(v.(*int32)))
+		}
+		return true
+	})
+	return total
+}
 
 // ★ 遗弃永久有效：切换文件夹后，旧文件夹的缩略图生成彻底停止，
 //   直到用户重新聚焦（FocusFolder）该文件夹才恢复。
 //   之前用 5 秒过期，导致切换后 5 秒生成又恢复读原图——用户看到的"没停"就是它。
 
 // AbandonFolder 前端在离开某文件夹（切换视图）时调用：记录为"已遗弃"。
-// ★ 不再杀 worker 进程：此前"每次切换都 killThumbWorker"会在用户快速切文件夹时
-//   反复杀掉/重生 worker（重生含 vips 初始化停滞），且前台 on-demand 现走 worker
-//   生成——杀 worker 等于把当前文件夹的缩略图生成打断。遗弃保护由调用方的
-//   isFolderAbandoned 判断承担（on-demand / 自动预生成在发任务前都会检查并跳过，
-//   worker 只是"生成字节"的无状态进程，不知道也无需知道文件夹归属）。
-//   在途的原图读取最多完成当前 1 个任务即空闲，不会持续读被遗弃文件夹。
+// ★ 硬中断：若该文件夹（含子目录）仍有在途的原图读取（正在 vips 解码），
+//   立即杀掉 worker 进程——OS 直接终止读盘，真正做到"切走即停"。
+//   误伤说明：worker 是无状态字节生成器，被杀时新文件夹的在途解码也会中断，
+//   但这些任务会自动走主进程内联回退（thumbSem 限流）完成，worker 随下次调用
+//   惰性重生——只付一次 vips 初始化，不损失正确性。若没有在途读取则不杀，
+//   避免快速连续切换时反复杀/重生（v1 的老问题）。
 func (a *App) AbandonFolder(folderPath string) {
 	if folderPath == "" {
 		return
@@ -1284,6 +1368,10 @@ func (a *App) AbandonFolder(folderPath string) {
 	abandonedFoldersMu.Lock()
 	abandonedFolders[key] = time.Now().UnixMilli()
 	abandonedFoldersMu.Unlock()
+	if inflightReadsFor(key) > 0 {
+		debugSwitchf("[thumb] 遗弃 %s：仍有 %d 个在途原图读取 → 杀 worker 硬中断", key, inflightReadsFor(key))
+		a.killThumbWorker()
+	}
 }
 
 // FocusFolder 前端进入某文件夹时调用：从遗弃集合移除该文件夹及其所有祖先，

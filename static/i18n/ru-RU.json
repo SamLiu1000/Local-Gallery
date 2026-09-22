@@ -584,7 +584,7 @@
   "toolbar.edit_mode_title": "Режим редактирования: нажмите для выбора, Ctrl/Shift для множественного выбора",
   "toolbar.image_count": "изображений",
   "toolbar.inertia": "Инерция",
-  "toolbar.inertia_title": "Инерционная прокрутка: правый клик по пустой области для настройки параметров",
+  "toolbar.inertia_title": "Инерционная прокрутка: используйте кнопку настроек рядом с кнопкой инерции для настройки параметров",
   "toolbar.layout.grid": "Сетка",
   "toolbar.layout.list": "Список",
   "toolbar.layout.masonry": "Мозаика",
