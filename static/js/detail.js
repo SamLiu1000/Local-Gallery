@@ -707,7 +707,7 @@ const DetailPanel = (() => {
 
             const sourceLabel = version.source === 'original' ? _t('detail.prompt_original') :
                                version.source === 'ai_generated' ? _t('detail.prompt_ai') : _t('detail.prompt_custom');
-            promptVersionLabel.title = `来源: ${sourceLabel}`;
+            promptVersionLabel.title = _t('detail.prompt_source') + ': ' + sourceLabel;
         } else {
             positivePrompt.textContent = _t("detail.no_prompt");
             negativePrompt.textContent = _t("detail.none");
@@ -1770,6 +1770,10 @@ const DetailPanel = (() => {
                 renderRawMetadata(currentImage);
                 renderFileInfo(currentImage);
             }
+            // ★ 提示词区的 "no prompt"/"none" 占位与版本来源 title 也需随语言刷新
+            renderCurrentPrompt();
+            // ★ API 配置下拉的占位选项
+            refreshDetailApiConfigSelect();
             if (btnToggleRawMetadata) btnToggleRawMetadata.textContent = _t('detail.metadata');
         }
     };
@@ -1825,6 +1829,12 @@ const ImageViewer = (() => {
     function init() {
         if (_viewerInitialized) return;
         _viewerInitialized = true;
+
+        // ★ 语言切换：大图查看器的参数/元数据面板若已打开，重渲染
+        //   （拍摄时间等 EXIF 标签、文件信息行都是构建时一次性写入的）
+        window.addEventListener('i18n:changed', () => {
+            if (paramsPanelVisible && currentImgData) renderParamsPanel(currentImgData);
+        });
 
         overlay = document.getElementById('imageViewerOverlay');
         wrapper = document.getElementById('imageViewerWrapper');

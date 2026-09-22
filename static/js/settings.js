@@ -11,15 +11,23 @@ const Settings = (() => {
         if (btnThumbSettings) {
             btnThumbSettings.addEventListener('click', openSettingsDialog);
         }
+        // overlay 点击关闭只在 init 绑定一次，避免每次打开设置都重复挂监听器
+        const overlay = document.getElementById('modalOverlay');
+        if (overlay) {
+            overlay.addEventListener('click', (e) => {
+                if (e.target === overlay) {
+                    stopPreGenPolling();
+                    overlay.style.display = 'none';
+                }
+            });
+        }
     }
 
     // ==================== 打开设置对话框 ====================
 
-    let _settingsChanged = false;
 
     async function openSettingsDialog() {
         const t = (typeof I18n !== "undefined" ? I18n.t : (s) => s);
-        _settingsChanged = false;
         const overlay = document.getElementById('modalOverlay');
         const content = document.getElementById('modalContent');
 
@@ -50,16 +58,6 @@ const Settings = (() => {
                 <!-- 3. 目录路径设置 -->
                 <div class="settings-section">
                     <h4>${t("settings.dir_paths")}</h4>
-                    <div style="margin-bottom: 14px;">
-                        <span style="font-size: 12px; color: var(--text-secondary); font-weight: 600;">${t("settings.thumb_cache_dir")}</span>
-                        <div class="settings-dir-row" style="margin-top: 4px;">
-                            <input type="text" id="settingsThumbDir" class="settings-dir-input" readonly />
-                            <button id="settingsBrowseThumbDir" class="btn-small" title="${t("settings.select_thumb_dir")}"><span class="icon icon-browse"></span></button>
-                            <button id="settingsNewThumbDir" class="btn-small" title="${t("settings.new_thumb_dir")}"><span class="icon icon-add"></span></button>
-                            <button id="settingsResetThumbDir" class="btn-small" title="${t("settings.reset_default")}"><span class="icon icon-reset"></span></button>
-                        </div>
-                        <span class="input-hint" id="settingsThumbDirHint"></span>
-                    </div>
                     <div>
                         <span style="font-size: 12px; color: var(--text-secondary); font-weight: 600;">${t("settings.user_data_dir")}</span>
                         <div class="settings-dir-row" style="margin-top: 4px;">
@@ -129,22 +127,9 @@ const Settings = (() => {
                         <label for="settingsThumbConcurrency">${t("settings.concurrency")}:</label>
                         <input type="number" id="settingsThumbConcurrency" class="settings-number" min="1" max="64" value="2" />
                         <button id="settingsApplyConcurrency" class="btn-small">${t("settings.apply")}</button>
-                        <span class="input-hint" style="margin-left: 8px;">(1-64)</span>
+                        <button id="settingsRestoreConcurrency" class="btn-small">${t("settings.concurrency_restore_default")}</button>
+                        <span class="input-hint" id="settingsThumbConcurrencyHint" style="margin-left: 8px;"></span>
                     </div>
-                    <!-- 缩放算法暂时隐藏
-                    <div class="settings-row" style="margin-bottom: 8px;">
-                        <label for="settingsThumbKernel">${t("settings.scale_algo")}:</label>
-                        <select id="settingsThumbKernel" class="settings-select">
-                            <option value="lanczos3">Lanczos3 (${t("settings.lanczos3")})</option>
-                            <option value="lanczos2">Lanczos2 (${t("settings.lanczos2")})</option>
-                            <option value="cubic">Cubic</option>
-                            <option value="mitchell">Mitchell</option>
-                            <option value="linear">Linear</option>
-                            <option value="nearest">Nearest</option>
-                        </select>
-                        <button id="settingsApplyKernel" class="btn-small">${t("settings.apply")}</button>
-                    </div>
-                    -->
                 </div>
 
                 <!-- 6. 手机/平板访问 (WiFi) -->
@@ -194,24 +179,19 @@ const Settings = (() => {
         document.getElementById('btnCloseSettings').addEventListener('click', () => {
             stopPreGenPolling();
             overlay.style.display = 'none';
-            if (_settingsChanged) {
-                window.runtime.Quit();
-            }
+            // ★ 旧"关闭设置即 Quit 重启"兜底已移除：路径修改走热切换，
+            //   失败有回滚，无任何场景需要退出程序
         });
 
         // ===== 配色方案事件 =====
         initColorPickers();
 
-        document.getElementById('settingsBrowseThumbDir').addEventListener('click', browseThumbDir);
-        const newThumbBtn = document.getElementById('settingsNewThumbDir');
-        if (newThumbBtn) newThumbBtn.addEventListener('click', newThumbDir);
-        document.getElementById('settingsResetThumbDir').addEventListener('click', resetThumbDir);
         document.getElementById('settingsBrowseUserDataDir').addEventListener('click', browseUserDataDir);
         document.getElementById('settingsResetUserDataDir').addEventListener('click', resetUserDataDir);
         document.getElementById('settingsRefreshStats').addEventListener('click', loadCacheStats);
         document.getElementById('settingsCleanOrphaned').addEventListener('click', cleanOrphanedThumbs);
         document.getElementById('settingsApplyConcurrency').addEventListener('click', applyConcurrency);
-        // document.getElementById('settingsApplyKernel').addEventListener('click', applyKernel); // 缩放算法暂时隐藏
+        document.getElementById('settingsRestoreConcurrency').addEventListener('click', restoreDefaultConcurrency);
         document.getElementById('settingsClearFolderThumbs').addEventListener('click', clearSelectedFolderThumbs);
         document.getElementById('settingsStartLAN').addEventListener('click', startLANServer);
         document.getElementById('settingsStopLAN').addEventListener('click', stopLANServer);
@@ -228,10 +208,8 @@ const Settings = (() => {
                 }
             });
         }
-        // 复选框即时保存到 localStorage
-        document.getElementById('settingsLanAutoStart').addEventListener('change', function() {
-            localStorage.setItem('lanAutoStart', String(this.checked));
-        });
+        // 复选框即时保存到后端全局设置（启动时后端据此自动开启 LAN 服务）
+        document.getElementById('settingsLanAutoStart').addEventListener('change', saveLANConfig);
 
         // ===== 全选按钮 =====
         document.getElementById('settingsSelectAllFolders').addEventListener('click', function() {
@@ -304,16 +282,6 @@ const Settings = (() => {
         startPreGenPollingIfNeeded();
         if (typeof ImportExport !== 'undefined') ImportExport.bindEvents();
 
-        overlay.addEventListener('click', (e) => {
-            if (e.target === overlay) {
-                stopPreGenPolling();
-                overlay.style.display = 'none';
-                if (_settingsChanged) {
-                    window.runtime.Quit();
-                }
-            }
-        });
-
         loadCurrentDirs();
         loadCacheStats();
         loadThumbGenSettings();
@@ -325,23 +293,11 @@ const Settings = (() => {
 
     async function loadCurrentDirs() {
         const tfn = (typeof I18n !== "undefined" ? I18n.t : (s) => s);
-        const thumbInput = document.getElementById('settingsThumbDir');
-        const thumbHint = document.getElementById('settingsThumbDirHint');
         const userDataInput = document.getElementById('settingsUserDataDir');
 
         if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails()) {
-            try {
-                const thumbDir = await WailsBridge.getThumbDir();
-                if (thumbInput) {
-                    thumbInput.value = thumbDir;
-                    thumbHint.innerHTML = '<span class="icon icon-check"></span> ' + tfn('settings.thumb_cache_dir');
-                    thumbHint.style.color = 'var(--green)';
-                }
-            } catch (e) {
-                console.error('[loadCurrentDirs] getThumbDir 失败:', e);
-                if (thumbHint) thumbHint.innerHTML = '<span class="icon icon-warning"></span> ' + tfn('settings.load_failed');
-            }
-
+            // ★ 缩略图库已并入数据目录（thumbnails.db 固定在其中），
+            //   不再有独立的缩略图目录输入框
             try {
                 const userDataDir = await WailsBridge.getUserDataDir();
                 console.log('[loadCurrentDirs] getUserDataDir 返回:', userDataDir, 'input:', !!userDataInput);
@@ -354,15 +310,6 @@ const Settings = (() => {
     }
 
     // ==================== 更新前端缓存 ====================
-
-    async function syncSettingsCache(key, value) {
-        if (typeof Storage !== 'undefined' && Storage.setSetting) {
-            await Storage.setSetting(key, value);
-        }
-        if (typeof Storage !== 'undefined' && Storage.saveToServer) {
-            await Storage.saveToServer();
-        }
-    }
 
     // ==================== 加载缓存统计 ====================
 
@@ -383,83 +330,6 @@ const Settings = (() => {
     }
 
     // ==================== 浏览/重置 缩略图目录 ====================
-
-    async function browseThumbDir() {
-        try {
-            // ★ 直接选择 thumbnails.db 文件（而非文件夹），路径天然指向真实缩略图库，
-            //   避免"选错目录导致空库重新生成"的问题
-            const filePath = await WailsBridge.selectThumbDBFile();
-            if (!filePath) return;
-
-            await syncSettingsCache('thumbDir', filePath);
-
-            const result = await WailsBridge.setThumbDir(filePath);
-            if (result && result.success) {
-                _settingsChanged = true;
-                document.getElementById('settingsThumbDir').value = result.thumbDir;
-                // ★ 显示后端的具体提示（含目标库数量/空库警告）
-                const hint = document.getElementById('settingsThumbDirHint');
-                hint.innerHTML = '<span class="icon icon-check"></span> ' + (result.message || t('settings.cache_dir_updated'));
-                hint.style.color = 'var(--green)';
-                App.showToast(result.message || t('settings.cache_dir_updated'), 'success');
-                // ★ 保存后立即热切换，无需退出重启
-                await applyDataDirSwitch();
-            } else {
-                await syncSettingsCache('thumbDir', await WailsBridge.getThumbDir());
-                App.showToast(t('settings.save_failed') + ': ' + (result.error || t('settings.unknown_error')), 'error');
-            }
-        } catch (e) {
-            App.showToast(t('settings.select_dir_failed') + ': ' + e.message, 'error');
-        }
-    }
-
-    // ★ 新建缩略图库目录：选择文件夹，程序将在其中创建 thumbnails.db（从空库开始）
-    async function newThumbDir() {
-        try {
-            const folderPath = await WailsBridge.selectFolder();
-            if (!folderPath) return;
-
-            await syncSettingsCache('thumbDir', folderPath);
-
-            const result = await WailsBridge.setThumbDir(folderPath);
-            if (result && result.success) {
-                _settingsChanged = true;
-                document.getElementById('settingsThumbDir').value = result.thumbDir;
-                const hint = document.getElementById('settingsThumbDirHint');
-                hint.innerHTML = '<span class="icon icon-check"></span> ' + (result.message || t('settings.cache_dir_updated'));
-                hint.style.color = 'var(--green)';
-                App.showToast(result.message || t('settings.cache_dir_updated'), 'success');
-                await applyDataDirSwitch();
-            } else {
-                await syncSettingsCache('thumbDir', await WailsBridge.getThumbDir());
-                App.showToast(t('settings.save_failed') + ': ' + (result.error || t('settings.unknown_error')), 'error');
-            }
-        } catch (e) {
-            App.showToast(t('settings.select_dir_failed') + ': ' + e.message, 'error');
-        }
-    }
-
-    async function resetThumbDir() {
-        try {
-            const result = await WailsBridge.setThumbDir('');
-            if (result && result.success) {
-                _settingsChanged = true;
-                await syncSettingsCache('thumbDir', result.thumbDir);
-
-                document.getElementById('settingsThumbDir').value = result.thumbDir;
-                const hint = document.getElementById('settingsThumbDirHint');
-                hint.innerHTML = '<span class="icon icon-check"></span> ' + t('settings.cache_dir_reset');
-                hint.style.color = 'var(--green)';
-                App.showToast(t('settings.cache_dir_reset'), 'success');
-                // ★ 方案A：保存后立即热切换
-                await applyDataDirSwitch();
-            } else {
-                App.showToast(t('settings.reset_failed') + ': ' + (result.error || t('settings.unknown_error')), 'error');
-            }
-        } catch (e) {
-            App.showToast(t('settings.reset_failed') + ': ' + e.message, 'error');
-        }
-    }
 
     // ==================== 清理孤立缩略图 ====================
 
@@ -495,14 +365,14 @@ const Settings = (() => {
 
             const result = await WailsBridge.setUserDataDir(folderPath);
             if (result && result.success) {
-                _settingsChanged = true;
                 document.getElementById('settingsUserDataDir').value = result.userDataDir;
                 const hint = document.getElementById('settingsUserDataDirHint');
                 hint.innerHTML = '<span class="icon icon-check"></span> ' + t('settings.user_dir_set_hint');
                 hint.style.color = 'var(--green)';
                 App.showToast(t('settings.user_dir_set'), 'success');
                 // ★ 方案A：保存后立即热切换
-                await applyDataDirSwitch();
+                // ★ 防抖合并连续修改，统一走一次热切换
+                scheduleDataDirSwitch();
             } else {
                 App.showToast(t('settings.save_failed') + ': ' + (result.error || t('settings.unknown_error')), 'error');
             }
@@ -515,14 +385,14 @@ const Settings = (() => {
         try {
             const result = await WailsBridge.setUserDataDir('');
             if (result && result.success) {
-                _settingsChanged = true;
                 document.getElementById('settingsUserDataDir').value = result.userDataDir;
                 const hint = document.getElementById('settingsUserDataDirHint');
                 hint.innerHTML = '<span class="icon icon-check"></span> ' + t('settings.user_dir_reset_hint');
                 hint.style.color = 'var(--green)';
                 App.showToast(t('settings.user_dir_reset'), 'success');
                 // ★ 方案A：保存后立即热切换
-                await applyDataDirSwitch();
+                // ★ 防抖合并连续修改，统一走一次热切换
+                scheduleDataDirSwitch();
             } else {
                 App.showToast(t('settings.reset_failed') + ': ' + (result.error || t('settings.unknown_error')), 'error');
             }
@@ -532,11 +402,19 @@ const Settings = (() => {
     }
 
     async function refreshAfterDataDirChange() {
+        // ★ 顺序敏感：先以服务器注册列表整体替换前端内存的导入根列表
+        //   （否则旧目录的根残留、新目录的根缺失），再立刻刷新导航栏——
+        //   文件夹树是用户最关心的，不等设置/标签等慢步骤
+        if (typeof Gallery !== 'undefined' && Gallery.resyncImportedRootsFromServer) {
+            await Gallery.resyncImportedRootsFromServer();
+        }
+        if (typeof Sidebar !== 'undefined') {
+            await Sidebar.refreshFolderTree();
+        }
         if (typeof Storage !== 'undefined' && Storage.syncFromServer) {
             await Storage.syncFromServer();
         }
         if (typeof Sidebar !== 'undefined') {
-            await Sidebar.refreshFolderTree();
             await Sidebar.refreshTagTree();
             await Sidebar.refreshApiConfigSelect();
         }
@@ -549,6 +427,17 @@ const Settings = (() => {
      *   后端 RestartWithNewPaths 会：关旧 DB → 并行开新 DB → 原子替换内存 →
      *   清理旧缓存。切换成功后再刷新前端缓存。
      */
+    // ★ 连续修改合并：用户可能一口气改用户数据目录+缩略图目录，
+    //   每次都各跑一次完整热切换会放大不一致窗口。800ms 防抖合并成一次
+    let _switchDebounceTimer = null;
+    function scheduleDataDirSwitch() {
+        if (_switchDebounceTimer) clearTimeout(_switchDebounceTimer);
+        _switchDebounceTimer = setTimeout(async () => {
+            _switchDebounceTimer = null;
+            await applyDataDirSwitch();
+        }, 800);
+    }
+
     async function applyDataDirSwitch() {
         if (typeof WailsBridge === 'undefined' || !WailsBridge.isWails()) {
             await refreshAfterDataDirChange();
@@ -559,7 +448,6 @@ const Settings = (() => {
             if (result && result.success) {
                 console.log('[设置] 数据目录已热切换:', result.userDataDir);
                 // ★ 路径已生效，不再需要关闭时 Quit 重启
-                _settingsChanged = false;
                 await refreshAfterDataDirChange();
                 if (typeof Gallery !== 'undefined' && Gallery.refreshRootFromServer) {
                     const roots = Gallery.getImportedRoots ? Gallery.getImportedRoots() : [];
@@ -570,7 +458,8 @@ const Settings = (() => {
             } else {
                 console.warn('[设置] 热切换失败:', result && result.error);
                 App.showToast((result && result.error) || t('settings.switch_failed'), 'error');
-                // 失败时维持旧数据，前端只刷新缓存
+                // ★ 失败时后端已回滚（.gallery-userdir 恢复旧值、旧库保持打开），
+                //   当前数据完整可用，清掉标记避免关闭设置时触发 Quit 旧兜底
                 await refreshAfterDataDirChange();
             }
         } catch (e) {
@@ -586,23 +475,38 @@ const Settings = (() => {
         if (typeof WailsBridge === 'undefined' || !WailsBridge.isWails()) return;
 
         try {
-            const concurrency = await WailsBridge.getThumbConcurrency();
+            const info = await WailsBridge.getThumbConcurrencyInfo();
             const concurrencyInput = document.getElementById('settingsThumbConcurrency');
-            if (concurrencyInput) concurrencyInput.value = concurrency;
+            if (info && concurrencyInput) concurrencyInput.value = info.concurrency;
+            updateConcurrencyHint(info ? info.defaultConcurrency : null);
         } catch (e) {
             console.warn('[设置] 加载并发数失败:', e);
         }
+    }
 
-        // 缩放算法暂时隐藏
-        /*
-        try {
-            const kernel = await WailsBridge.getThumbKernel();
-            const kernelSelect = document.getElementById('settingsThumbKernel');
-            if (kernelSelect) kernelSelect.value = kernel;
-        } catch (e) {
-            console.warn('[设置] 加载缩放算法失败:', e);
+    // 并发数提示：标明默认值 = CPU 逻辑核心数
+    function updateConcurrencyHint(defaultConcurrency) {
+        const hint = document.getElementById('settingsThumbConcurrencyHint');
+        if (hint) {
+            hint.textContent = defaultConcurrency
+                ? t('settings.concurrency_default_hint', { n: defaultConcurrency })
+                : '(1-64)';
         }
-        */
+    }
+
+    async function restoreDefaultConcurrency() {
+        try {
+            const result = await WailsBridge.setThumbConcurrency(0);
+            if (result && result.success) {
+                const input = document.getElementById('settingsThumbConcurrency');
+                if (input) input.value = result.thumbConcurrency;
+                App.showToast(t("settings.concurrency_updated") + " " + result.thumbConcurrency, 'success');
+            } else {
+                App.showToast(t('settings.save_failed') + ': ' + (result.error || t('settings.unknown_error')), 'error');
+            }
+        } catch (e) {
+            App.showToast(t('settings.save_failed') + ': ' + e.message, 'error');
+        }
     }
 
     async function applyConcurrency() {
@@ -624,25 +528,6 @@ const Settings = (() => {
             App.showToast(t('settings.save_failed') + ': ' + e.message, 'error');
         }
     }
-
-    // 缩放算法暂时隐藏
-    /*
-    async function applyKernel() {
-        const select = document.getElementById('settingsThumbKernel');
-        const kernel = select.value;
-
-        try {
-            const result = await WailsBridge.setThumbKernel(kernel);
-            if (result && result.success) {
-                App.showToast(t("settings.kernel_updated") + " " + result.thumbKernel, 'success');
-            } else {
-                App.showToast(t('settings.save_failed') + ': ' + (result.error || t('settings.unknown_error')), 'error');
-            }
-        } catch (e) {
-            App.showToast(t('settings.save_failed') + ': ' + e.message, 'error');
-        }
-    }
-    */
 
     // ==================== 按文件夹清除缩略图 ====================
 
@@ -835,7 +720,7 @@ const Settings = (() => {
         if (_selectedFolderPaths.size === 0) return;
 
         var folders = Array.from(_selectedFolderPaths);
-        var folderList = folders.length <= 3 ? folders.join('\n') : folders.slice(0, 3).join('\n') + '\n...等 ' + folders.length + ' 个文件夹';
+        var folderList = folders.length <= 3 ? folders.join('\n') : folders.slice(0, 3).join('\n') + '\n' + t('settings.and_more_folders', { n: folders.length });
         if (!confirm(t('settings.confirm_clear_thumbs') + '\n\n' + folderList + '\n\n' + t('settings.clear_thumbs_note'))) return;
 
         var btn = document.getElementById('settingsClearFolderThumbs');
@@ -1001,7 +886,7 @@ const Settings = (() => {
         if (text) {
             var parts = [];
             if (total > 0) parts.push(done + skipped + ' / ' + total);
-            if (s.paused) parts.push('[已暂停]');
+            if (s.paused) parts.push('[' + t('settings.paused') + ']');
             if (done > 0) parts.push(t('settings.generated') + ' ' + done);
             if (skipped > 0) parts.push(t('settings.skipped') + ' ' + skipped);
             if (failed > 0) parts.push(t('settings.failed') + ' ' + failed);
@@ -1053,17 +938,16 @@ const Settings = (() => {
                 const app = window.go.main.App;
                 const info = await app.GetLANInfo();
                 updateLANUI(info);
+                // 自动启动与端口从后端全局设置读取（后端启动时也用同一份数据）
+                const cfg = await app.GetLANConfig();
+                const autoStartCB = document.getElementById('settingsLanAutoStart');
+                if (autoStartCB && cfg && typeof cfg.autoStart === 'boolean') autoStartCB.checked = cfg.autoStart;
+                const portInput = document.getElementById('settingsLanPort');
+                if (portInput && cfg && cfg.port) portInput.value = cfg.port;
             }
         } catch (e) {
             // 非 Wails 环境或无权限
         }
-        // 加载自动启动设置
-        const autoStart = localStorage.getItem('lanAutoStart') === 'true';
-        const autoStartCB = document.getElementById('settingsLanAutoStart');
-        if (autoStartCB) autoStartCB.checked = autoStart;
-        const savedPort = localStorage.getItem('lanPort');
-        const portInput = document.getElementById('settingsLanPort');
-        if (portInput && savedPort) portInput.value = savedPort;
     }
 
     let _lastLANInfo = null;
@@ -1096,18 +980,32 @@ const Settings = (() => {
         }
     }
 
+    // 保存 LAN 设置到后端全局设置文件（自动启动 + 端口）
+    async function saveLANConfig() {
+        if (typeof WailsBridge === 'undefined' || !WailsBridge.isWails()) return;
+        const portInput = document.getElementById('settingsLanPort');
+        const port = parseInt(portInput.value, 10);
+        const autoStart = document.getElementById('settingsLanAutoStart').checked;
+        if (!isNaN(port) && port >= 1 && port <= 65535) {
+            await window.go.main.App.SetLANConfig(autoStart, port);
+        }
+    }
+
     async function startLANServer() {
         const portInput = document.getElementById('settingsLanPort');
-        const port = parseInt(portInput.value) || 25876;
-        // 保存端口和自动启动设置
-        localStorage.setItem('lanPort', String(port));
-        localStorage.setItem('lanAutoStart', String(document.getElementById('settingsLanAutoStart').checked));
+        const port = parseInt(portInput.value, 10);
+        // 端口非法时明确报错，不再静默回退到默认端口
+        if (isNaN(port) || port < 1 || port > 65535) {
+            App.showToast(t('settings.port_invalid'), 'error');
+            return;
+        }
 
         try {
             if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails()) {
                 const app = window.go.main.App;
                 const info = await app.StartLANServer(port);
                 updateLANUI(info);
+                await saveLANConfig();
                 App.showToast(t("settings.wifi_started_toast") || 'WiFi access started');
             }
         } catch (e) {

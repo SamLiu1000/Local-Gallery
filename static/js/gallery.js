@@ -9,6 +9,7 @@ const Gallery = (() => {
 
     // DOM
     let galleryScroll, galleryGrid, loadingIndicator, loadMoreIndicator;
+    let bgOpStatusEl;
     let layoutBtns, thumbnailSlider, thumbnailSizeValue, sortSelect;
     let imageCountEl, btnShowPromptCount, btnInertiaToggle;
 
@@ -165,22 +166,21 @@ const Gallery = (() => {
     // ★ 滚动状态（模块级，供 IntersectionObserver 和 scroll 防抖共享）
     let _isScrolling = false;
 
-    // ★ 惯性滚动引擎
+    // ★ 惯性滚动引擎（油门+滑行模型）：每格滚轮 = 踩一脚油门给速度加冲量，
+    //   之后每帧固定摩擦自然滑停——手感对齐"中键按住拖动"：连击越密越快，
+    //   停手滑行渐停。唯一用户参数 _inertiaPower(0-100)，映射冲量与速度上限；
+    //   摩擦/停止阈值为内部常数，不再暴露散装调参项。
     let _inertiaEnabled = false;         // 用户是否开启惯性滚动（默认关闭）
-    let _inertiaV = 0;                   // 当前速度
+    let _inertiaPower = 10;              // 滑行力度 0-100（默认 10：轻快跟手）
+    let _inertiaV = 0;                   // 当前速度（px/帧）
 
     // ★ 拖拽滚动状态
     let _dragScroll = { active: false, pointerId: -1, startY: 0, startScroll: 0, lastY: 0, lastTime: 0, velocity: 0, rafId: 0 };
     let _inertiaId = null;               // requestAnimationFrame ID
     let _inertiaScrolling = false;       // 一次性令牌：保护本次 scrollBy 不被取消
-    let _lastWheelTime = 0;              // 最后一次滚轮事件时间戳
     let _lastFrameTime = performance.now(); // 上一帧时间
-    let ACCELERATION = 0.8;            // 加速度（1.0 ≈ 跟手，>1 加速感）
-    let FRICTION_ACTIVE = 0.9;         // 滚动中摩擦
-    let FRICTION_IDLE = 0.5;           // 松手后摩擦
-    let MAX_VELOCITY = 75;             // 最大速度限制
-    let MIN_VELOCITY = 0.5;            // 停止阈值
-    let RELEASE_DELAY = 80;            // 滚轮停止 N ms 后切换为松手摩擦
+    const INERTIA_FRICTION = 0.865;      // 每帧速度保留比例（基准 60fps，按帧时长归一；0.93²≈0.865，滑停时间约为初版一半）
+    const INERTIA_MIN_V = 0.4;           // 停止阈值（px/帧）
 
     // 固定行高瀑布流布局缓存
     let masonryLayout = [];          // [{imgIndex, row, x, y, w, h}]
@@ -236,6 +236,7 @@ const Gallery = (() => {
         thumbnailSizeValue = document.getElementById('thumbnailSizeValue');
         sortSelect = document.getElementById('sortOrder');
         imageCountEl = document.getElementById('imageCount');
+        bgOpStatusEl = document.getElementById('bgOpStatus');
         btnShowPromptCount = document.getElementById('btnShowPromptCount');
         btnInertiaToggle = document.getElementById('btnInertiaToggle');
 
@@ -257,19 +258,9 @@ const Gallery = (() => {
                 if (savedInertia !== null) {
                     _inertiaEnabled = savedInertia;
                 }
-                // 恢复惯性滚动参数
-                const savedAccel = await Storage.getSetting('inertiaAccel', null);
-                if (savedAccel !== null) ACCELERATION = savedAccel;
-                const savedFricActive = await Storage.getSetting('inertiaFricActive', null);
-                if (savedFricActive !== null) FRICTION_ACTIVE = savedFricActive;
-                const savedFricIdle = await Storage.getSetting('inertiaFricIdle', null);
-                if (savedFricIdle !== null) FRICTION_IDLE = savedFricIdle;
-                const savedMaxVel = await Storage.getSetting('inertiaMaxVel', null);
-                if (savedMaxVel !== null) MAX_VELOCITY = savedMaxVel;
-                const savedMinVel = await Storage.getSetting('inertiaMinVel', null);
-                if (savedMinVel !== null) MIN_VELOCITY = savedMinVel;
-                const savedReleaseDelay = await Storage.getSetting('inertiaReleaseDelay', null);
-                if (savedReleaseDelay !== null) RELEASE_DELAY = savedReleaseDelay;
+                // 恢复滑行力度（0-100；旧版散装参数不再读取）
+                const savedPower = await Storage.getSetting('inertiaPower', null);
+                if (savedPower !== null) _inertiaPower = Math.max(0, Math.min(100, parseInt(savedPower) || 10));
             }
         } catch (e) { /* 静默 */ }
 
@@ -320,6 +311,8 @@ const Gallery = (() => {
                 let _scanCompleteLast = 0;      // scan:complete 重取当前文件夹的防抖时间戳
                 window.runtime.EventsOn('scan:complete', (data) => {
                     console.log('[Gallery] 收到扫描完成事件:', data);
+                    _bgOpScanning = false;
+                    updateBgOpStatus();
                     const scanRoot = (data.rootPath || '').replace(/\\/g, '/');
                     // ★ 只清除本次扫描 root 子树下的缓存元数据，而不是 `folderCacheMeta = {}` 清空全部。
                     //   旧逻辑把**所有**文件夹的缓存元数据一次清空——之后点任何已缓存文件夹都命中失败，
@@ -412,6 +405,8 @@ const Gallery = (() => {
                 window.runtime.EventsOn('scan:start', (data) => {
                     const rootPath = (data.rootPath || '').replace(/\\/g, '/');
                     console.log('[Gallery] scan:start root=' + rootPath);
+                    _bgOpScanning = true;
+                    updateBgOpStatus();
                     showScanningPlaceholder();
                     // ★ 轻量更新侧栏显示新添加的文件夹
                     if (typeof Sidebar !== 'undefined' && Sidebar._updateSingleFolderCount) {
@@ -430,6 +425,21 @@ const Gallery = (() => {
                     } else if (typeof Sidebar !== 'undefined' && Sidebar.refreshFolderTree) {
                         Sidebar.refreshFolderTree();
                     }
+                });
+
+                // ★ 后台操作状态：自动预生成缩略图期间显示进度。
+                //   thumb:progress 每生成一张节流触发一次，作为查询 GetPreGenStatus 的
+                //   起点；运行中 pollBgOpPregen 自续轮询，直到 running=false 自动隐藏。
+                window.runtime.EventsOn('thumb:progress', () => {
+                    if (typeof WailsBridge === 'undefined' || !WailsBridge.isWails()) return;
+                    const now = Date.now();
+                    if (now - _bgOpPregenQueryAt < 2000) { pollBgOpPregen(); return; }
+                    _bgOpPregenQueryAt = now;
+                    WailsBridge.getPreGenStatus().then((st) => {
+                        _bgOpPregenStatus = st;
+                        updateBgOpStatus();
+                        if (st && (st.running || st.autoRunning)) pollBgOpPregen();
+                    }).catch(() => {});
                 });
             }
         } catch (e) {
@@ -593,13 +603,19 @@ const Gallery = (() => {
             }, 150);
         });
 
-        // ★ 惯性滚动：velocity += deltaY * ACCELERATION → scrollBy(0, velocity) → friction
+        // ★ 惯性滚动：油门+滑行——每格滚轮给速度加冲量，rAF 每帧 scrollBy + 固定摩擦衰减
         galleryScroll.addEventListener('wheel', (e) => {
             if (!_inertiaEnabled) return;
             if (e.buttons === 1) return;
             e.preventDefault();
 
-            const delta = e.deltaY * ACCELERATION;
+            // ★ 油门：每格滚轮给速度加冲量。deltaMode=1（行）按 ~40px/行 归一。
+            const rawDelta = e.deltaMode === 1 ? e.deltaY * 40 : e.deltaY;
+            // 冲量系数：力度 0 → 0.06/px，100 → 1.26/px（一格 deltaY=100 的脉冲，
+            //   50 档约 v=66px/帧起步，配合 0.93 摩擦滑行约 900px）
+            const gain = 0.06 + (_inertiaPower / 100) * 1.2;
+            const delta = rawDelta * gain;
+
             // ★ 边界反向输入立即归零：到底部时 wheel 向上、到顶部时 wheel 向下
             //   避免残留的同向速度吞掉用户的反向意图
             if (_inertiaV !== 0 && Math.sign(delta) !== Math.sign(_inertiaV)) {
@@ -610,9 +626,10 @@ const Gallery = (() => {
                 }
             }
 
+            // 速度上限：力度 0 → 40px/帧，100 → 140px/帧（连击封顶，防止失控）
+            const maxV = 40 + _inertiaPower;
             _inertiaV += delta;
-            _inertiaV = Math.max(-MAX_VELOCITY, Math.min(MAX_VELOCITY, _inertiaV));
-            _lastWheelTime = performance.now();
+            _inertiaV = Math.max(-maxV, Math.min(maxV, _inertiaV));
 
             if (!_inertiaId) {
                 _lastFrameTime = performance.now();
@@ -793,12 +810,13 @@ const Gallery = (() => {
     }
 
     function initIntersectionObserver() {
-        // rootMargin：视窗上下各扩展 2 屏（预取窗口）。
-        // ★ 原来是 3 屏，配合"卡片一插入就赋 src"会让视窗外很远的图也抢连接；
-        //   现在预取严格排在"立即加载窗口"（视窗上 0.5 屏 / 下 1.5 屏）之后。
+        // rootMargin：上方 2 屏、下方 4 屏（预取窗口，向下深、向上够用）。
+        // ★ 新文件夹缩略图走按需生成（约 100-200ms/张），下方只预取 2 屏会被
+        //   正常滚动速度追上——表现为"往下滚全是黑块"。加深到 4 屏后，
+        //   用户停下滚动到继续下滚之间，下方图大多已在生成/已就绪。
         function _getPreloadMargin() {
             const vh = galleryScroll ? galleryScroll.clientHeight : window.innerHeight;
-            return Math.max(vh * 2, 800);
+            return `${Math.max(vh * 2, 800)}px 0px ${Math.max(vh * 4, 1600)}px`;
         }
 
         function _createObserver() {
@@ -807,7 +825,7 @@ const Gallery = (() => {
                 for (const entry of entries) {
                     if (!entry.isIntersecting) continue;
                     const img = entry.target;
-                    // ★ 滚动中不预取：卡片滚过 2 屏预取边界时不应立刻发请求。
+                    // ★ 滚动中不预取：卡片滚过预取边界时不应立刻发请求。
                     //   unobserve 以便滚动停止后重新观察并立即触发一次回调。
                     if (_thumbScrollBurst) { intersectionObserver.unobserve(img); continue; }
                     // 统一走 _startThumbLoad：清 _deferred 标志、武装超时兜底
@@ -816,7 +834,7 @@ const Gallery = (() => {
                 }
             }, {
                 root: galleryScroll,
-                rootMargin: `${margin}px 0px`,
+                rootMargin: margin,
                 threshold: 0
             });
         }
@@ -848,14 +866,15 @@ const Gallery = (() => {
     }
 
     /**
-     * ★ 惯性滚动引擎 — 先移动再摩擦（首帧不吃衰减）
+     * ★ 惯性滚动引擎 — 油门+滑行：每帧按固定摩擦衰减（按帧时长归一，
+     *   120Hz 高刷屏上滑行时长与 60fps 一致）
      */
     function _tick(now) {
         const deltaTime = now - _lastFrameTime;
         _lastFrameTime = now;
 
         // 速度太小就停止
-        if (Math.abs(_inertiaV) < MIN_VELOCITY) {
+        if (Math.abs(_inertiaV) < INERTIA_MIN_V) {
             _inertiaV = 0;
             _inertiaId = null;
             _inertiaScrolling = false;
@@ -877,18 +896,15 @@ const Gallery = (() => {
             return;
         }
 
-        // 滚轮停止超过 RELEASE_DELAY ms → 切换为松手摩擦（快速衰减）
-        const friction = (now - _lastWheelTime > RELEASE_DELAY)
-            ? FRICTION_IDLE
-            : FRICTION_ACTIVE;
-        _inertiaV *= friction;
+        // 固定摩擦（帧时长归一）：松手后自然滑停，无"滚动中/松手后"双曲线
+        _inertiaV *= Math.pow(INERTIA_FRICTION, deltaTime / 16.7);
 
         // 继续下一帧
         _inertiaId = requestAnimationFrame(_tick);
     }
 
     /**
-     * ★ 右键弹出 → 惯性滚动参数调节对话框
+     * ★ 右键弹出 → 惯性滚动"滑行力度"调节（0-100 单滑杆）
      */
     function _showInertiaDialog(mx, my) {
         const overlay = document.getElementById('modalOverlay');
@@ -900,12 +916,12 @@ const Gallery = (() => {
             <div class="settings-dialog">
                 <h2>${t('inertia.title')}</h2>
                 <div class="inertia-params">
-                    <label><span>${t('inertia.accel')}</span><input type="number" id="ipAccel" value="${ACCELERATION}" step="0.5" min="0"></label>
-                    <label><span>${t('inertia.fric_active')}</span><input type="number" id="ipFricActive" value="${FRICTION_ACTIVE}" step="0.01" min="0" max="1"></label>
-                    <label><span>${t('inertia.fric_idle')}</span><input type="number" id="ipFricIdle" value="${FRICTION_IDLE}" step="0.01" min="0" max="1"></label>
-                    <label><span>${t('inertia.max_vel')}</span><input type="number" id="ipMaxVel" value="${MAX_VELOCITY}" step="10" min="0"></label>
-                    <label><span>${t('inertia.min_vel')}</span><input type="number" id="ipMinVel" value="${MIN_VELOCITY}" step="0.1" min="0"></label>
-                    <label><span>${t('inertia.release_delay')}</span><input type="number" id="ipReleaseDelay" value="${RELEASE_DELAY}" step="10" min="0"></label>
+                    <label style="display:flex;align-items:center;gap:10px;">
+                        <span style="white-space:nowrap;">${t('inertia.power')}</span>
+                        <input type="range" id="ipPower" min="0" max="100" step="5" value="${_inertiaPower}" style="flex:1;">
+                        <span id="ipPowerVal" style="min-width:34px;text-align:right;">${_inertiaPower}</span>
+                    </label>
+                    <div style="font-size:11px;color:var(--text-muted,#888);margin-top:6px;">${t('inertia.power_hint')}</div>
                 </div>
             </div>
             <div class="modal-actions">
@@ -923,21 +939,16 @@ const Gallery = (() => {
             if (e.target === overlay) close();
         });
 
+        const slider = document.getElementById('ipPower');
+        slider.addEventListener('input', () => {
+            document.getElementById('ipPowerVal').textContent = slider.value;
+        });
+
         document.getElementById('btnApplyInertia').addEventListener('click', () => {
-            ACCELERATION = parseFloat(document.getElementById('ipAccel').value) || 20;
-            FRICTION_ACTIVE = parseFloat(document.getElementById('ipFricActive').value) || 0.9;
-            FRICTION_IDLE = parseFloat(document.getElementById('ipFricIdle').value) || 0.5;
-            MAX_VELOCITY = parseFloat(document.getElementById('ipMaxVel').value) || 500;
-            MIN_VELOCITY = parseFloat(document.getElementById('ipMinVel').value) || 0.5;
-            RELEASE_DELAY = parseFloat(document.getElementById('ipReleaseDelay').value) || 80;
-            // ★ 持久化参数
+            _inertiaPower = Math.max(0, Math.min(100, parseInt(slider.value) || 10));
+            // ★ 持久化
             if (typeof Storage !== 'undefined' && Storage.setSetting) {
-                Storage.setSetting('inertiaAccel', ACCELERATION);
-                Storage.setSetting('inertiaFricActive', FRICTION_ACTIVE);
-                Storage.setSetting('inertiaFricIdle', FRICTION_IDLE);
-                Storage.setSetting('inertiaMaxVel', MAX_VELOCITY);
-                Storage.setSetting('inertiaMinVel', MIN_VELOCITY);
-                Storage.setSetting('inertiaReleaseDelay', RELEASE_DELAY);
+                Storage.setSetting('inertiaPower', _inertiaPower);
             }
             close();
         });
@@ -946,11 +957,12 @@ const Gallery = (() => {
     /**
      * ★ 视窗优先：中止视口外正在传输中的图片请求，释放 HTTP 连接槽。
      *   视口内已在加载的图片不受影响，保证用户当前看到的内容不闪烁。
-     *   缓冲带 2.5 屏（大于预取窗口 2 屏），避免误杀即将进入视窗的预取图、来回抖动。
+     *   缓冲带 4.5 屏：必须大于下方预取深度（4 屏），否则深预取的在途请求
+     *   会被下一次滚动误杀，预加载永远到不了"提前就位"。
      */
     function _abortOutOfViewportLoads() {
         const galleryRect = galleryScroll.getBoundingClientRect();
-        const buffer = galleryRect.height * 2.5;
+        const buffer = galleryRect.height * 4.5;
         const viewTop = galleryRect.top - buffer;
         const viewBottom = galleryRect.bottom + buffer;
 
@@ -3822,7 +3834,7 @@ const Gallery = (() => {
         }, 0);
     }
 
-    // 立即加载的窗口：视窗上方 0.5 屏 + 下方 1.5 屏（回滚/下滚都能提前就位）；
+    // 立即加载的窗口：视窗上方 0.5 屏 + 下方 2.5 屏（回滚/下滚都能提前就位）；
     // ★ 滚动中收紧到视窗本身（tight），不再预取——经过的位置不生成。
     function _thumbLoadWindow() {
         if (!galleryScroll) return null;
@@ -3831,7 +3843,7 @@ const Gallery = (() => {
             return { top: rect.top, bottom: rect.bottom, tight: true };
         }
         const vh = rect.height || window.innerHeight;
-        return { top: rect.top - vh * 0.5, bottom: rect.bottom + vh * 1.5 };
+        return { top: rect.top - vh * 0.5, bottom: rect.bottom + vh * 2.5 };
     }
 
     function _flushThumbLoads() {
@@ -3879,6 +3891,9 @@ const Gallery = (() => {
         if (!img || !img.dataset.src || img.src) return;
         img._deferred = false;
         if (intersectionObserver) intersectionObserver.unobserve(img);
+        // ★ 视窗内请求插队：fetchpriority=high 让浏览器把这条请求排到连接池最前，
+        //   预取图（low）不会挤占当前视窗的加载
+        img.setAttribute('fetchpriority', 'high');
         img.src = img.dataset.src;
         img.removeAttribute('data-src');
         armThumbTimeout(img);
@@ -3887,6 +3902,8 @@ const Gallery = (() => {
     // 交给 IntersectionObserver 预取（rootMargin = 1 屏）
     function _observeThumb(img) {
         if (!img || !img.dataset.src || img.src) return;
+        // ★ 预取请求降权：不与视窗内图片抢连接
+        img.setAttribute('fetchpriority', 'low');
         if (intersectionObserver) intersectionObserver.observe(img);
         else _startThumbLoad(img);
     }
@@ -3910,7 +3927,7 @@ const Gallery = (() => {
         img._thumbTimeout = setTimeout(() => {
             if (img.complete && img.naturalWidth > 0) return; // 实际已加载，无需重试
             img.dispatchEvent(new Event('error'));
-        }, 15000);
+        }, 25000);
     }
 
     // ★ 自愈：缩略图最终生成成功后，把已经显示 "Load failed" 的卡片重新拉一次。
@@ -4091,6 +4108,36 @@ const Gallery = (() => {
         return card;
     }
 
+    // ★ 瀑布流宽高比自校正（存量 0 尺寸/占位数据的兜底）：
+    //   缩略图本来就要加载，onload 时浏览器免费给出 naturalWidth/Height——
+    //   与库中记录缺失或偏差 >5% 时更新数据对象并去抖重排（只影响本次会话，
+    //   后台 backfillImageDimensions 用头部快解析写库后新会话直接命中真实尺寸）。
+    let _aspectFixTimer = null;
+    function scheduleAspectRelayout() {
+        if (_aspectFixTimer) return;
+        _aspectFixTimer = setTimeout(() => {
+            _aspectFixTimer = null;
+            try { render(); } catch (e) { /* 静默 */ }
+        }, 400);
+    }
+    function noteRealAspect(imgData, img) {
+        if (!imgData || !img || !img.naturalWidth || !img.naturalHeight) return;
+        const nw = img.naturalWidth, nh = img.naturalHeight;
+        const w = imgData.width || 0, h = imgData.height || 0;
+        if (!w || !h) {
+            imgData.width = nw;
+            imgData.height = nh;
+            scheduleAspectRelayout();
+            return;
+        }
+        const realRatio = nw / nh;
+        if (Math.abs(w / h - realRatio) / realRatio > 0.05) {
+            imgData.width = nw;
+            imgData.height = nh;
+            scheduleAspectRelayout();
+        }
+    }
+
     function createImageCard(imgData, masonryLayout) {
         const poolKey = _cardPoolKey(imgData, masonryLayout);
         const reused = _cardPoolTake(poolKey, imgData);
@@ -4135,18 +4182,32 @@ const Gallery = (() => {
                 // ★ 人为中止（滚出视窗被 _deferThumbLoad 清空 src）不算加载失败：
                 //   直接返回，不消耗重试次数；滚回来时由调度器重新发起。
                 if (this._deferred) return;
+                // ★ 快速滚动中滚出视窗的错误不进入重试（重试风暴会烧光 5 次配额，
+                //   搜索结果缩略图多为按需生成，排队久时尤其严重）：
+                //   退回"待调度"状态，滚动停止后由 _resumeImageObserver / 滚回来
+                //   进入视窗时重新发起，不消耗 retryCount。
+                const _gr = galleryScroll ? galleryScroll.getBoundingClientRect() : null;
+                const _rr = this.getBoundingClientRect();
+                if (_gr && (_rr.bottom < _gr.top || _rr.top > _gr.bottom)) {
+                    _deferThumbLoad(this);
+                    this.dataset.retryCount = '0';
+                    return;
+                }
                 let retries = parseInt(this.dataset.retryCount) || 0;
-                if (retries < 3) {
+                // ★ 5 次重试 + 退避上限 3s：快速滚动时失败多因请求排队超时（后端生成
+                //   队列拥挤），并非真失败；更多次更温和的重试能把绝大多数卡救回来。
+                if (retries < 5) {
                     retries++;
                     this.dataset.retryCount = retries;
-                    const delay = 500 * retries + Math.random() * 500;
+                    const delay = Math.min(500 * retries, 3000) + Math.random() * 500;
                     const baseUrl = imgData.thumbnailUrl || this.dataset.src || this.src;
                     if (baseUrl) {
-                        setTimeout(() => {
-                            this.src = '';
-                            this.src = baseUrl.replace(/[&?]_r=[^&]*/g, '') + (baseUrl.includes('?') ? '&' : '?') + '_r=' + Math.random().toString(36).slice(2);
-                            armThumbTimeout(this);
-                        }, delay);
+                    setTimeout(() => {
+                        this.src = '';
+                        this.setAttribute('fetchpriority', 'high');
+                        this.src = baseUrl.replace(/[&?]_r=[^&]*/g, '') + (baseUrl.includes('?') ? '&' : '?') + '_r=' + Math.random().toString(36).slice(2);
+                        armThumbTimeout(this);
+                    }, delay);
                     }
                 } else {
                     // 记录原始 display，供自愈时恢复（grid 模式下 img 是 display:block）
@@ -4247,12 +4308,12 @@ const Gallery = (() => {
             img.style.inset = '0';
             img.style.width = '100%';
             img.style.height = '100%';
-            img.style.objectFit = 'cover';
+            img.style.objectFit = 'contain';
 
             // ★ 淡入
             img.style.opacity = '0';
             img.style.transition = 'opacity 0.25s ease';
-            const handlePinterestLoad = () => { img.style.opacity = '1'; };
+            const handlePinterestLoad = () => { img.style.opacity = '1'; noteRealAspect(imgData, img); };
             if (img.complete && img.naturalWidth > 0) {
                 handlePinterestLoad();
             } else {
@@ -4274,12 +4335,12 @@ const Gallery = (() => {
             img.style.inset = '0';
             img.style.width = '100%';
             img.style.height = '100%';
-            img.style.objectFit = 'cover';
+            img.style.objectFit = 'contain';
 
             // ★ 淡入（修复竞态：图片若已从缓存瞬间加载，load 事件不会再触发）
             img.style.opacity = '0';
             img.style.transition = 'opacity 0.25s ease';
-            const handleMasonryLoad = () => { img.style.opacity = '1'; };
+            const handleMasonryLoad = () => { img.style.opacity = '1'; noteRealAspect(imgData, img); };
             if (img.complete && img.naturalWidth > 0) {
                 handleMasonryLoad();
             } else {
@@ -5423,6 +5484,53 @@ const Gallery = (() => {
         loadingIndicator.style.display = show ? 'flex' : 'none';
     }
 
+    // ============ 后台操作状态徽标（图廊工具栏） ============
+    // 让用户知道"导入后磁盘/CPU 忙碌、出图很快"的原因：文件夹扫描/导入、
+    // 自动预生成缩略图。扫描状态来自 scan:start/scan:complete；
+    // 预生成状态来自 GetPreGenStatus（由 thumb:progress 触发查询，运行中自续轮询）。
+    let _bgOpScanning = false;
+    let _bgOpPregenStatus = null;
+    let _bgOpPregenTimer = null;
+    let _bgOpPregenQueryAt = 0;
+
+    function updateBgOpStatus() {
+        if (!bgOpStatusEl) return;
+        const t = (typeof I18n !== 'undefined' ? I18n.t : (s) => s);
+        if (_bgOpScanning) {
+            bgOpStatusEl.textContent = t('status.bgop.scan');
+            bgOpStatusEl.style.display = 'inline-flex';
+            return;
+        }
+        if (_bgOpPregenStatus && (_bgOpPregenStatus.running || _bgOpPregenStatus.autoRunning)) {
+            // 手动预生成用 running/done/total；自动预生成（导入后）用 autoRunning/autoDone/autoTotal
+            const manual = _bgOpPregenStatus.running;
+            const done = manual ? _bgOpPregenStatus.done : _bgOpPregenStatus.autoDone;
+            const total = manual ? _bgOpPregenStatus.total : _bgOpPregenStatus.autoTotal;
+            const rawFolder = manual ? _bgOpPregenStatus.folder : _bgOpPregenStatus.autoFolder;
+            const folderName = (rawFolder || '').split(/[\\/]/).pop();
+            const label = t('status.bgop.pregen').replace('{done}', done || 0).replace('{total}', total || 0);
+            bgOpStatusEl.textContent = folderName ? label + ' · ' + folderName : label;
+            bgOpStatusEl.style.display = 'inline-flex';
+            return;
+        }
+        bgOpStatusEl.style.display = 'none';
+    }
+
+    function pollBgOpPregen() {
+        if (_bgOpPregenTimer) return;
+        if (typeof WailsBridge === 'undefined' || !WailsBridge.isWails()) return;
+        _bgOpPregenTimer = setTimeout(async () => {
+            _bgOpPregenTimer = null;
+            try {
+                _bgOpPregenStatus = await WailsBridge.getPreGenStatus();
+            } catch (e) {
+                _bgOpPregenStatus = null;
+            }
+            updateBgOpStatus();
+            if (_bgOpPregenStatus && (_bgOpPregenStatus.running || _bgOpPregenStatus.autoRunning)) pollBgOpPregen();
+        }, 1000);
+    }
+
     function updateImageCount() {
         const displayImages = isFilteringActive ? filteredImages : images;
         // ★ 只更新数字部分，单位"张图片/images"保留为带 data-i18n 的 <span>（由 i18n.scanDOM 管理），
@@ -5745,8 +5853,39 @@ const Gallery = (() => {
         return [];
     }
 
-    // ==================== 搜索结果显示 ====================
+    // ★ 数据目录热切换后调用（RestartWithNewPaths 成功后）：
+    //   以服务器当前注册列表【整体替换】内存 importedRoots。
+    //   loadImportedRootsFromServer 只做"增量合并"，旧目录的根会残留
+    //   → 表现为切换后导航栏仍显示旧文件夹、新文件夹迟迟不出现
+    async function resyncImportedRootsFromServer() {
+        try {
+            if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails()) {
+                const roots = await WailsBridge.getImportedRoots();
+                const newList = (Array.isArray(roots) ? roots : []).map(r => {
+                    const rootId = r.path || r.Path;
+                    return {
+                        rootId: rootId,
+                        path: rootId,
+                        name: r.name || r.Name || '',
+                        handleName: r.handleName || r.HandleName || '',
+                        displayName: r.displayName || r.DisplayName || r.name || r.Name || '',
+                        folderType: r.folderType || r.FolderType || '',
+                        addedAt: r.addedAt || r.AddedAt || ''
+                    };
+                });
+                importedRoots.length = 0;
+                for (const item of newList) importedRoots.push(item);
+                importedRootsLoaded = true;
+                console.log('[Gallery] 热切换后重同步 importedRoots:', importedRoots.length, '个根');
+                return importedRoots;
+            }
+        } catch (err) {
+            console.warn('[Gallery] 重同步 importedRoots 失败:', err.message);
+        }
+        return null;
+    }
 
+    // ==================== 搜索结果显示 ====================
     /**
      * 生成搜索命中片段 HTML：定位第一个命中词，截取前后 ±40 字符并高亮
      * @param {string} text - 提示词原文
@@ -6025,10 +6164,12 @@ const Gallery = (() => {
         retryFailedThumbs,            // ★ 缩略图补齐后自愈图廊里 "Load failed" 的卡片
         saveImportedRootsToServer,    // ★ 跨浏览器持久化保存
         loadImportedRootsFromServer,  // ★ 跨浏览器持久化恢复
+        resyncImportedRootsFromServer, // ★ 数据目录热切换后：以服务器注册列表整体替换内存列表
         reloadImportedRoot,
         removeImportedRoot,
         renameImportedRoot,
         getImportedRoots,
+        isImportedRootsLoaded: function() { return importedRootsLoaded; },
         addImportedRoot,              // ★ 手动添加 importedRoot 记录
         loadFromServer,
         loadAll,

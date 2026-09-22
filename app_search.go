@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 
 	"local-gallery/internal/database"
 )
@@ -362,58 +365,118 @@ func (a *App) indexImageMetadata(id, path, name string, size, lastModified, crea
 
 // batchIndexImages 批量索引图片元数据（后台调用，不阻塞扫描完成通知）
 // folderType: "ai"=全部索引, "mixed"=仅索引有元数据的文件, "photo"=不调用
+// ★ 并行解析：ParseMetadataFast 是 IO 密集的小读，多 worker 可把整根索引时间
+//   除以核数（顺序读文件头对慢盘也友好）。DB 写入仍走单次 IndexBatch。
+// ★ 完成后失效参数标签缓存并发 index:ready：否则"生成参数"面板一直显示旧聚合，
+//   且索引完成前搜索 Model/Steps 等参数词必然无结果（这就是"要重新索引才搜得到"的根源）。
 func (a *App) batchIndexImages(images map[string]*ImageEntry, folderType string) {
 	if a.imageDB == nil || len(images) == 0 || folderType == "photo" {
 		return
 	}
-	var records []*database.ImageRecord
-	for id, entry := range images {
-		meta := a.ParseMetadataFast(entry.Path)
-		prompt := ""
-		negativePrompt := ""
-		paramsJSON := "{}"
-		rawJSON := "{}"
-		if meta != nil {
-			if p, ok := meta["prompt"].(string); ok {
-				prompt = p
-			}
-			if np, ok := meta["negativePrompt"].(string); ok {
-				negativePrompt = np
-			}
-			if raw, ok := meta["raw"]; ok {
-				if rawBytes, err := json.Marshal(raw); err == nil {
-					rawJSON = string(rawBytes)
-				}
-			}
-			if params, ok := meta["params"]; ok {
-				if paramsBytes, err := json.Marshal(params); err == nil {
-					paramsJSON = string(paramsBytes)
-				}
-			}
-		}
-		// mixed 模式：无元数据则跳过，不写入数据库
-		if folderType == "mixed" && meta == nil {
-			continue
-		}
-		records = append(records, &database.ImageRecord{
-			ID:             id,
-			Path:           entry.Path,
-			Name:           entry.Name,
-			Size:           entry.Size,
-			LastModified:   entry.LastModified,
-			Folder:         entry.Folder,
-			RootPath:       entry.RootPath,
-			Prompt:         prompt,
-			NegativePrompt: negativePrompt,
-			ParamsJSON:     paramsJSON,
-			RawJSON:        rawJSON,
-		})
+	start := time.Now()
+
+	type indexJob struct {
+		id    string
+		entry *ImageEntry
+		meta  map[string]interface{}
 	}
-	indexed, err := a.imageDB.IndexBatch(records)
+	// worker 池：解析与磁盘 IO 并行
+	workers := runtime.NumCPU()
+	if workers > 8 {
+		workers = 8
+	}
+	if workers < 2 {
+		workers = 2
+	}
+	jobs := make(chan indexJob, 256)
+	results := make(chan *database.ImageRecord, 256)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				results <- a.buildIndexRecord(j.id, j.entry, j.meta, folderType)
+			}
+		}()
+	}
+	go func() {
+		for id, entry := range images {
+			jobs <- indexJob{id: id, entry: entry}
+		}
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+
+	var records []*database.ImageRecord
+	for rec := range results {
+		if rec != nil {
+			records = append(records, rec)
+		}
+	}
+
+	n, err := a.imageDB.IndexBatch(records)
 	if err != nil {
 		fmt.Printf("[批量索引] 失败: %v\n", err)
-	} else if indexed > 0 {
-		fmt.Printf("[批量索引] 已索引 %d 张图片元数据\n", indexed)
+	} else if n > 0 {
+		fmt.Printf("[批量索引] 已索引 %d 张图片元数据（解析耗时 %s）\n",
+			n, time.Since(start).Round(time.Millisecond))
+	}
+
+	// ★ 索引落地后：清参数标签缓存（内存+磁盘），让面板下次打开拿到新聚合；
+	//   并发 index:ready 让前端刷新（与启动索引完成共用同一事件）。
+	a.invalidateParamTags()
+	if a.ctx != nil {
+		wailsruntime.EventsEmit(a.ctx, "index:ready", map[string]interface{}{
+			"count": n,
+		})
+	}
+}
+
+// buildIndexRecord 解析单张图片并构造索引记录（无元数据且 mixed 模式 → nil 跳过）
+func (a *App) buildIndexRecord(id string, entry *ImageEntry, meta map[string]interface{}, folderType string) *database.ImageRecord {
+	prompt := ""
+	negativePrompt := ""
+	paramsJSON := "{}"
+	rawJSON := "{}"
+	if meta == nil {
+		meta = a.ParseMetadataFast(entry.Path)
+	}
+	if meta != nil {
+		if p, ok := meta["prompt"].(string); ok {
+			prompt = p
+		}
+		if np, ok := meta["negativePrompt"].(string); ok {
+			negativePrompt = np
+		}
+		if raw, ok := meta["raw"]; ok {
+			if rawBytes, err := json.Marshal(raw); err == nil {
+				rawJSON = string(rawBytes)
+			}
+		}
+		if params, ok := meta["params"]; ok {
+			if paramsBytes, err := json.Marshal(params); err == nil {
+				paramsJSON = string(paramsBytes)
+			}
+		}
+	}
+	// mixed 模式：无元数据则跳过，不写入数据库
+	if folderType == "mixed" && meta == nil {
+		return nil
+	}
+	return &database.ImageRecord{
+		ID:             id,
+		Path:           entry.Path,
+		Name:           entry.Name,
+		Size:           entry.Size,
+		LastModified:   entry.LastModified,
+		Folder:         entry.Folder,
+		RootPath:       entry.RootPath,
+		Prompt:         prompt,
+		NegativePrompt: negativePrompt,
+		ParamsJSON:     paramsJSON,
+		RawJSON:        rawJSON,
 	}
 }
 
@@ -475,83 +538,8 @@ func (a *App) backfillImageMetadata() {
 	}
 }
 
-// repairSearchIndex 修复搜索索引：将内存中有但数据库中缺失的图片元数据补写回 SQLite
-// 在应用启动时异步调用，确保之前扫描的图片也能被搜索到
-//
-// 注意：轻量索引加载后 a.images 仅含 LRU 缓存中的部分图片，此函数不再可靠。
-// 现已改为按根目录 ensureRootLoaded 后再遍历。main.go 已注释调用，保留函数备用。
-func (a *App) repairSearchIndex() {
-	if a.imageDB == nil {
-		return
-	}
-
-	a.mu.RLock()
-	totalRoots := len(a.registeredRoots)
-	rootsCopy := make([]string, 0, totalRoots)
-	for root := range a.registeredRoots {
-		rootsCopy = append(rootsCopy, root)
-	}
-	a.mu.RUnlock()
-
-	if totalRoots == 0 {
-		return
-	}
-
-	// 对每个根目录：ensureRootLoaded 后再检查索引
-	for _, rootPath := range rootsCopy {
-		a.ensureRootLoaded(rootPath)
-	}
-
-	// 快速路径：如果数据库记录数与 image_cache 一致，跳过
-	a.mu.RLock()
-	totalImages := len(a.images)
-	a.mu.RUnlock()
-	if totalImages == 0 {
-		return
-	}
-	if stats := a.imageDB.GetStats(); stats != nil {
-		if dbCount, ok := stats["totalImages"].(int); ok && dbCount >= totalImages {
-			fmt.Printf("[索引修复] 搜索索引完整（DB: %d, 内存: %d），跳过检查\n", dbCount, totalImages)
-			return
-		}
-	}
-
-	existingIDs, err := a.imageDB.GetExistingIDs()
-	if err != nil {
-		fmt.Printf("[索引修复] 获取已有 ID 失败: %v\n", err)
-		return
-	}
-
-	a.mu.RLock()
-	var toIndex []*ImageEntry
-	for id, entry := range a.images {
-		if !existingIDs[id] {
-			if ft, ok := a.folderTypes[entry.RootPath]; ok && ft == "photo" {
-				continue
-			}
-			toIndex = append(toIndex, entry)
-		}
-	}
-	a.mu.RUnlock()
-
-	if len(toIndex) == 0 {
-		fmt.Printf("[索引修复] 搜索索引完整，%d 张图片全部已索引\n", totalImages)
-		return
-	}
-
-	fmt.Printf("[索引修复] 发现 %d 张图片缺失搜索索引（共 %d 张），开始后台补建...\n", len(toIndex), totalImages)
-
-	indexed := 0
-	for _, entry := range toIndex {
-		a.indexImageMetadata(entry.ID, entry.Path, entry.Name, entry.Size, entry.LastModified, entry.CreatedAt, entry.Folder, entry.RootPath)
-		indexed++
-		if indexed%500 == 0 {
-			fmt.Printf("[索引修复] 进度: %d / %d\n", indexed, len(toIndex))
-		}
-	}
-
-	fmt.Printf("[索引修复] 完成！已补建 %d 张图片的搜索索引\n", indexed)
-}
+// repairSearchIndex 已随 M2/M3 重构移除：搜索索引（FTS）现直接挂在 image_cache 上
+// 自动同步，扫描写入即完成索引，无需额外的"内存 → SQLite"修复路径。
 
 // IndexRootInfo 单个根目录的索引状态
 type IndexRootInfo struct {
@@ -563,24 +551,35 @@ type IndexRootInfo struct {
 }
 
 // GetFolderIndexStatus 返回所有已注册根目录的索引状态
+// ★ M3：total 改为 folders 表子树计数（嵌套根由 dbSubtreeCount 归属到父根）。
 func (a *App) GetFolderIndexStatus() []IndexRootInfo {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-
 	if a.imageDB == nil {
 		return nil
 	}
 
-	var result []IndexRootInfo
+	a.mu.RLock()
+	roots := make([]string, 0, len(a.registeredRoots))
 	for rootPath := range a.registeredRoots {
+		roots = append(roots, rootPath)
+	}
+	a.mu.RUnlock()
+
+	var result []IndexRootInfo
+	for _, rootPath := range roots {
 		rootNorm := strings.ReplaceAll(rootPath, "\\", "/")
-		total := a.folderCount[rootNorm]
+		total := a.dbSubtreeCount(rootNorm)
+		if total < 0 {
+			total = 0
+		}
 		indexed := a.imageDB.CountByRoot(rootPath)
 		if indexed == 0 {
 			// ★ 嵌套虚拟根：图片记在外层父根目录名下，按 root_path 精确匹配恒为 0。
 			//   它的内容由父根目录的索引覆盖 → 用父根的已索引数判断是否完成，
 			//   否则索引图标永远停在"未完成"。
-			if parent := a.owningRootLockedNorm(strings.ToLower(rootNorm)); parent != "" {
+			a.mu.RLock()
+			parent := a.owningRootLockedNorm(strings.ToLower(rootNorm))
+			a.mu.RUnlock()
+			if parent != "" {
 				indexed = a.imageDB.CountByRoot(parent)
 			}
 		}

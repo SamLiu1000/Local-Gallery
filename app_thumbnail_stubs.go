@@ -4,7 +4,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -23,6 +26,10 @@ func (a *App) SetThumbConcurrency(n int) map[string]interface{} {
 
 func (a *App) GetThumbConcurrency() int { return int(thumbSemSize) }
 
+func (a *App) GetThumbConcurrencyInfo() map[string]interface{} {
+	return map[string]interface{}{"concurrency": a.GetThumbConcurrency(), "defaultConcurrency": 2}
+}
+
 func (a *App) SetThumbKernel(kernel string) map[string]interface{} {
 	return map[string]interface{}{"success": true, "thumbKernel": kernel}
 }
@@ -30,6 +37,30 @@ func (a *App) SetThumbKernel(kernel string) map[string]interface{} {
 func (a *App) GetThumbKernel() string { return "lanczos3" }
 
 func (a *App) loadThumbSettings() {}
+
+// 全局设置读写（与 app_thumbnail.go 中实现一致，供 LAN 配置等使用）
+func getGlobalSettingsPath() string {
+	execDir, _ := os.Getwd()
+	return filepath.Join(execDir, ".gallery-settings.json")
+}
+
+func readGlobalSettings() map[string]interface{} {
+	data := make(map[string]interface{})
+	bytes, err := os.ReadFile(getGlobalSettingsPath())
+	if err != nil {
+		return data
+	}
+	json.Unmarshal(bytes, &data)
+	return data
+}
+
+func writeGlobalSettings(data map[string]interface{}) error {
+	bytes, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(getGlobalSettingsPath(), bytes, 0644)
+}
 
 func (a *App) getThumbDir() string { return "" }
 

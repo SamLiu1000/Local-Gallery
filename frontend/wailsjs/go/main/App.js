@@ -150,6 +150,10 @@ export function GetImportedRoots() {
   return window['go']['main']['App']['GetImportedRoots']();
 }
 
+export function GetLANConfig() {
+  return window['go']['main']['App']['GetLANConfig']();
+}
+
 export function GetLANInfo() {
   return window['go']['main']['App']['GetLANInfo']();
 }
@@ -184,6 +188,10 @@ export function GetThumbCacheInfo() {
 
 export function GetThumbConcurrency() {
   return window['go']['main']['App']['GetThumbConcurrency']();
+}
+
+export function GetThumbConcurrencyInfo() {
+  return window['go']['main']['App']['GetThumbConcurrencyInfo']();
 }
 
 export function GetThumbDir() {
@@ -352,6 +360,10 @@ export function SetContext(arg1) {
 
 export function SetFavorite(arg1, arg2) {
   return window['go']['main']['App']['SetFavorite'](arg1, arg2);
+}
+
+export function SetLANConfig(arg1, arg2) {
+  return window['go']['main']['App']['SetLANConfig'](arg1, arg2);
 }
 
 export function SetSidebarSetting(arg1, arg2) {

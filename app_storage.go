@@ -1,7 +1,6 @@
 package main
 
 import (
-	"container/list"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -14,6 +13,9 @@ import (
 )
 
 // ==================== 持久化操作 ====================
+// ★ 改造（M2/M3）：磁盘扫描 → SQLite；所有 UI 读取纯 SQL。
+//   原内存索引（a.images / folderIndex / folderCount / LRU）已删除，
+//   图片索引与文件夹计数全部以 image_cache / folders 表为唯一真相源。
 
 func (a *App) loadUserData() {
 	fmt.Printf("[加载] 从 %s 加载用户数据\n", a.userDataFile)
@@ -99,67 +101,7 @@ func (a *App) loadUserData() {
 	fmt.Printf("[删除诊断] 启动时 registeredRoots=%v\n", rootList)
 }
 
-func (a *App) loadImageIndex() {
-	if a.imageDB == nil {
-		return
-	}
-	entries, err := a.imageDB.LoadAllImageCache()
-	if err != nil {
-		fmt.Printf("[缓存] 从 SQLite 加载图片索引失败: %v\n", err)
-		return
-	}
-	if len(entries) == 0 {
-		fmt.Printf("[缓存] 图片索引缓存为空，等待扫描填充\n")
-		return
-	}
-	a.mu.Lock()
-	a.images = make(map[string]*ImageEntry, len(entries))
-	a.folderIndex = make(map[string][]string)
-	a.folderCount = make(map[string]int)
-	for _, e := range entries {
-		rootNorm := strings.ReplaceAll(e.RootPath, "\\", "/")
-		// 修复：如果 Folder 是完整路径，需要转换为相对路径
-		folderRel := e.Folder
-		if folderRel != "" {
-			folderNorm := strings.ReplaceAll(folderRel, "\\", "/")
-			// 如果 Folder 以 rootNorm 开头，说明是完整路径，需要截取相对部分
-			if strings.HasPrefix(folderNorm, rootNorm+"/") {
-				folderRel = folderNorm[len(rootNorm)+1:]
-			} else if folderNorm == rootNorm {
-				folderRel = ""
-			}
-		}
-		a.images[e.ID] = &ImageEntry{
-			ID: e.ID, Path: e.Path, Name: e.Name, Size: e.Size,
-			LastModified: e.LastModified, CreatedAt: e.CreatedAt,
-			Folder: folderRel, RootPath: e.RootPath,
-			Width: e.Width, Height: e.Height, IsVideo: e.IsVideo,
-			URL: fmt.Sprintf("/image/%s", e.ID),
-		}
-		fk := rootNorm
-		if folderRel != "" {
-			fk = rootNorm + "/" + folderRel
-		}
-		a.folderIndex[fk] = append(a.folderIndex[fk], e.ID)
-		// 统计根目录和子文件夹的数量
-		a.folderCount[rootNorm]++
-		if fk != rootNorm {
-			a.folderCount[fk]++
-		}
-	}
-	a.mu.Unlock()
-	a.rebuildFolderCounts()
-	// 自修复：检测并修复重复路径的 folderIndex 键（如 "K:/bid/K:\bid\..."）
-	a.fixDuplicatePathKeys()
-	fmt.Printf("[缓存] 已从 SQLite 加载图片索引: %d 张图片，%d 个文件夹\n", len(entries), len(a.folderIndex))
-}
-
-// ==================== 轻量索引 + LRU 按需加载 ====================
-
-const (
-	maxLoadedFolders = 32    // LRU 容量：按文件夹数
-	maxLoadedImages  = 50000 // LRU 硬上限：防单文件夹巨量
-)
+// ==================== 条目/键的工具函数 ====================
 
 // normalizeFolderRel 将 image_cache.Folder 字段规范化为相对 root 的子路径。
 // 处理两种历史格式：完整路径（以 root 开头）和相对路径。
@@ -177,14 +119,12 @@ func normalizeFolderRel(folder, rootNorm string) string {
 	return folderNorm
 }
 
-// toImageEntry 将 ImageCacheEntry 转为 ImageEntry（复用 loadImageIndex 内的构造）。
+// toImageEntry 将 ImageCacheEntry 转为 ImageEntry。
 func toImageEntry(e database.ImageCacheEntry) *ImageEntry {
-	rootNorm := strings.ReplaceAll(e.RootPath, "\\", "/")
-	folderRel := normalizeFolderRel(e.Folder, rootNorm)
 	return &ImageEntry{
 		ID: e.ID, Path: e.Path, Name: e.Name, Size: e.Size,
 		LastModified: e.LastModified, CreatedAt: e.CreatedAt,
-		Folder: folderRel, RootPath: e.RootPath,
+		Folder: e.Folder, RootPath: e.RootPath,
 		Width: e.Width, Height: e.Height, IsVideo: e.IsVideo,
 		URL: fmt.Sprintf("/image/%s", e.ID),
 	}
@@ -215,455 +155,48 @@ func (a *App) splitFolderKey(folderKey string) (rootPath, folderRel string) {
 	return folderKey, ""
 }
 
-// loadFolderIndexLight 仅加载文件夹列表与计数，不读图片详情。启动时用，替代 loadImageIndex。
-func (a *App) loadFolderIndexLight() {
+// dbSubtreeCount 查询某目录（含子树）在 folders 表中的图片总数。
+// ★ 嵌套虚拟根的图片记在外层父根名下：优先用"最长严格前缀"的已注册父根查询，
+//   与旧 rootSubtreeCount（folderCount 前缀求和）语义一致。
+// ★ folders 表的 root_path 存的是注册时的原始路径（Windows 上为反斜杠），
+//   查询必须用注册根的原始形式，不能用正斜杠规范化形式（否则永远查不到 → 计数恒 0）。
+// 返回 -1 表示该路径未被任何已注册根目录覆盖（或根本身无 folders 行）。
+func (a *App) dbSubtreeCount(folderKey string) int {
 	if a.imageDB == nil {
-		return
+		return -1
 	}
-	// ★ 冷启动优化：优先读取上次保存的轻量索引快照（小 JSON，毫秒级），
-	//   避免对 4.5GB 的 images.db 做 GROUP BY 全量统计（冷缓存下实测 2-10s）。
-	//   快照在每次扫描/刷新后由 rebuildFolderCountsFromSQL 同步更新。
-	// ★ 但快照可能过期：若导入/重扫没写完就重启（或 saveFolderIndexLight 写失败），
-	//   快照是旧数据，新导入的根不在里面 → 重启后该文件夹 count 显示 0。
-	//   因此必须验证快照覆盖了所有已注册根：缺任一根 → 视为过期，回退 SQL 重查。
-	if entries, ok := a.loadFolderIndexLightCache(); ok && a.folderIndexLightCoversAllRoots(entries) {
-		a.populateFolderIndexFromEntries(entries)
-		fmt.Printf("[缓存] 轻量索引从快照就绪: %d 个文件夹\n", len(a.folderIndex))
-		return
-	} else if ok {
-		fmt.Printf("[缓存] 轻量索引快照过期（未覆盖全部已注册根），回退 SQL 重建\n")
-	}
-	entries, err := a.imageDB.LoadFolderIndexLight()
-	if err != nil {
-		fmt.Printf("[缓存] 轻量索引加载失败 %v，回退全量\n", err)
-		a.loadImageIndex()
-		return
-	}
-	if len(entries) == 0 {
-		fmt.Printf("[缓存] 轻量索引为空，等待扫描填充\n")
-		return
-	}
-	a.populateFolderIndexFromEntries(entries)
-	a.saveFolderIndexLight(entries) // ★ 写快照，供下次冷启动直接读取
-	fmt.Printf("[缓存] 轻量索引就绪: %d 个文件夹\n", len(a.folderIndex))
-}
-
-// folderIndexLightCoversAllRoots 检查轻量索引快照是否覆盖所有已注册根目录。
-// 若某个已注册根不在快照里，说明快照是"导入/扫描完成前"保存的过期数据——此时
-// image_cache 里该根可能已有新图片（只是快照没更新），若直接用旧快照会把它的
-// count 显示成 0。返回 false 则调用方应回退 SQL 重查并重写快照。
-func (a *App) folderIndexLightCoversAllRoots(entries []database.ImageCacheEntry) bool {
+	normalized := strings.ReplaceAll(folderKey, "\\", "/")
+	// 找到覆盖该路径的已注册根：嵌套根用最长严格前缀父根；普通根要求精确匹配。
+	// exactRoot/bestRoot 保存注册时的原始路径形式，与 folders 表写入格式一致。
 	a.mu.RLock()
-	defer a.mu.RUnlock()
-	if len(a.registeredRoots) == 0 {
-		return true
-	}
-	covered := make(map[string]bool, len(entries))
-	for _, e := range entries {
-		covered[strings.ToLower(strings.ReplaceAll(e.RootPath, "\\", "/"))] = true
-	}
+	var bestRoot, bestRootNorm, exactRoot string
 	for root := range a.registeredRoots {
-		norm := strings.ToLower(strings.ReplaceAll(root, "\\", "/"))
-		if norm != "" && !covered[norm] {
-			return false
-		}
-	}
-	return true
-}
-
-// populateFolderIndexFromEntries 用 LoadFolderIndexLight 返回的条目重建轻量索引结构：
-// folderIndex（key→nil，"未加载"占位）、folderCount（根/子目录累加计数）。
-func (a *App) populateFolderIndexFromEntries(entries []database.ImageCacheEntry) {
-	a.mu.Lock()
-	a.images = make(map[string]*ImageEntry)   // 启动时空
-	a.folderIndex = make(map[string][]string) // key 存在，value=nil 标记"未加载"
-	a.folderLoaded = make(map[string]bool)
-	a.folderCount = make(map[string]int)
-	if a.folderLRU == nil {
-		a.folderLRU = list.New()
-	}
-	if a.lruNodes == nil {
-		a.lruNodes = make(map[string]*list.Element)
-	}
-	a.folderLRU.Init()
-	a.lruNodes = make(map[string]*list.Element)
-	for _, e := range entries {
-		rootNorm := strings.ReplaceAll(e.RootPath, "\\", "/")
-		folderRel := normalizeFolderRel(e.Folder, rootNorm)
-		fk := rootNorm
-		if folderRel != "" {
-			fk = rootNorm + "/" + folderRel
-		}
-		a.folderIndex[fk] = nil // 标记未加载
-		count := int(e.Size)
-		a.folderCount[rootNorm] += count
-		if folderRel != "" {
-			parts := strings.Split(folderRel, "/")
-			for i := 1; i <= len(parts); i++ {
-				sub := rootNorm + "/" + strings.Join(parts[:i], "/")
-				a.folderCount[sub] += count
-			}
-		}
-	}
-	a.mu.Unlock()
-	a.fixDuplicatePathKeys()
-}
-
-// 轻量索引快照缓存：启动时用本地 JSON 替代 SQLite 的 GROUP BY 全量统计。
-// 数据即 LoadFolderIndexLight() 返回的 (root_path, folder, count) 三元组列表。
-const folderIndexLightFileName = "folder-index-light.json"
-
-type folderIndexLightEntry struct {
-	RootPath string `json:"root_path"`
-	Folder   string `json:"folder"`
-	Count    int    `json:"count"`
-}
-
-// loadFolderIndexLightCache 尝试读取上次保存的轻量索引快照。
-// ok=false 表示无缓存/损坏/为空，调用方应回退到 SQL 查询。
-func (a *App) loadFolderIndexLightCache() ([]database.ImageCacheEntry, bool) {
-	if a.userDataDir == "" {
-		return nil, false
-	}
-	path := filepath.Join(a.userDataDir, folderIndexLightFileName)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, false
-	}
-	var list []folderIndexLightEntry
-	if err := json.Unmarshal(data, &list); err != nil || len(list) == 0 {
-		return nil, false
-	}
-	entries := make([]database.ImageCacheEntry, 0, len(list))
-	for _, it := range list {
-		entries = append(entries, database.ImageCacheEntry{RootPath: it.RootPath, Folder: it.Folder, Size: int64(it.Count)})
-	}
-	return entries, true
-}
-
-// saveFolderIndexLight 原子写入轻量索引快照（临时文件+改名），避免半截 JSON。
-func (a *App) saveFolderIndexLight(entries []database.ImageCacheEntry) {
-	if a.userDataDir == "" {
-		return
-	}
-	list := make([]folderIndexLightEntry, 0, len(entries))
-	for _, e := range entries {
-		list = append(list, folderIndexLightEntry{RootPath: e.RootPath, Folder: e.Folder, Count: int(e.Size)})
-	}
-	data, err := json.MarshalIndent(list, "", "  ")
-	if err != nil {
-		return
-	}
-	path := filepath.Join(a.userDataDir, folderIndexLightFileName)
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
-		return
-	}
-	_ = os.Rename(tmp, path)
-}
-
-// rebuildFolderCountsFromSQL 从 SQL 重建 folderCount，覆盖所有根目录。
-// 用于扫描后或增量刷新后准确地刷新计数（a.images 是部分 LRU，不可信）。
-// ★ 调用方【不要】再持 a.mu：原来这个函数要求持写锁，于是在写锁内跑
-//   image_cache 全表 GROUP BY（百万行，实测数秒）并写快照文件，
-//   期间所有 GetFolders/GetImages 全部阻塞 —— 表现为"删除/扫描后点别的文件夹不出图"。
-//   现在改成：无锁查询+计算 → 短暂持锁换入 → 无锁写快照。
-func (a *App) rebuildFolderCountsFromSQL() {
-	if a.imageDB == nil {
-		return
-	}
-	entries, err := a.imageDB.LoadFolderIndexLight()
-	if err != nil {
-		fmt.Printf("[计数] 从 SQL 重建 folderCount 失败: %v\n", err)
-		return
-	}
-	counts := make(map[string]int)
-	for _, e := range entries {
-		rootNorm := strings.ReplaceAll(e.RootPath, "\\", "/")
-		folderRel := normalizeFolderRel(e.Folder, rootNorm)
-		count := int(e.Size)
-		counts[rootNorm] += count
-		if folderRel != "" {
-			parts := strings.Split(folderRel, "/")
-			for i := 1; i <= len(parts); i++ {
-				sub := rootNorm + "/" + strings.Join(parts[:i], "/")
-				counts[sub] += count
-			}
-		}
-	}
-	a.mu.Lock()
-	a.folderCount = counts
-	a.mu.Unlock()
-	// ★ 同步更新轻量索引快照，让下次冷启动读到最新统计，避免快照过期。
-	a.saveFolderIndexLight(entries)
-	fmt.Printf("[计数] rebuildFolderCountsFromSQL 完成: 共 %d 个 folderCount 键\n", len(counts))
-}
-
-// ensureFolderLoaded 同步加载某 folderKey 进缓存；带 double-check + LRU 淘汰。
-func (a *App) ensureFolderLoaded(folderKey string) {
-	a.mu.RLock()
-	if a.folderLoaded[folderKey] {
-		a.touchFolderLocked(folderKey)
-		a.mu.RUnlock()
-		return
-	}
-	a.mu.RUnlock()
-
-	root, folderRel := a.splitFolderKey(folderKey)
-	entries, err := a.imageDB.LoadImageCacheByFolder(root, folderRel)
-	if err != nil || len(entries) == 0 {
-		// 即使无图片也标记 loaded，避免重复查询空文件夹
-		a.mu.Lock()
-		defer a.mu.Unlock()
-		if a.folderLoaded[folderKey] {
-			return
-		}
-		a.folderLoaded[folderKey] = true
-		if a.folderIndex[folderKey] == nil {
-			a.folderIndex[folderKey] = []string{}
-		}
-		a.lruNodes[folderKey] = a.folderLRU.PushBack(folderKey)
-		a.evictLRU()
-		return
-	}
-
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.folderLoaded[folderKey] { // double-check
-		return
-	}
-	if a.folderIndex[folderKey] == nil {
-		a.folderIndex[folderKey] = make([]string, 0, len(entries))
-	}
-	for _, e := range entries {
-		entry := toImageEntry(e)
-		a.images[e.ID] = entry
-		a.folderIndex[folderKey] = append(a.folderIndex[folderKey], e.ID)
-	}
-	a.folderLoaded[folderKey] = true
-	a.lruNodes[folderKey] = a.folderLRU.PushBack(folderKey)
-	a.evictLRU()
-}
-
-// ensureRootLoaded 加载整个根目录所有子文件夹（全量遍历回退用）。
-func (a *App) ensureRootLoaded(rootPath string) {
-	rootNorm := strings.ReplaceAll(rootPath, "\\", "/")
-	// 先检查是否所有子 folderKey 都已 loaded
-	a.mu.RLock()
-	allLoaded := true
-	for folderKey := range a.folderIndex {
-		if folderKey == rootNorm || strings.HasPrefix(folderKey, rootNorm+"/") {
-			if !a.folderLoaded[folderKey] {
-				allLoaded = false
-				break
-			}
-		}
-	}
-	a.mu.RUnlock()
-	if allLoaded {
-		return
-	}
-
-	// ★ 按路径前缀取：嵌套虚拟根的记录 root_path 记在外层父根名下，按 root_path
-	//   精确匹配查不到 → 它的文件夹用不上缓存，每次都要重新扫盘。
-	entries, err := a.imageDB.LoadImageCacheByPathPrefix(rootPath)
-	if err != nil {
-		return
-	}
-	// 按 folderKey 分组
-	grouped := make(map[string][]database.ImageCacheEntry)
-	for _, e := range entries {
-		rootN := strings.ReplaceAll(e.RootPath, "\\", "/")
-		folderRel := normalizeFolderRel(e.Folder, rootN)
-		fk := rootN
-		if folderRel != "" {
-			fk = rootN + "/" + folderRel
-		}
-		grouped[fk] = append(grouped[fk], e)
-	}
-
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	for fk, groupEntries := range grouped {
-		if a.folderLoaded[fk] {
+		rn := strings.ReplaceAll(root, "\\", "/")
+		if rn == normalized {
+			exactRoot = root
 			continue
 		}
-		if a.folderIndex[fk] == nil {
-			a.folderIndex[fk] = make([]string, 0, len(groupEntries))
-		}
-		for _, e := range groupEntries {
-			entry := toImageEntry(e)
-			a.images[e.ID] = entry
-			a.folderIndex[fk] = append(a.folderIndex[fk], e.ID)
-		}
-		a.folderLoaded[fk] = true
-		a.lruNodes[fk] = a.folderLRU.PushBack(fk)
-	}
-	a.evictLRU()
-}
-
-// touchFolderLocked 更新 LRU 顺序（命中时调用，需持锁）。
-func (a *App) touchFolderLocked(folderKey string) {
-	if elem, ok := a.lruNodes[folderKey]; ok {
-		a.folderLRU.MoveToBack(elem)
-	}
-}
-
-// countLoadedImagesLocked 统计当前已加载的图片总数（需持锁）。
-func (a *App) countLoadedImagesLocked() int {
-	count := 0
-	for _, ids := range a.folderIndex {
-		if len(ids) > 0 {
-			count += len(ids)
-		}
-	}
-	return count
-}
-
-// evictLRU 淘汰最久未用的文件夹（需持写锁）。
-func (a *App) evictLRU() {
-	for len(a.folderLoaded) > maxLoadedFolders || a.countLoadedImagesLocked() > maxLoadedImages {
-		elem := a.folderLRU.Front()
-		if elem == nil {
-			return
-		}
-		oldKey := elem.Value.(string)
-		a.folderLRU.Remove(elem)
-		delete(a.lruNodes, oldKey)
-		for _, id := range a.folderIndex[oldKey] {
-			delete(a.images, id)
-		}
-		a.folderIndex[oldKey] = nil // 保留 key 标记"未加载"
-		delete(a.folderLoaded, oldKey)
-	}
-}
-
-// invalidateFolder 使某 folderKey 失效（扫描刷新时调用）。
-func (a *App) invalidateFolder(folderKey string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if !a.folderLoaded[folderKey] {
-		return
-	}
-	for _, id := range a.folderIndex[folderKey] {
-		delete(a.images, id)
-	}
-	a.folderIndex[folderKey] = nil
-	delete(a.folderLoaded, folderKey)
-	if elem, ok := a.lruNodes[folderKey]; ok {
-		a.folderLRU.Remove(elem)
-		delete(a.lruNodes, folderKey)
-	}
-}
-
-// invalidateAllFolders 清空所有 LRU 缓存（scanAllFolders 原子替换前调用）。
-func (a *App) invalidateAllFolders() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.images = make(map[string]*ImageEntry)
-	a.folderLoaded = make(map[string]bool)
-	if a.folderLRU == nil {
-		a.folderLRU = list.New()
-	} else {
-		a.folderLRU.Init()
-	}
-	a.lruNodes = make(map[string]*list.Element)
-}
-
-// markFolderLoadedLocked 标记某 folderKey 已加载（扫描写入后调用，需持写锁）。
-// 同时更新 LRU。
-func (a *App) markFolderLoadedLocked(folderKey string, ids []string) {
-	if a.folderIndex[folderKey] == nil {
-		a.folderIndex[folderKey] = ids
-	} else {
-		// 已有 ID 列表，合并去重
-		existing := make(map[string]bool, len(a.folderIndex[folderKey]))
-		for _, id := range a.folderIndex[folderKey] {
-			existing[id] = true
-		}
-		for _, id := range ids {
-			if !existing[id] {
-				a.folderIndex[folderKey] = append(a.folderIndex[folderKey], id)
-				existing[id] = true
-			}
-		}
-	}
-	if !a.folderLoaded[folderKey] {
-		a.folderLoaded[folderKey] = true
-		a.lruNodes[folderKey] = a.folderLRU.PushBack(folderKey)
-		a.evictLRU()
-	} else {
-		a.touchFolderLocked(folderKey)
-	}
-}
-
-func (a *App) saveImageIndex() {
-	if a.imageDB != nil {
-		go a.saveImageIndexToSQLite()
-	}
-}
-
-func (a *App) saveImageIndexForRoot(rootPath string) {
-	if a.imageDB == nil {
-		return
-	}
-	normalized := strings.ReplaceAll(rootPath, "\\", "/")
-	// ★ sync: update image_cache before scan:complete
-	a.saveImageIndexByRoot(normalized)
-}
-
-func (a *App) saveImageIndexByRoot(rootPath string) {
-	a.mu.RLock()
-	// ★ 修复：从权威的内存 a.images 直接按 RootPath 收集，而不是经 folderIndex。
-	//   重启后 loadFolderIndexLight 会把 folderIndex 的值设为 nil（"未加载"标记），
-	//   旧逻辑收集不到任何 ID → SaveImageCacheByRoot 的 DELETE-then-replace 会把
-	//   image_cache 里已落盘的图片删光再只写回残缺子集 → 计数对不上总数。
-	//   扫描/增量刷新都会先把该根目录全部文件放进 a.images 再落库，因此这里
-	//   收集到的就是该根目录的完整数据。
-	normalizedRoot := strings.ReplaceAll(rootPath, "\\", "/")
-	entries := make([]database.ImageCacheEntry, 0, 256)
-	for _, img := range a.images {
-		if strings.ReplaceAll(img.RootPath, "\\", "/") == normalizedRoot {
-			entries = append(entries, database.ImageCacheEntry{
-				ID: img.ID, Path: img.Path, Name: img.Name, Size: img.Size,
-				LastModified: img.LastModified, CreatedAt: img.CreatedAt,
-				Folder: img.Folder, RootPath: img.RootPath,
-				Width: img.Width, Height: img.Height, IsVideo: img.IsVideo, ContentHash: img.ContentHash,
-			})
+		if strings.HasPrefix(normalized, rn+"/") && len(rn) > len(bestRootNorm) {
+			bestRoot = root
+			bestRootNorm = rn
 		}
 	}
 	a.mu.RUnlock()
-	if len(entries) == 0 {
-		fmt.Printf("[增量存储] %s: 无图片数据，跳过（不清空现有缓存）\n", rootPath)
-		return
-	}
-	if err := a.imageDB.SaveImageCacheByRoot(rootPath, entries); err != nil {
-		fmt.Printf("[增量存储] %s: 写入失败: %v\n", rootPath, err)
-	} else {
-		fmt.Printf("[增量存储] %s: 已保存 %d 张图片\n", rootPath, len(entries))
-	}
-}
-
-func (a *App) saveImageIndexToSQLite() {
-	a.mu.RLock()
-	const batchSize = 2000
-	entries := make([]database.ImageCacheEntry, 0, batchSize)
-	for _, img := range a.images {
-		entries = append(entries, database.ImageCacheEntry{
-			ID: img.ID, Path: img.Path, Name: img.Name, Size: img.Size,
-			LastModified: img.LastModified, CreatedAt: img.CreatedAt,
-			Folder: img.Folder, RootPath: img.RootPath,
-			Width: img.Width, Height: img.Height, IsVideo: img.IsVideo, ContentHash: img.ContentHash,
-		})
-		if len(entries) >= batchSize {
-			a.imageDB.SaveImageCacheBatch(entries)
-			entries = entries[:0]
+	if bestRoot != "" {
+		rel := normalized[len(bestRootNorm)+1:]
+		if n := a.imageDB.GetFolderSubtreeCount(bestRoot, rel); n >= 0 {
+			return n
 		}
+		return 0 // 已被根覆盖但尚无文件夹行（未扫描）→ 计 0
 	}
-	a.mu.RUnlock()
-	if len(entries) > 0 {
-		a.imageDB.SaveImageCacheBatch(entries)
+	// 本身是已注册根：查根行（folder=""）
+	if exactRoot == "" {
+		return -1
 	}
+	if n := a.imageDB.GetFolderSubtreeCount(exactRoot, ""); n >= 0 {
+		return n
+	}
+	return 0
 }
 
 func (a *App) saveRegisteredRoots() {
@@ -1009,72 +542,4 @@ func (a *App) OpenReverseLog() error {
 		os.WriteFile(logFile, []byte{}, 0644)
 	}
 	return exec.Command("explorer", "/select,", logFile).Start()
-}
-
-// fixDuplicatePathKeys 修复 folderIndex 中重复路径的键（如 "K:/bid/K:\bid\..."）
-func (a *App) fixDuplicatePathKeys() {
-	fixedCount := 0
-	newIndex := make(map[string][]string)
-
-	for folderKey, ids := range a.folderIndex {
-		// 规范化键：统一使用正斜杠
-		normalizedKey := strings.ReplaceAll(folderKey, "\\", "/")
-
-		// 检测并修复重复路径模式（如 "K:/bid/K:/bid/..."）
-		// 方法：找到驱动器号+第一个路径部分，如果整个键以这个模式开头两次，则删除重复
-		parts := strings.Split(normalizedKey, "/")
-		if len(parts) >= 4 {
-			// 检查是否有驱动器号 + 路径部分被重复
-			// 例如 ["K:", "bid", "K:", "bid", "ATKArchives"]
-			// 找到第二次出现驱动器号的位置
-			firstDrive := parts[0] // e.g., "K:"
-			var secondDriveIdx = -1
-			for i := 1; i < len(parts)-1; i++ {
-				if parts[i] == firstDrive && i+1 < len(parts) && parts[i+1] == parts[1] {
-					secondDriveIdx = i
-					break
-				}
-			}
-			if secondDriveIdx > 0 {
-				// 找到重复，删除从开头到重复开始的所有部分
-				correctedKey := strings.Join(parts[secondDriveIdx:], "/")
-				fixedCount++
-				fmt.Printf("[自修复] folderIndex: %q -> %q\n", folderKey, correctedKey)
-				normalizedKey = correctedKey
-			}
-		}
-
-		newIndex[normalizedKey] = append(newIndex[normalizedKey], ids...)
-	}
-
-	if fixedCount > 0 {
-		a.mu.Lock()
-		a.folderIndex = newIndex
-
-		// 同时修复 folderCount 中的重复路径键
-		newFolderCount := make(map[string]int)
-		for folderKey, count := range a.folderCount {
-			normalizedKey := strings.ReplaceAll(folderKey, "\\", "/")
-			parts := strings.Split(normalizedKey, "/")
-			if len(parts) >= 4 {
-				firstDrive := parts[0]
-				var secondDriveIdx = -1
-				for i := 1; i < len(parts)-1; i++ {
-					if parts[i] == firstDrive && i+1 < len(parts) && parts[i+1] == parts[1] {
-						secondDriveIdx = i
-						break
-					}
-				}
-				if secondDriveIdx > 0 {
-					correctedKey := strings.Join(parts[secondDriveIdx:], "/")
-					normalizedKey = correctedKey
-				}
-			}
-			newFolderCount[normalizedKey] = count
-		}
-		a.folderCount = newFolderCount
-
-		a.mu.Unlock()
-		fmt.Printf("[自修复] 已修复 %d 个重复路径的 folderIndex 键，并同步修复 folderCount\n", fixedCount)
-	}
 }

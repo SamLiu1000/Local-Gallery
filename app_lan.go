@@ -200,6 +200,44 @@ func (a *App) StartLANServer(port int) map[string]interface{} {
 	return a.GetLANInfo()
 }
 
+// SetLANConfig 保存 LAN 自动启动开关与端口到全局设置文件，供下次启动时自动恢复。
+func (a *App) SetLANConfig(autoStart bool, port int) map[string]interface{} {
+	if port < 1 || port > 65535 {
+		port = 25876
+	}
+	settings := readGlobalSettings()
+	settings["lanAutoStart"] = autoStart
+	settings["lanPort"] = port
+	if err := writeGlobalSettings(settings); err != nil {
+		return map[string]interface{}{"success": false, "error": err.Error()}
+	}
+	return map[string]interface{}{"success": true}
+}
+
+// GetLANConfig 读取 LAN 自动启动开关与端口设置。
+func (a *App) GetLANConfig() map[string]interface{} {
+	port := 25876
+	autoStart := false
+	settings := readGlobalSettings()
+	if p, ok := settings["lanPort"].(float64); ok && p >= 1 && p <= 65535 {
+		port = int(p)
+	}
+	if v, ok := settings["lanAutoStart"].(bool); ok {
+		autoStart = v
+	}
+	return map[string]interface{}{"autoStart": autoStart, "port": port}
+}
+
+// loadLANSettings 启动时恢复 LAN 设置：勾选了"开机自动启动"则直接开启局域网服务。
+func (a *App) loadLANSettings() {
+	cfg := a.GetLANConfig()
+	if autoStart, ok := cfg["autoStart"].(bool); ok && autoStart {
+		port, _ := cfg["port"].(int)
+		fmt.Printf("[LAN] 自动启动局域网服务: 端口 %d\n", port)
+		a.startLANServerWithPort(port)
+	}
+}
+
 // handleLANGetFolders 返回文件夹树（含图片数量）
 func (a *App) handleLANGetFolders(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")

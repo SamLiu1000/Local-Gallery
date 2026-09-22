@@ -78,6 +78,8 @@ export function GetImagesForTagIds(arg1:Array<string>):Promise<Array<string>>;
 
 export function GetImportedRoots():Promise<Array<database.ImportedRoot>>;
 
+export function GetLANConfig():Promise<Record<string, any>>;
+
 export function GetLANInfo():Promise<Record<string, any>>;
 
 export function GetParamTags(arg1:boolean):Promise<main.ParamTagsResponse>;
@@ -95,6 +97,8 @@ export function GetThumbBaseURL2():Promise<string>;
 export function GetThumbCacheInfo():Promise<Record<string, any>>;
 
 export function GetThumbConcurrency():Promise<number>;
+
+export function GetThumbConcurrencyInfo():Promise<Record<string, any>>;
 
 export function GetThumbDir():Promise<string>;
 
@@ -179,6 +183,8 @@ export function SelectThumbDBFile():Promise<string>;
 export function SetContext(arg1:context.Context):Promise<void>;
 
 export function SetFavorite(arg1:string,arg2:boolean):Promise<Record<string, any>>;
+
+export function SetLANConfig(arg1:boolean,arg2:number):Promise<Record<string, any>>;
 
 export function SetSidebarSetting(arg1:string,arg2:string):Promise<Record<string, any>>;
 

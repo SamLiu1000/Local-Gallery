@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -34,6 +35,13 @@ type ImageDB struct {
 	db     *sql.DB
 	dbPath string
 	mu     sync.RWMutex
+
+	// ★ FTS 完整性状态：批量索引快路径/启动自愈/大目录删除都会出现
+	//   "FTS 索引缺行"的窗口（摘触发器插入 + 后台重建，重建可达数分钟，
+	//   中途退出则缺行持续到下次启动自愈）。此期间直接搜索（走 FTS）会漏结果，
+	//   所以用计数器标记"FTS 不可信"，搜索自动回退 LIKE 完整路径。
+	ftsIncomplete atomic.Int32
+	ftsRebuildMu  sync.Mutex // 串行化重建，避免多个 'rebuild' 并发互踩
 }
 
 // New 打开或创建数据库
@@ -69,20 +77,29 @@ func New(dbPath string) (*ImageDB, error) {
 	return idb, nil
 }
 
-// rebuildSearchFTSIfNeeded 若 FTS 索引尚未全量重建（search_meta 无 fts_rebuilt 标记），
-// 则从 images 重建。之后由触发器增量维护。
-// ★ 注意：external-content 的 images_fts COUNT(*) 返回的是内容表行数而非索引行数，
-//   因此用标记表判断，绝不能拿 images_fts 行数与 images 比较。
+// rebuildSearchFTSIfNeeded 启动时校验并按需重建 FTS 全文索引。
+// ★ 校验逻辑（自愈残缺索引）：fts_rebuilt 标记为 1 时不再直接跳过，而是比较
+//   images_fts 索引行数与 image_cache 行数——批量索引快速路径的"摘触发器+事后
+//   重建"若中途失败/程序退出，FTS 会永久缺一批行（表现为普通搜索缺结果而高级
+//   搜索正常，高级搜索走 LIKE 不依赖 FTS）。容差 1%：避免后台仍在写入时误判。
+//   external-content 表上 SELECT COUNT(*) FROM images_fts 返回的是索引行数。
 // ★ 用独立连接执行重建：主池 MaxOpenConns=1，若在主连接上跑几十秒的重建
 //   会把整个应用的 DB 操作全部冻结；独立连接下 WAL 并发读不受影响。
 func (idb *ImageDB) rebuildSearchFTSIfNeeded() {
-	var marker string
-	if err := idb.db.QueryRow(`SELECT value FROM search_meta WHERE key='fts_rebuilt'`).Scan(&marker); err == nil && marker == "1" {
+	var imgCount int
+	if err := idb.db.QueryRow(`SELECT COUNT(*) FROM image_cache`).Scan(&imgCount); err != nil || imgCount == 0 {
 		return
 	}
-	var imgCount int
-	if err := idb.db.QueryRow(`SELECT COUNT(*) FROM images`).Scan(&imgCount); err != nil || imgCount == 0 {
-		return
+	var marker string
+	if err := idb.db.QueryRow(`SELECT value FROM search_meta WHERE key='fts_rebuilt'`).Scan(&marker); err == nil && marker == "1" {
+		var ftsCount int
+		if err := idb.db.QueryRow(`SELECT COUNT(*) FROM images_fts`).Scan(&ftsCount); err == nil {
+			// 容差 1%：索引比主表少 ≤1% 视为正常（后台写入窗口），多则必残缺
+			if ftsCount <= imgCount && ftsCount >= imgCount-imgCount/100 {
+				return
+			}
+			fmt.Printf("[搜索索引] FTS 行数(%d)与主表(%d)不一致，启动自愈重建\n", ftsCount, imgCount)
+		}
 	}
 
 	rebuildDB, err := sql.Open("sqlite", idb.dbPath+"?cache=shared&_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=60000")
@@ -91,7 +108,13 @@ func (idb *ImageDB) rebuildSearchFTSIfNeeded() {
 		return
 	}
 	defer rebuildDB.Close()
+	rebuildDB.Exec("PRAGMA busy_timeout=60000")
 	start := time.Now()
+	// ★ 重建前清标记：若本次重建中途失败/退出，下次启动会因标记缺失再次尝试
+	idb.db.Exec(`DELETE FROM search_meta WHERE key='fts_rebuilt'`)
+	// ★ 重建期间 FTS 缺行：搜索回退 LIKE，避免直接搜索漏结果
+	idb.markFTSIncomplete()
+	defer idb.markFTSComplete()
 	if _, err := rebuildDB.Exec(`INSERT INTO images_fts(images_fts) VALUES('rebuild')`); err != nil {
 		fmt.Printf("[搜索索引] FTS 重建失败: %v\n", err)
 		return
@@ -156,23 +179,8 @@ func (idb *ImageDB) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_image_cache_path ON image_cache(path);
 
 	-- ★ FTS5 全文搜索索引（trigram 分词器：支持子串匹配，语义接近 LIKE %kw%）。
-	--   external content：内容存 images 表，由触发器自动同步，Go 代码无需手动维护。
-	--   trigram 要求查询词 >=3 字符，短词查询回退 LIKE（见 SearchImagesBySubstring）。
-	CREATE VIRTUAL TABLE IF NOT EXISTS images_fts USING fts5(
-		name, prompt, negative_prompt, path, params_json,
-		content='images', content_rowid='rowid',
-		tokenize='trigram'
-	);
-	CREATE TRIGGER IF NOT EXISTS images_fts_ai AFTER INSERT ON images BEGIN
-		INSERT INTO images_fts(rowid, name, prompt, negative_prompt, path, params_json)
-		VALUES (new.rowid, new.name, new.prompt, new.negative_prompt, new.path, new.params_json);
-	END;
-	CREATE TRIGGER IF NOT EXISTS images_fts_au AFTER UPDATE ON images BEGIN
-		INSERT INTO images_fts(images_fts, rowid, name, prompt, negative_prompt, path, params_json)
-		VALUES ('delete', old.rowid, old.name, old.prompt, old.negative_prompt, old.path, old.params_json);
-		INSERT INTO images_fts(rowid, name, prompt, negative_prompt, path, params_json)
-		VALUES (new.rowid, new.name, new.prompt, new.negative_prompt, new.path, new.params_json);
-	END;
+	--   已随主目录表统一迁移到 createFTSOnCatalog()：content 指向 image_cache，
+	--   由 migrateUnifiedCatalog 负责创建与切换。
 
 	-- ★ FTS 重建标记：external-content 表 COUNT(*) 返回内容表行数（≠已索引），
 	--   用标记记录"是否已完成一次全量 rebuild"，避免每次启动误判跳过重建。
@@ -216,6 +224,167 @@ func (idb *ImageDB) initSchema() error {
 	if _, err := idb.db.Exec(`CREATE INDEX IF NOT EXISTS idx_image_cache_content_hash ON image_cache(content_hash)`); err != nil {
 		fmt.Printf("[数据库迁移] content_hash 索引创建失败: %v\n", err)
 	}
+	if err := idb.migrateUnifiedCatalog(); err != nil {
+		fmt.Printf("[数据库迁移] 主目录表统一迁移失败: %v\n", err)
+	}
+	if err := idb.initFoldersSchema(); err != nil {
+		return fmt.Errorf("初始化 folders 表失败: %w", err)
+	}
+	if err := idb.seedFoldersIfNeeded(); err != nil {
+		fmt.Printf("[数据库迁移] folders 表播种失败: %v\n", err)
+	}
+	return nil
+}
+
+// seedFoldersIfNeeded 首次迁移时从 image_cache 的 GROUP BY 播种 folders 表（仅一次）。
+func (idb *ImageDB) seedFoldersIfNeeded() error {
+	var seeded string
+	idb.db.QueryRow(`SELECT value FROM search_meta WHERE key='folders_seeded'`).Scan(&seeded)
+	if seeded == "1" {
+		return nil
+	}
+	entries, err := idb.LoadFolderIndexLight()
+	if err != nil {
+		return err
+	}
+	perRoot := make(map[string][]string)
+	for _, e := range entries {
+		if e.Folder != "" {
+			perRoot[e.RootPath] = append(perRoot[e.RootPath], e.Folder)
+		}
+	}
+	for root, folders := range perRoot {
+		if err := idb.EnsureFolderRows(root, folders); err != nil {
+			return err
+		}
+		if err := idb.RecomputeFolderCountsForRoot(root, nil); err != nil {
+			return err
+		}
+	}
+	idb.db.Exec(`INSERT INTO search_meta(key, value) VALUES('folders_seeded','1')
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value`)
+	fmt.Printf("[数据库迁移] folders 表播种完成（%d 个根）\n", len(perRoot))
+	return nil
+}
+
+// ==================== 主目录表统一迁移 ====================
+// 查询式改造：image_cache 成为唯一主目录表（图库 + 搜索共用），
+// 把原 images（搜索索引）表的 prompt/negative_prompt/params_json/raw_json/indexed_at
+// 增列进 image_cache 并回填一次；FTS 内容表从 images 切换到 image_cache。
+
+// migrateUnifiedCatalog 幂等迁移：
+//  1. image_cache 增列（prompt 等 + has_thumb）
+//  2. 从旧 images 表回填元数据（仅一次，search_meta 标记 meta_backfilled）
+//  3. FTS 虚表 content 从 images 切换到 image_cache（需 DROP 重建 + 全量 rebuild）
+func (idb *ImageDB) migrateUnifiedCatalog() error {
+	for _, col := range []string{
+		`prompt TEXT NOT NULL DEFAULT ''`,
+		`negative_prompt TEXT NOT NULL DEFAULT ''`,
+		`params_json TEXT NOT NULL DEFAULT '{}'`,
+		`raw_json TEXT NOT NULL DEFAULT '{}'`,
+		`indexed_at INTEGER NOT NULL DEFAULT 0`,
+		`has_thumb INTEGER NOT NULL DEFAULT 0`,
+	} {
+		name := strings.SplitN(col, " ", 2)[0]
+		if _, err := idb.db.Exec(`ALTER TABLE image_cache ADD COLUMN ` + col); err != nil {
+			// 列已存在时 SQLite 报 duplicate column，静默忽略
+			if !strings.Contains(err.Error(), "duplicate column") {
+				return fmt.Errorf("增列 %s 失败: %w", name, err)
+			}
+		}
+	}
+
+	// 回填旧 images 表的元数据（仅一次）
+	var backfilled string
+	idb.db.QueryRow(`SELECT value FROM search_meta WHERE key='meta_backfilled'`).Scan(&backfilled)
+	if backfilled != "1" {
+		var n int
+		idb.db.QueryRow(`SELECT COUNT(*) FROM images`).Scan(&n)
+		if n > 0 {
+			start := time.Now()
+			res, err := idb.db.Exec(`UPDATE image_cache SET
+				prompt          = COALESCE((SELECT prompt          FROM images WHERE images.id = image_cache.id), ''),
+				negative_prompt = COALESCE((SELECT negative_prompt FROM images WHERE images.id = image_cache.id), ''),
+				params_json     = COALESCE((SELECT params_json     FROM images WHERE images.id = image_cache.id), '{}'),
+				raw_json        = COALESCE((SELECT raw_json        FROM images WHERE images.id = image_cache.id), '{}'),
+				indexed_at      = COALESCE((SELECT indexed_at      FROM images WHERE images.id = image_cache.id), 0)
+				WHERE EXISTS (SELECT 1 FROM images WHERE images.id = image_cache.id)`)
+			if err != nil {
+				return fmt.Errorf("回填元数据失败: %w", err)
+			}
+			affected, _ := res.RowsAffected()
+			fmt.Printf("[数据库迁移] 已从 images 回填元数据到 image_cache: %d 行，耗时 %s\n",
+				affected, time.Since(start).Round(time.Millisecond))
+		}
+		idb.db.Exec(`INSERT INTO search_meta(key, value) VALUES('meta_backfilled','1')
+			ON CONFLICT(key) DO UPDATE SET value=excluded.value`)
+	}
+
+	// ★ au 触发器定义升级过（加 WHEN 条件）：IF NOT EXISTS 不会更新已存在的触发器，
+	//   每次启动先 DROP 再重建（代价可忽略），保证所有库都用上新定义。
+	//   尺寸回填（UpdateImageDimensions）、has_thumb 等无关更新不再逐行重写 FTS 大文本。
+	if _, err := idb.db.Exec(`DROP TRIGGER IF EXISTS images_fts_au`); err != nil {
+		fmt.Printf("[数据库迁移] 重建 FTS au 触发器失败: %v", err)
+	}
+	// FTS 内容表切换：检查现有 images_fts_ai 触发器挂在哪张表上
+	var trigSQL string
+	err := idb.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='trigger' AND name='images_fts_ai'`).Scan(&trigSQL)
+	if err == nil && !strings.Contains(trigSQL, "image_cache") {
+		fmt.Printf("[数据库迁移] FTS 内容表切换: images → image_cache（将触发全量重建）\n")
+		for _, trig := range []string{"images_fts_ai", "images_fts_au", "images_fts_ad"} {
+			idb.db.Exec(`DROP TRIGGER IF EXISTS ` + trig)
+		}
+		if _, err := idb.db.Exec(`DROP TABLE IF EXISTS images_fts`); err != nil {
+			return fmt.Errorf("删除旧 FTS 虚表失败: %w", err)
+		}
+		if err := idb.createFTSOnCatalog(); err != nil {
+			return err
+		}
+		// 重置 rebuild 标记，让后台 rebuildSearchFTSIfNeeded 全量重建
+		idb.db.Exec(`DELETE FROM search_meta WHERE key='fts_rebuilt'`)
+	} else if err != nil {
+		// 触发器不存在（全新库或上次崩溃残留）→ 直接补建
+		if err := idb.createFTSOnCatalog(); err != nil {
+			return err
+		}
+	} else {
+		// 触发器已存在且挂在 image_cache 上：只需补回刚 DROP 的 au（WHEN 新定义）
+		if err := idb.createFTSOnCatalog(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// createFTSOnCatalog 在 image_cache 上创建 FTS5 虚表与同步触发器。
+// external content：内容由 image_cache 提供，触发器自动同步，Go 侧无需手动维护。
+func (idb *ImageDB) createFTSOnCatalog() error {
+	stmts := []string{
+		`CREATE VIRTUAL TABLE IF NOT EXISTS images_fts USING fts5(
+			name, prompt, negative_prompt, path, params_json,
+			content='image_cache', content_rowid='rowid',
+			tokenize='trigram'
+		)`,
+		`CREATE TRIGGER IF NOT EXISTS images_fts_ai AFTER INSERT ON image_cache BEGIN
+			INSERT INTO images_fts(rowid, name, prompt, negative_prompt, path, params_json)
+			VALUES (new.rowid, new.name, new.prompt, new.negative_prompt, new.path, new.params_json);
+		END`,
+		`CREATE TRIGGER IF NOT EXISTS images_fts_au AFTER UPDATE ON image_cache
+			WHEN (old.name IS NOT new.name OR old.prompt IS NOT new.prompt
+				OR old.negative_prompt IS NOT new.negative_prompt
+				OR old.path IS NOT new.path OR old.params_json IS NOT new.params_json)
+			BEGIN
+			INSERT INTO images_fts(images_fts, rowid, name, prompt, negative_prompt, path, params_json)
+			VALUES ('delete', old.rowid, old.name, old.prompt, old.negative_prompt, old.path, old.params_json);
+			INSERT INTO images_fts(rowid, name, prompt, negative_prompt, path, params_json)
+			VALUES (new.rowid, new.name, new.prompt, new.negative_prompt, new.path, new.params_json);
+		END`,
+	}
+	for _, s := range stmts {
+		if _, err := idb.db.Exec(s); err != nil {
+			return fmt.Errorf("创建 FTS 触发器失败: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -228,16 +397,15 @@ func (idb *ImageDB) IndexImage(record *ImageRecord) error {
 		return err
 	}
 	defer tx.Rollback()
+	// ★ 主目录表统一后：元数据索引只更新 prompt/negative/params/raw/indexed_at，
+	//   不覆盖扫描写入的基础字段（path/size/尺寸/content_hash 等）。
 	_, err = tx.Exec(`
-		INSERT INTO images(id, path, name, size, last_modified, created_at, folder, root_path,
+		INSERT INTO image_cache(id, path, name, size, last_modified, created_at, folder, root_path,
 		                  prompt, negative_prompt, params_json, raw_json, indexed_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
-			path=excluded.path, name=excluded.name, size=excluded.size,
-			last_modified=excluded.last_modified, created_at=excluded.created_at, folder=excluded.folder,
-			root_path=excluded.root_path, prompt=excluded.prompt,
-			negative_prompt=excluded.negative_prompt, params_json=excluded.params_json,
-			raw_json=excluded.raw_json, indexed_at=excluded.indexed_at
+			prompt=excluded.prompt, negative_prompt=excluded.negative_prompt,
+			params_json=excluded.params_json, raw_json=excluded.raw_json, indexed_at=excluded.indexed_at
 	`, record.ID, record.Path, record.Name, record.Size, record.LastModified, record.CreatedAt,
 		record.Folder, record.RootPath, record.Prompt, record.NegativePrompt,
 		record.ParamsJSON, record.RawJSON, now)
@@ -253,6 +421,56 @@ func (idb *ImageDB) IndexBatch(records []*ImageRecord) (int, error) {
 	}
 	idb.mu.Lock()
 	defer idb.mu.Unlock()
+
+	// ★ 大批量快速路径：临时摘除 FTS 同步触发器 → 批量 upsert → 恢复触发器 →
+	//   后台一次性重建全文索引。逐行 UPDATE 触发 trigram FTS delete+insert（长
+	//   prompt/params 文本）实测每行毫秒级，几十万张要数分钟；摘触发器 + 一次
+	//   重建（~15µs/行）快一个数量级。小批量走原路径，避免重建开销倒挂。
+	if len(records) >= 2000 {
+		start := time.Now()
+		for _, trig := range []string{"images_fts_ai", "images_fts_au", "images_fts_ad"} {
+			if _, err := idb.db.Exec(`DROP TRIGGER IF EXISTS ` + trig); err != nil {
+				fmt.Printf("[批量索引] 摘除触发器失败 %s: %v（回退逐行路径）\n", trig, err)
+				return idb.indexBatchWithTriggers(records)
+			}
+		}
+		// ★ 摘触发器到后台重建完成之间 FTS 缺行：先同步置不完整标记，
+		//   让这期间的直接搜索回退 LIKE（后台重建在 goroutine 里，可能要几分钟）
+		idb.markFTSIncomplete()
+		n, err := idb.indexBatchWithTriggers(records)
+		// 无论成败先恢复触发器（崩溃兜底：下次启动 initSchema 也会补回）
+		if cerr := idb.createFTSOnCatalog(); cerr != nil {
+			fmt.Printf("[批量索引] 恢复 FTS 触发器失败: %v\n", cerr)
+		}
+		if _, cerr := idb.db.Exec(ftsDeleteTriggerSQL); cerr != nil {
+			fmt.Printf("[批量索引] 恢复 FTS 删除触发器失败: %v\n", cerr)
+		}
+		if err == nil && n > 0 {
+			go func() {
+				defer idb.markFTSComplete()
+				// ★ 先清标记：本次后台重建若失败/程序退出，下次启动自愈校验会兜底
+				idb.db.Exec(`DELETE FROM search_meta WHERE key='fts_rebuilt'`)
+				if rerr := idb.rebuildFTSSerialized(); rerr != nil {
+					fmt.Printf("[批量索引] FTS 重建失败: %v\n", rerr)
+					return
+				}
+				idb.db.Exec(`INSERT INTO search_meta(key, value) VALUES('fts_rebuilt','1')
+					ON CONFLICT(key) DO UPDATE SET value=excluded.value`)
+			}()
+			fmt.Printf("[批量索引] 快速路径: %d 条，耗时 %s（含摘触发器，FTS 后台重建中）\n",
+				n, time.Since(start).Round(time.Millisecond))
+		} else {
+			// 没有后台重建兜底（批量写入失败）：立即恢复完整状态，
+			// 触发器已回来，之后的逐行 upsert 会补 FTS；缺的行由下次启动自愈兜底
+			idb.markFTSComplete()
+		}
+		return n, err
+	}
+	return idb.indexBatchWithTriggers(records)
+}
+
+// indexBatchWithTriggers 逐行 upsert 元数据（FTS 触发器在线，小批量用）。
+func (idb *ImageDB) indexBatchWithTriggers(records []*ImageRecord) (int, error) {
 	now := time.Now().UnixMilli()
 	tx, err := idb.db.Begin()
 	if err != nil {
@@ -260,15 +478,12 @@ func (idb *ImageDB) IndexBatch(records []*ImageRecord) (int, error) {
 	}
 	defer tx.Rollback()
 	stmt, err := tx.Prepare(`
-		INSERT INTO images(id, path, name, size, last_modified, created_at, folder, root_path,
+		INSERT INTO image_cache(id, path, name, size, last_modified, created_at, folder, root_path,
 		                  prompt, negative_prompt, params_json, raw_json, indexed_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
-			path=excluded.path, name=excluded.name, size=excluded.size,
-			last_modified=excluded.last_modified, created_at=excluded.created_at, folder=excluded.folder,
-			root_path=excluded.root_path, prompt=excluded.prompt,
-			negative_prompt=excluded.negative_prompt, params_json=excluded.params_json,
-			raw_json=excluded.raw_json, indexed_at=excluded.indexed_at
+			prompt=excluded.prompt, negative_prompt=excluded.negative_prompt,
+			params_json=excluded.params_json, raw_json=excluded.raw_json, indexed_at=excluded.indexed_at
 	`)
 	if err != nil {
 		return 0, err
@@ -299,7 +514,7 @@ func (idb *ImageDB) GetImagePath(id string) string {
 	idb.mu.RLock()
 	defer idb.mu.RUnlock()
 	var path string
-	idb.db.QueryRow("SELECT path FROM images WHERE id = ?", id).Scan(&path)
+	idb.db.QueryRow("SELECT path FROM image_cache WHERE id = ?", id).Scan(&path)
 	return path
 }
 
@@ -310,7 +525,7 @@ func (idb *ImageDB) GetImageRecord(id string) *ImageRecord {
 	err := idb.db.QueryRow(`
 		SELECT id, path, name, size, last_modified, created_at, folder, root_path,
 		       prompt, negative_prompt, params_json, raw_json
-		FROM images WHERE id = ?`, id).Scan(
+		FROM image_cache WHERE id = ?`, id).Scan(
 		&rec.ID, &rec.Path, &rec.Name, &rec.Size, &rec.LastModified, &rec.CreatedAt,
 		&rec.Folder, &rec.RootPath, &rec.Prompt, &rec.NegativePrompt,
 		&rec.ParamsJSON, &rec.RawJSON,
@@ -351,7 +566,7 @@ func (idb *ImageDB) DeleteByRoot(rootPath string) (int, error) {
 // ftsDeleteTriggerSQL 是 images 表的全文索引删除触发器定义。
 // ★ 单独定义成常量：DeleteByRoot 的快路径会临时 DROP 它、删完再用这份定义重建，
 //   保证"建触发器"与"恢复触发器"永远用同一份 SQL。
-const ftsDeleteTriggerSQL = `CREATE TRIGGER IF NOT EXISTS images_fts_ad AFTER DELETE ON images BEGIN
+const ftsDeleteTriggerSQL = `CREATE TRIGGER IF NOT EXISTS images_fts_ad AFTER DELETE ON image_cache BEGIN
 	INSERT INTO images_fts(images_fts, rowid, name, prompt, negative_prompt, path, params_json)
 	VALUES ('delete', old.rowid, old.name, old.prompt, old.negative_prompt, old.path, old.params_json);
 END;`
@@ -367,7 +582,7 @@ func (idb *ImageDB) shouldRebuildFTSForDelete(rootPath string) bool {
 
 	idb.mu.RLock()
 	var toDelete int
-	err := idb.db.QueryRow(`SELECT COUNT(*) FROM images WHERE root_path = ?`, rootPath).Scan(&toDelete)
+	err := idb.db.QueryRow(`SELECT COUNT(*) FROM image_cache WHERE root_path = ?`, rootPath).Scan(&toDelete)
 	idb.mu.RUnlock()
 	if err != nil || toDelete < minRows {
 		return false
@@ -375,7 +590,7 @@ func (idb *ImageDB) shouldRebuildFTSForDelete(rootPath string) bool {
 
 	idb.mu.RLock()
 	var total int
-	err = idb.db.QueryRow(`SELECT COUNT(*) FROM images`).Scan(&total)
+	err = idb.db.QueryRow(`SELECT COUNT(*) FROM image_cache`).Scan(&total)
 	idb.mu.RUnlock()
 	if err != nil || total <= 0 {
 		return false
@@ -398,7 +613,7 @@ func (idb *ImageDB) deleteByRootWithFTSRebuild(rootPath string) (int, error) {
 	var delErr error
 	for {
 		res, err := idb.execLocked(
-			`DELETE FROM images WHERE id IN (SELECT id FROM images WHERE root_path = ? LIMIT ?)`,
+			`DELETE FROM image_cache WHERE id IN (SELECT id FROM image_cache WHERE root_path = ? LIMIT ?)`,
 			rootPath, batchSize)
 		if err != nil {
 			delErr = err
@@ -420,8 +635,11 @@ func (idb *ImageDB) deleteByRootWithFTSRebuild(rootPath string) (int, error) {
 		return total, trigErr
 	}
 
+	// ★ 删除期间 FTS 缺行（摘了删除触发器）：标记不完整，搜索回退 LIKE
+	idb.markFTSIncomplete()
+	defer idb.markFTSComplete()
 	// 4. 重建全文索引
-	if err := idb.rebuildFTSIndex(); err != nil {
+	if err := idb.rebuildFTSSerialized(); err != nil {
 		return total, err
 	}
 	fmt.Printf("[搜索索引] 大目录删除完成（%d 行），已重建全文索引\n", total)
@@ -443,6 +661,7 @@ func (idb *ImageDB) rebuildFTSIndex() error {
 	if err != nil {
 		return err
 	}
+	rebuildDB.Exec("PRAGMA busy_timeout=60000")
 	defer rebuildDB.Close()
 	start := time.Now()
 	if _, err := rebuildDB.Exec(`INSERT INTO images_fts(images_fts) VALUES('rebuild')`); err != nil {
@@ -450,6 +669,22 @@ func (idb *ImageDB) rebuildFTSIndex() error {
 	}
 	fmt.Printf("[搜索索引] FTS 重建完成，耗时 %s\n", time.Since(start).Round(time.Millisecond))
 	return nil
+}
+
+// markFTSIncomplete / markFTSComplete / ftsIsIncomplete 维护"FTS 索引缺行"状态
+// （计数器：多个窗口重叠时嵌套计数）。ftsIsIncomplete 为真期间，
+// SearchImagesBySubstring 回退 LIKE 全表路径，保证直接搜索结果完整。
+func (idb *ImageDB) markFTSIncomplete()   { idb.ftsIncomplete.Add(1) }
+func (idb *ImageDB) markFTSComplete()     { idb.ftsIncomplete.Add(-1) }
+func (idb *ImageDB) ftsIsIncomplete() bool { return idb.ftsIncomplete.Load() > 0 }
+
+// rebuildFTSSerialized 串行化的全量重建：并发触发（批量索引后台重建、启动自愈、
+// 大目录删除）时排队等待而非并发执行——两个 'rebuild' 在不同连接上会互相
+// busy 失败。等待方拿到锁后再重建一次，覆盖等待期间新写入的行。
+func (idb *ImageDB) rebuildFTSSerialized() error {
+	idb.ftsRebuildMu.Lock()
+	defer idb.ftsRebuildMu.Unlock()
+	return idb.rebuildFTSIndex()
 }
 
 // deleteByRootBatch 删除一批属于 rootPath 的 images 行（独立加锁，批间释放 idb.mu）。
@@ -461,7 +696,7 @@ func (idb *ImageDB) deleteByRootBatch(rootPath string, batchSize int) (int, erro
 		return 0, err
 	}
 	res, err := tx.Exec(
-		"DELETE FROM images WHERE id IN (SELECT id FROM images WHERE root_path = ? LIMIT ?)",
+		"DELETE FROM image_cache WHERE id IN (SELECT id FROM image_cache WHERE root_path = ? LIMIT ?)",
 		rootPath, batchSize,
 	)
 	if err != nil {
@@ -483,7 +718,7 @@ func (idb *ImageDB) DeleteImage(id string) error {
 		return err
 	}
 	defer tx.Rollback()
-	tx.Exec("DELETE FROM images WHERE id = ?", id)
+	tx.Exec("DELETE FROM image_cache WHERE id = ?", id)
 	return tx.Commit()
 }
 
@@ -498,7 +733,7 @@ func (idb *ImageDB) DeleteImagesBatch(ids []string) error {
 		return err
 	}
 	defer tx.Rollback()
-	stmt, err := tx.Prepare("DELETE FROM images WHERE id = ?")
+	stmt, err := tx.Prepare("DELETE FROM image_cache WHERE id = ?")
 	if err != nil {
 		return err
 	}
@@ -585,8 +820,11 @@ func (idb *ImageDB) SearchImagesBySubstring(query string, folder string, offset 
 	// ★ FTS5(trigram) 快路径：查询 >=3 字符时走全文索引，命中行才做 LIKE 打分，
 	//   避免每次搜索全表扫描 57 万行（多列 OR LIKE）。
 	//   注意：MATCH 运算符必须直接作用在 FTS 表名上，不能使用表别名。
-	if matchExpr := buildTrigramMatch(query); matchExpr != "" {
-		countSQL := "SELECT COUNT(*) FROM images_fts JOIN images i ON i.rowid = images_fts.rowid WHERE images_fts MATCH ?" + folderClause
+	// ★ FTS 不完整期间（批量索引后台重建/启动自愈/大目录删除）回退 LIKE：
+	//   FTS 缺行会让直接搜索漏结果（高级搜索走 LIKE 不受影响，表现为
+	//   "直接搜索结果少、高级搜索正常"）。LIKE 慢但完整，重建完自动切回 FTS。
+	if matchExpr := buildTrigramMatch(query); matchExpr != "" && !idb.ftsIsIncomplete() {
+		countSQL := "SELECT COUNT(*) FROM images_fts JOIN image_cache i ON i.rowid = images_fts.rowid WHERE images_fts MATCH ?" + folderClause
 		countArgs := append([]interface{}{matchExpr}, folderArgs...)
 		var total int
 		if err := idb.db.QueryRow(countSQL, countArgs...).Scan(&total); err != nil {
@@ -594,7 +832,7 @@ func (idb *ImageDB) SearchImagesBySubstring(query string, folder string, offset 
 		}
 		querySQL := `SELECT i.id, i.path, i.name, i.size, i.last_modified, i.created_at, i.folder, i.root_path,
 			i.prompt, i.negative_prompt, i.params_json, ` + scoreExprJoin + ` AS score
-			FROM images_fts JOIN images i ON i.rowid = images_fts.rowid
+			FROM images_fts JOIN image_cache i ON i.rowid = images_fts.rowid
 			WHERE images_fts MATCH ?` + folderClause + `
 			ORDER BY score DESC, i.last_modified DESC LIMIT ? OFFSET ?`
 		// 占位符顺序：scoreExprJoin(5) + MATCH(1) + folderArgs(0|2) + limit/offset(2)
@@ -631,13 +869,13 @@ func (idb *ImageDB) SearchImagesBySubstring(query string, folder string, offset 
 
 	// 先查总数
 	var total int
-	countSQL := "SELECT COUNT(*) FROM images " + where
+	countSQL := "SELECT COUNT(*) FROM image_cache " + where
 	if err := idb.db.QueryRow(countSQL, whereArgs...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("搜索计数失败: %w", err)
 	}
 
 	// 查询结果：相关度优先，其次按修改时间
-	querySQL := "SELECT id, path, name, size, last_modified, created_at, folder, root_path, prompt, negative_prompt, params_json, " + scoreExpr + " AS score FROM images " + where + " ORDER BY score DESC, last_modified DESC LIMIT ? OFFSET ?"
+	querySQL := "SELECT id, path, name, size, last_modified, created_at, folder, root_path, prompt, negative_prompt, params_json, " + scoreExpr + " AS score FROM image_cache " + where + " ORDER BY score DESC, last_modified DESC LIMIT ? OFFSET ?"
 	queryArgs := append(scoreArgs, whereArgs...)
 	queryArgs = append(queryArgs, limit, offset)
 	rows, err := idb.db.Query(querySQL, queryArgs...)
@@ -743,13 +981,13 @@ func (idb *ImageDB) SearchImagesAdvanced(conditions []SearchCondition, folders [
 
 	// 先查总数
 	var total int
-	countSQL := "SELECT COUNT(*) FROM images " + where
+	countSQL := "SELECT COUNT(*) FROM image_cache " + where
 	if err := idb.db.QueryRow(countSQL, whereArgs...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("高级搜索计数失败: %w", err)
 	}
 
 	// 查询结果（占位符顺序：SELECT 打分 → WHERE → LIMIT/OFFSET）
-	querySQL := "SELECT id, path, name, size, last_modified, created_at, folder, root_path, prompt, negative_prompt, params_json, " + scoreExpr + " AS score FROM images " + where + " ORDER BY score DESC, last_modified DESC LIMIT ? OFFSET ?"
+	querySQL := "SELECT id, path, name, size, last_modified, created_at, folder, root_path, prompt, negative_prompt, params_json, " + scoreExpr + " AS score FROM image_cache " + where + " ORDER BY score DESC, last_modified DESC LIMIT ? OFFSET ?"
 	queryArgs := append(scoreArgs, whereArgs...)
 	queryArgs = append(queryArgs, limit, offset)
 	rows, err := idb.db.Query(querySQL, queryArgs...)
@@ -938,7 +1176,7 @@ func buildConditionScore(fields []string, value, mode string) (string, []interfa
 func (idb *ImageDB) GetExistingIDs() (map[string]bool, error) {
 	idb.mu.RLock()
 	defer idb.mu.RUnlock()
-	rows, err := idb.db.Query("SELECT id FROM images")
+	rows, err := idb.db.Query("SELECT id FROM image_cache")
 	if err != nil {
 		return nil, err
 	}
@@ -958,12 +1196,12 @@ func (idb *ImageDB) GetStats() map[string]interface{} {
 	idb.mu.RLock()
 	defer idb.mu.RUnlock()
 	var totalImages int
-	idb.db.QueryRow("SELECT COUNT(*) FROM images").Scan(&totalImages)
+	idb.db.QueryRow("SELECT COUNT(*) FROM image_cache").Scan(&totalImages)
 	var dbSize int64
 	if info, err := os.Stat(idb.dbPath); err == nil {
 		dbSize = info.Size()
 	}
-	rows, err := idb.db.Query("SELECT root_path, COUNT(*) FROM images GROUP BY root_path")
+	rows, err := idb.db.Query("SELECT root_path, COUNT(*) FROM image_cache GROUP BY root_path")
 	rootCounts := make(map[string]int)
 	if err == nil {
 		defer rows.Close()
@@ -987,7 +1225,7 @@ func (idb *ImageDB) CountByRoot(rootPath string) int {
 	idb.mu.RLock()
 	defer idb.mu.RUnlock()
 	var count int
-	idb.db.QueryRow("SELECT COUNT(*) FROM images WHERE root_path=?", rootPath).Scan(&count)
+	idb.db.QueryRow("SELECT COUNT(*) FROM image_cache WHERE root_path=?", rootPath).Scan(&count)
 	return count
 }
 
@@ -1159,9 +1397,19 @@ func (idb *ImageDB) SaveImageCacheBatch(entries []ImageCacheEntry) error {
 		return err
 	}
 	defer tx.Rollback()
-	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO image_cache
+	// ★ upsert 只更新基础字段：prompt/params_json/width/height/content_hash/has_thumb
+	//   等由其它链路（元数据索引、尺寸懒加载、缩略图 worker）维护的列不能被扫描覆盖。
+	stmt, err := tx.Prepare(`INSERT INTO image_cache
 		(id, path, name, size, last_modified, created_at, folder, root_path, width, height, is_video, content_hash)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			path=excluded.path, name=excluded.name, size=excluded.size,
+			last_modified=excluded.last_modified, created_at=excluded.created_at,
+			folder=excluded.folder, root_path=excluded.root_path,
+			width=CASE WHEN excluded.width>0 THEN excluded.width ELSE image_cache.width END,
+			height=CASE WHEN excluded.height>0 THEN excluded.height ELSE image_cache.height END,
+			is_video=excluded.is_video,
+			content_hash=CASE WHEN excluded.content_hash!='' THEN excluded.content_hash ELSE image_cache.content_hash END`)
 	if err != nil {
 		return err
 	}
@@ -1173,6 +1421,118 @@ func (idb *ImageDB) SaveImageCacheBatch(entries []ImageCacheEntry) error {
 		}
 		if _, err := stmt.Exec(e.ID, e.Path, e.Name, e.Size, e.LastModified,
 			e.CreatedAt, e.Folder, e.RootPath, e.Width, e.Height, isVideo, e.ContentHash); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// SaveImageCacheBatchCounted 在一个事务内 upsert 一批扫描条目，并对"真正新增"的行
+// 增量维护 folders 计数（ensureFolderRowsTx + applyImageDeltaTx）。
+// 重复扫描已存在的条目时 delta=0，幂等不重复计数 —— 扫描热路径用这个，
+// 代替"SaveImageCacheBatch + EnsureFolderRows + ApplyImageDelta"三步各自加锁。
+func (idb *ImageDB) SaveImageCacheBatchCounted(root string, entries []ImageCacheEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	idb.mu.Lock()
+	defer idb.mu.Unlock()
+	tx, err := idb.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// 1. 找出库中已存在的 ID（分块 IN 查询），用于计算各文件夹的新增 delta
+	existing := make(map[string]bool, len(entries))
+	ids := make([]string, 0, len(entries))
+	for _, e := range entries {
+		ids = append(ids, e.ID)
+	}
+	const chunk = 500
+	for i := 0; i < len(ids); i += chunk {
+		end := i + chunk
+		if end > len(ids) {
+			end = len(ids)
+		}
+		ph := strings.Repeat("?,", end-i)
+		ph = ph[:len(ph)-1]
+		args := make([]interface{}, 0, end-i)
+		for _, id := range ids[i:end] {
+			args = append(args, id)
+		}
+		rows, err := tx.Query(`SELECT id FROM image_cache WHERE id IN (`+ph+`)`, args...)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return err
+			}
+			existing[id] = true
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+	}
+
+	// 2. upsert（与 SaveImageCacheBatch 相同：只更新基础字段，保护 prompt/params/has_thumb）
+	stmt, err := tx.Prepare(`INSERT INTO image_cache
+		(id, path, name, size, last_modified, created_at, folder, root_path, width, height, is_video, content_hash)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			path=excluded.path, name=excluded.name, size=excluded.size,
+			last_modified=excluded.last_modified, created_at=excluded.created_at,
+			folder=excluded.folder, root_path=excluded.root_path,
+			width=CASE WHEN excluded.width>0 THEN excluded.width ELSE image_cache.width END,
+			height=CASE WHEN excluded.height>0 THEN excluded.height ELSE image_cache.height END,
+			is_video=excluded.is_video,
+			content_hash=CASE WHEN excluded.content_hash!='' THEN excluded.content_hash ELSE image_cache.content_hash END`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, e := range entries {
+		isVideo := 0
+		if e.IsVideo {
+			isVideo = 1
+		}
+		if _, err := stmt.Exec(e.ID, e.Path, e.Name, e.Size, e.LastModified,
+			e.CreatedAt, e.Folder, e.RootPath, e.Width, e.Height, isVideo, e.ContentHash); err != nil {
+			return err
+		}
+	}
+
+	// 3. 按 folder 统计新增数并增量维护计数（批内重复 ID 去重，防止同批重复计数）
+	folders := make(map[string]bool, 8)
+	deltas := make(map[string]int, 8)
+	seen := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		folders[e.Folder] = true
+		if seen[e.ID] {
+			continue
+		}
+		seen[e.ID] = true
+		if !existing[e.ID] {
+			deltas[e.Folder]++
+		}
+	}
+	folderList := make([]string, 0, len(folders))
+	for f := range folders {
+		folderList = append(folderList, f)
+	}
+	if err := ensureFolderRowsTx(tx, root, folderList); err != nil {
+		return err
+	}
+	for f, d := range deltas {
+		if d == 0 {
+			continue
+		}
+		if err := applyImageDeltaTx(tx, root, f, d); err != nil {
 			return err
 		}
 	}
@@ -1258,9 +1618,18 @@ func (idb *ImageDB) SaveImageCacheByRoot(rootPath string, entries []ImageCacheEn
 	}
 
 	// 2. 分批插入（INSERT OR REPLACE，批间释放锁让读查询可插队）
-	stmt := `INSERT OR REPLACE INTO image_cache
+	// ★ upsert 只更新基础字段（同 SaveImageCacheBatch），并保留已有非空哈希与尺寸
+	stmt := `INSERT INTO image_cache
 		(id, path, name, size, last_modified, created_at, folder, root_path, width, height, is_video, content_hash)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			path=excluded.path, name=excluded.name, size=excluded.size,
+			last_modified=excluded.last_modified, created_at=excluded.created_at,
+			folder=excluded.folder, root_path=excluded.root_path,
+			width=CASE WHEN excluded.width>0 THEN excluded.width ELSE image_cache.width END,
+			height=CASE WHEN excluded.height>0 THEN excluded.height ELSE image_cache.height END,
+			is_video=excluded.is_video,
+			content_hash=CASE WHEN excluded.content_hash!='' THEN excluded.content_hash ELSE image_cache.content_hash END`
 	for i := 0; i < len(entries); i += insBatch {
 		end := i + insBatch
 		if end > len(entries) {
@@ -1626,7 +1995,7 @@ func (idb *ImageDB) GetImagesNeedingMetadataBackfill(limit int) ([]ImageCacheEnt
 	idb.mu.RLock()
 	defer idb.mu.RUnlock()
 	rows, err := idb.db.Query(`SELECT id, path, name, size, last_modified, created_at,
-		folder, root_path FROM images WHERE params_json = '' OR json_valid(params_json) = 0 LIMIT ?`, limit)
+		folder, root_path FROM image_cache WHERE params_json = '' OR json_valid(params_json) = 0 LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1648,7 +2017,7 @@ func (idb *ImageDB) GetImagesNeedingMetadataBackfill(limit int) ([]ImageCacheEnt
 func (idb *ImageDB) MarkMetadataEmpty(id string) error {
 	idb.mu.Lock()
 	defer idb.mu.Unlock()
-	_, err := idb.db.Exec(`UPDATE images SET params_json = '{}', raw_json = '{}' WHERE id = ?`, id)
+	_, err := idb.db.Exec(`UPDATE image_cache SET params_json = '{}', raw_json = '{}' WHERE id = ?`, id)
 	return err
 }
 
@@ -1666,8 +2035,8 @@ func (idb *ImageDB) GetParamTagAggregation() (map[string]map[string]int, error) 
 	defer idb.mu.RUnlock()
 	rows, err := idb.db.Query(`
 		SELECT je.key, je.value, COUNT(*) c
-		FROM images, json_each(images.params_json) je
-		WHERE json_valid(images.params_json) AND json_type(images.params_json) = 'object'
+		FROM image_cache, json_each(image_cache.params_json) je
+		WHERE json_valid(image_cache.params_json) AND json_type(image_cache.params_json) = 'object'
 		  AND je.key != '' AND je.value != '' AND TRIM(je.value) != ''
 		GROUP BY je.key, je.value`)
 	if err != nil {

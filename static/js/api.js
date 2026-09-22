@@ -371,10 +371,19 @@ Respond ONLY with the JSON object, no other text.`;
     }
 
     /**
-     * 移除 <think> 推理标签（DeepSeek-R1 / QwQ 等模型）
+     * 移除 <think> 推理标签（DeepSeek-R1 / QwQ / Qwen3 / GLM 等思考型模型）。
+     * ★ 两条规则：成对标签剥内容；只有 <think> 开头没有闭合（响应被截断/部分
+     *   provider 只吐思考不吐正文）时，从 <think> 起整段丢弃——否则思考全文
+     *   会漏进 prompt 解析。不处理 message.reasoning_content（独立字段，
+     *   本代码只读 content，天然不显示）。
      */
     function stripThinking(text) {
-        return text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+        let out = text.replace(/<think>[\s\S]*?<\/think>/gi, '');
+        const openIdx = out.search(/<think>/i);
+        if (openIdx !== -1) {
+            out = out.substring(0, openIdx);
+        }
+        return out.trim();
     }
 
     /**

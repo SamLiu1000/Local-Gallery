@@ -525,6 +525,10 @@ export namespace main {
 	    done: number;
 	    skipped: number;
 	    failed: number;
+	    autoRunning: boolean;
+	    autoFolder: string;
+	    autoTotal: number;
+	    autoDone: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new PreGenStatus(source);
@@ -539,6 +543,10 @@ export namespace main {
 	        this.done = source["done"];
 	        this.skipped = source["skipped"];
 	        this.failed = source["failed"];
+	        this.autoRunning = source["autoRunning"];
+	        this.autoFolder = source["autoFolder"];
+	        this.autoTotal = source["autoTotal"];
+	        this.autoDone = source["autoDone"];
 	    }
 	}
 	export class ProxyRequestArgs {

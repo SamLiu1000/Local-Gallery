@@ -82,38 +82,13 @@ func (a *App) CleanDuplicateImages() map[string]interface{} {
 		removed := ids
 		allRemovedIDs = append(allRemovedIDs, removed...)
 		totalRemoved += len(removed)
-
-		// 从内存中删除
-		a.mu.Lock()
-		for _, id := range removed {
-			delete(a.images, id)
-		}
-		// 从 folderIndex 中移除
-		for folderKey, fids := range a.folderIndex {
-			var remaining []string
-			removedSet := make(map[string]bool, len(removed))
-			for _, id := range removed {
-				removedSet[id] = true
-			}
-			for _, id := range fids {
-				if !removedSet[id] {
-					remaining = append(remaining, id)
-				}
-			}
-			if len(remaining) == 0 {
-				a.folderIndex[folderKey] = nil
-			} else {
-				a.folderIndex[folderKey] = remaining
-			}
-		}
-		a.mu.Unlock()
 	}
 
 	if totalRemoved == 0 {
 		return map[string]interface{}{"success": true, "cleaned": 0, "message": "没有发现重复图片"}
 	}
 
-	// 3. 从 SQLite 删除
+	// 3. 从 SQLite 删除（image_cache 全集 + 搜索索引）
 	if err := a.imageDB.DeleteImagesBatch(allRemovedIDs); err != nil {
 		fmt.Printf("[去重] SQLite 批量删除失败: %v\n", err)
 	}
@@ -124,10 +99,18 @@ func (a *App) CleanDuplicateImages() map[string]interface{} {
 	// 4. 清理缩略图缓存
 	a.removeThumbsByIDs(allRemovedIDs)
 
-	// 5. 重建 folderCount
-	a.mu.Lock()
-	a.rebuildFolderCounts()
-	a.mu.Unlock()
+	// 5. ★ M2：校准所有已注册根目录的 folders 计数（不再重建内存 folderCount）
+	a.mu.RLock()
+	roots := make([]string, 0, len(a.registeredRoots))
+	for r := range a.registeredRoots {
+		roots = append(roots, r)
+	}
+	a.mu.RUnlock()
+	for _, root := range roots {
+		a.imageDB.RecomputeFolderCountsForRoot(root, nil)
+	}
+	a.invalidatePreviewCache()
+	a.invalidateParamTags()
 
 	fmt.Printf("[去重] 清理完成：共移除 %d 张重复图片\n", totalRemoved)
 	return map[string]interface{}{"success": true, "cleaned": totalRemoved}
@@ -191,29 +174,13 @@ func (a *App) dedupAfterScan(rootPath string) {
 		return
 	}
 
-	// 从内存中删除
-	a.mu.Lock()
-	removedSet := make(map[string]bool, len(rootRemovedIDs))
-	for _, id := range rootRemovedIDs {
-		delete(a.images, id)
-		removedSet[id] = true
-	}
-	for folderKey, fids := range a.folderIndex {
-		var remaining []string
-		for _, id := range fids {
-			if !removedSet[id] {
-				remaining = append(remaining, id)
-			}
-		}
-		a.folderIndex[folderKey] = remaining
-	}
-	a.rebuildFolderCounts()
-	a.mu.Unlock()
-
-	// 从 SQLite 删除
+	// ★ M2：不再操作内存索引，直接从 SQLite 删除并校准该根目录计数
 	a.imageDB.DeleteImageCacheBatch(rootRemovedIDs)
+	a.imageDB.RecomputeFolderCountsForRoot(rootPath, nil)
 	// 清理缩略图
 	a.removeThumbsByIDs(rootRemovedIDs)
+	a.invalidatePreviewCache()
+	a.invalidateParamTags()
 
 	fmt.Printf("[去重] %s: 移除 %d 张重复图片\n", rootPath, len(rootRemovedIDs))
 }

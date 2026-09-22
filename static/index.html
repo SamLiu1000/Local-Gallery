@@ -179,7 +179,7 @@
                 <div class="panel-toolbar">
                     <button id="btnSelectFolder" class="btn-primary"><span class="icon icon-browse"></span> <span data-i18n="panel.select_folder">选择文件夹</span></button>
                     <button id="btnRemoveFolder" class="btn-icon btn-danger" data-i18n-title="panel.remove_folder" title="移除选中的文件夹"><span class="icon icon-delete"></span></button>
-                    <button id="btnEditFolderOrder" class="btn-small" data-i18n-title="panel.edit_order_title" title="进入排序模式：拖动文件夹调整顺序"><span class="icon icon-edit"></span> <span data-i18n="panel.edit_order">排序</span></button>
+                    <button id="btnEditFolderOrder" class="btn-small" data-i18n-title="panel.edit_order_title" title="进入排序模式：拖动文件夹调整顺序"><span class="icon icon-edit"></span> <span data-i18n="panel.edit_order">编辑</span></button><button id="btnAddFolderBin" class="btn-small" style="display:none" data-i18n-title="sidebar.bin_dissolve" title="新建收纳夹"><span data-i18n="sidebar.bin_add">＋ 收纳夹</span></button>
                     <button id="btnCollapseAllFolders" class="btn-small" data-i18n-title="panel.collapse_all_title" title="折叠所有展开的文件夹"><span class="icon icon-collapse"></span> <span data-i18n="panel.collapse_all">折叠全部</span></button>
                 </div>
                 <div class="folder-filter-bar">
@@ -367,6 +367,7 @@
                     <button id="btnEditMode" class="edit-mode-btn" data-i18n-title="toolbar.edit_mode_title" title="编辑模式：单击选择图片，支持 Ctrl/Shift 批量选择"><span class="icon icon-edit"></span> <span data-i18n="toolbar.edit_mode">编辑</span></button>
                     <button id="btnInertiaToggle" class="edit-mode-btn" data-i18n-title="toolbar.inertia_title" title="惯性滚动：开启后滚轮有惯性滑行效果，右键空白区域可调参"><span class="icon icon-processing"></span> <span data-i18n="toolbar.inertia">惯性</span></button>
                     <span class="image-count inertia-image-count" id="imageCount"><span id="imageCountNum">0</span> <span data-i18n="toolbar.image_count">张图片</span></span>
+                    <span id="bgOpStatus" class="bg-op-status" style="display:none;"></span>
                 </div>
                 <div class="toolbar-right">
                     <button id="btnShowPromptCount" class="toolbar-prompt-count-btn" data-i18n-title="toolbar.show_prompt_count" title="显示提示词版本数量"><span class="icon icon-numbered"></span></button>

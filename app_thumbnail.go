@@ -11,9 +11,11 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
+	"io"
 	"os"
 	"path/filepath"
 	goruntime "runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -227,6 +229,15 @@ func (a *App) GetThumbConcurrency() int {
 	return int(thumbSemSize)
 }
 
+// GetThumbConcurrencyInfo 返回当前并发数与默认值（CPU 逻辑核心数，最少 2），
+// 供设置界面标明默认基准并提供"恢复默认"入口。
+func (a *App) GetThumbConcurrencyInfo() map[string]interface{} {
+	return map[string]interface{}{
+		"concurrency":        a.GetThumbConcurrency(),
+		"defaultConcurrency": max(goruntime.NumCPU(), 2),
+	}
+}
+
 // getThumbKernel 从全局设置中读取缩略图缩放算法，默认 Lanczos3
 func (a *App) getThumbKernel() vips.Kernel {
 	data := readGlobalSettings()
@@ -286,17 +297,12 @@ func (a *App) GetThumbKernel() string {
 	}
 }
 
-// getThumbDBPath 返回 BoltDB 文件路径（优先使用全局设置中的 thumbDir）
+// getThumbDBPath 返回 BoltDB 文件路径。
+// ★ 缩略图库与用户数据已合并：固定存放在用户数据目录内（thumbnails.db），
+//   不再读取独立的 thumbDir 设置（旧设置由 RestartWithNewPaths 做一次性迁移）
 func (a *App) getThumbDBPath() string {
 	if a.userDataDir == "" {
 		return ""
-	}
-	data := readGlobalSettings()
-	if dir, ok := data["thumbDir"].(string); ok && dir != "" {
-		if filepath.Ext(dir) == ".db" {
-			return dir
-		}
-		return filepath.Join(dir, "thumbnails.db")
 	}
 	return filepath.Join(a.userDataDir, "thumbnails.db")
 }
@@ -374,7 +380,9 @@ func (a *App) generateThumbnail(srcPath string, imageID string) error {
 		jpegBytes, err = generateThumbnailBytes(srcPath, thumbMaxSize, thumbJPEGQuality)
 		release()
 		if err != nil {
-			a.markThumbFailed(imageID)
+			// ★ 瞬时失败（高并发下 vips 内存/资源压力、内联回退拥塞）不写永久失败标记：
+			//   搜索结果滚动洪峰时会成批误标，之后每次请求都直接 404，
+			//   表现为"搜索结果大量 Load failed"。只对确定性损坏标记（见上方）。
 			return fmt.Errorf("缩略图生成失败: %w", err)
 		}
 	}
@@ -423,7 +431,7 @@ func (a *App) generateThumbnailDirect(srcPath string, imageID string) error {
 	}
 	jpegBytes, err := generateThumbnailBytes(srcPath, thumbMaxSize, thumbJPEGQuality)
 	if err != nil {
-		a.markThumbFailed(imageID)
+		// ★ 瞬时失败不写永久标记（同 generateThumbnail：并发洪峰下 vips 会成批误标）
 		return fmt.Errorf("缩略图生成失败: %w", err)
 	}
 	err = a.thumbDB.Batch(func(tx *bbolt.Tx) error {
@@ -670,6 +678,9 @@ func (a *App) serveThumbnail(ctx context.Context, imageID string) ([]byte, error
 	//   （任务内部 acquire），并发设置语义不变。
 	var jpegBytes []byte
 	var genErr error
+	// ★ 记录排队时的缩略图代数：热切换（RestartWithNewPaths）会递增，
+	//   任务实际执行时代数不一致则放弃（见回调内的检查）
+	onDemandGen := thumbGeneration.Load()
 	// ★ 浏览优先(before-semaphore)：在排队/抢 thumbSem 槽位之前就置 on-demand 标志。
 	//   自动预生成 worker 循环的任务开头检查 onDemandActive(见 auto pre-gen 循环)，
 	//   看到即让出磁盘与信号量。若等到拿到 thumbSem 槽位才置 1，on-demand 会在信号量
@@ -688,6 +699,14 @@ func (a *App) serveThumbnail(ctx context.Context, imageID string) ([]byte, error
 		release := onDemandSemAcquire()
 		debugSwitchf("[thumb] 拿到 on-demand 信号量: id=%s 等待=%.1fms", imageID, time.Since(tSem0).Seconds()*1000)
 		defer release()
+
+		// ★ 热切换保护：排队期间用户切换了缩略图目录/用户数据目录
+		//   （RestartWithNewPaths 会递增 thumbGeneration）→ 放弃本任务，
+		//   避免把缩略图写进已被替换的旧库；前端会用新代数重新请求
+		if thumbGeneration.Load() != onDemandGen {
+			genErr = fmt.Errorf("数据目录已切换，取消缩略图生成: %s", imageID)
+			return
+		}
 
 		// ★ 双重检查：排队到执行前用户可能已切走 → 仍放弃，不读原图。
 		if fk := a.imageFolderKey(imagePath); fk != "" && isFolderAbandoned(fk) {
@@ -1058,6 +1077,12 @@ var (
 	autoPreGenCancel   chan struct{}
 	autoPreGenCancelMu sync.Mutex
 	autoPreGenRunning  int32 // 1=后台自动预生成进行中（关闭时用于判断是否被打断）
+
+	// 自动预生成进度（供图廊状态徽标显示；与手动 preGenStatus 分开）
+	autoPreGenStatusMu sync.Mutex
+	autoPreGenFolder   string
+	autoPreGenTotal    int
+	autoPreGenDone     atomic.Int64
 )
 
 // stopAutoPreGen 停止后台自动预生成（关闭流程调用）。返回是否"被打断"（运行中强停）。
@@ -1098,6 +1123,22 @@ func (a *App) triggerAutoPreGen(label string, entries []*ImageEntry) {
 	if len(todo) == 0 {
 		return
 	}
+	// ★ 预生成顺序对齐浏览顺序：默认排序是"新→旧"（date-desc），把队列按同样
+	//   规则排序，让后台生成路径与用户浏览路径一致——滚到哪，缩略图大概率已就绪，
+	//   "边导边看"不再撞上未生成的图。纯排序调整，不影响幂等与并发安全。
+	sort.Slice(todo, func(i, j int) bool {
+		ti, tj := todo[i].CreatedAt, todo[j].CreatedAt
+		if ti == 0 {
+			ti = todo[i].LastModified
+		}
+		if tj == 0 {
+			tj = todo[j].LastModified
+		}
+		if ti != tj {
+			return ti > tj
+		}
+		return todo[i].Path < todo[j].Path
+	})
 	fmt.Printf("[自动预生成] 扫描新增 %d 张图片，后台低优生成缺失缩略图（%s）\n", len(todo), label)
 
 	// 新的扫描会取消旧的自动任务（避免堆积）
@@ -1113,6 +1154,19 @@ func (a *App) triggerAutoPreGen(label string, entries []*ImageEntry) {
 	atomic.StoreInt32(&autoPreGenRunning, 1)
 	defer atomic.StoreInt32(&autoPreGenRunning, 0)
 
+	// ★ 上报自动预生成进度（GetPreGenStatus 的 Auto* 字段，图廊状态徽标用）
+	autoPreGenStatusMu.Lock()
+	autoPreGenFolder = label
+	autoPreGenTotal = len(todo)
+	autoPreGenStatusMu.Unlock()
+	autoPreGenDone.Store(0)
+	defer func() {
+		autoPreGenStatusMu.Lock()
+		autoPreGenFolder = ""
+		autoPreGenTotal = 0
+		autoPreGenStatusMu.Unlock()
+	}()
+
 	// ★ 固定低并发（2）：不抢占交互式 on-demand 缩略图生成的 vips 额度，
 	//   导入后再怎么扫都不会拖慢前台浏览。
 	const workers = 2
@@ -1125,30 +1179,31 @@ func (a *App) triggerAutoPreGen(label string, entries []*ImageEntry) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for e := range jobs {
-				select {
-				case <-cancel:
-					return
-				default:
-				}
-				// ★★ 切换中断：用户切走了该图片所属文件夹 → 本轮跳过，
-				//   不再读目标文件夹原图做缩略图（制作缩略图是读原图，必须随切换停）。
-				//   一旦跳过则整轮记住，避免过期后恢复读取。
-				fk := a.imageFolderKey(e.Path)
-				if fk != "" {
-					skippedMu.Lock()
-					skip := skippedFolders[fk]
-					skippedMu.Unlock()
-					if !skip && isFolderAbandoned(fk) {
+				for e := range jobs {
+					select {
+					case <-cancel:
+						return
+					default:
+					}
+					// ★★ 切换中断：用户切走了该图片所属文件夹 → 本轮跳过，
+					//   不再读目标文件夹原图做缩略图（制作缩略图是读原图，必须随切换停）。
+					//   一旦跳过则整轮记住，避免过期后恢复读取。
+					fk := a.imageFolderKey(e.Path)
+					if fk != "" {
 						skippedMu.Lock()
-						skippedFolders[fk] = true
+						skip := skippedFolders[fk]
 						skippedMu.Unlock()
-						skip = true
+						if !skip && isFolderAbandoned(fk) {
+							skippedMu.Lock()
+							skippedFolders[fk] = true
+							skippedMu.Unlock()
+							skip = true
+						}
+						if skip {
+							autoPreGenDone.Add(1)
+							continue
+						}
 					}
-					if skip {
-						continue
-					}
-				}
 				// ★ 浏览优先：用户正在点击/浏览文件夹时，on-demand 正在读原图做缩略图，
 				//   自动预生成让出磁盘（否则大批量导入时磁盘被占满，前台点击排队）。
 				//   等 on-demand 读原图告一段落再继续，且随时响应取消。
@@ -1172,6 +1227,7 @@ func (a *App) triggerAutoPreGen(label string, entries []*ImageEntry) {
 				})
 				if has {
 					mu.Unlock()
+					autoPreGenDone.Add(1)
 					continue
 				}
 				// ★ 走 worker 子进程生成（generateThumbnail）——切换文件夹杀 worker 时，
@@ -1180,6 +1236,7 @@ func (a *App) triggerAutoPreGen(label string, entries []*ImageEntry) {
 					fmt.Printf("[自动预生成] 失败 %s: %v\n", e.ID, err)
 				}
 				mu.Unlock()
+				autoPreGenDone.Add(1)
 			}
 		}()
 	}
@@ -1336,11 +1393,17 @@ func (a *App) ResumePreGenThumbs() map[string]interface{} {
 	return map[string]interface{}{"success": true}
 }
 
-// GetPreGenStatus 获取当前预生成状态
+// GetPreGenStatus 获取当前预生成状态（含后台自动预生成的独立 Auto* 字段）
 func (a *App) GetPreGenStatus() *PreGenStatus {
 	preGenStatusMu.RLock()
-	defer preGenStatusMu.RUnlock()
 	s := preGenStatus
+	preGenStatusMu.RUnlock()
+	autoPreGenStatusMu.Lock()
+	s.AutoRunning = autoPreGenFolder != ""
+	s.AutoFolder = autoPreGenFolder
+	s.AutoTotal = autoPreGenTotal
+	s.AutoDone = int(autoPreGenDone.Load())
+	autoPreGenStatusMu.Unlock()
 	return &s
 }
 
@@ -1637,27 +1700,57 @@ func (a *App) invalidateThumbCounts() {
 	a.throttleThumbProgress()
 }
 
-// incrementThumbCount 增量更新：给 imageID 所属文件夹（含所有上级）的缩略图计数 +1
-func (a *App) incrementThumbCount(imageID string) {
-	a.mu.RLock()
-	entry, ok := a.images[imageID]
-	a.mu.RUnlock()
-	if !ok {
-		// LRU 未命中：回退 SQL 单点查询（缩略图刚生成时图片可能未在缓存）
-		if a.imageDB != nil {
-			if e, err := a.imageDB.GetImageEntry(imageID); err == nil && e != nil {
-				entry = &ImageEntry{
-					ID: e.ID, Path: e.Path, Name: e.Name, Size: e.Size,
-					LastModified: e.LastModified, CreatedAt: e.CreatedAt,
-					Folder: e.Folder, RootPath: e.RootPath,
-					Width: e.Width, Height: e.Height, IsVideo: e.IsVideo,
-					URL: fmt.Sprintf("/image/%s", e.ID),
+// has_thumb 批量写库缓冲：合并短时间内的大量标记，减少 SQLite 写事务
+var (
+	hasThumbPendingMu sync.Mutex
+	hasThumbPending   []string
+	hasThumbTimer     *time.Timer
+)
+
+// queueHasThumb 把 imageID 加入 has_thumb=1 批量写库缓冲，500ms 后合并提交。
+func (a *App) queueHasThumb(imageID string) {
+	if a.imageDB == nil {
+		return
+	}
+	hasThumbPendingMu.Lock()
+	hasThumbPending = append(hasThumbPending, imageID)
+	if hasThumbTimer == nil {
+		hasThumbTimer = time.AfterFunc(500*time.Millisecond, func() {
+			hasThumbPendingMu.Lock()
+			ids := hasThumbPending
+			hasThumbPending = nil
+			hasThumbTimer = nil
+			hasThumbPendingMu.Unlock()
+			if len(ids) > 0 && a.imageDB != nil {
+				if err := a.imageDB.SetHasThumbBatch(ids, true); err != nil {
+					fmt.Printf("[缩略图] has_thumb 批量更新失败 (%d 条): %v\n", len(ids), err)
 				}
-				ok = true
+			}
+		})
+	}
+	hasThumbPendingMu.Unlock()
+}
+
+// incrementThumbCount 增量更新：给 imageID 所属文件夹（含所有上级）的缩略图计数 +1。
+// ★ M2：同时把 has_thumb=1 批量写回 image_cache（合并写库，供侧栏/DB 统计使用）。
+func (a *App) incrementThumbCount(imageID string) {
+	// ★ has_thumb 标记：批量合并写库（500ms 窗口），避免每张缩略图一次 UPDATE
+	a.queueHasThumb(imageID)
+
+	var entry *ImageEntry
+	if a.imageDB != nil {
+		// SQL 单点查询（图片记录以 image_cache 为唯一真相源）
+		if e, err := a.imageDB.GetImageEntry(imageID); err == nil && e != nil {
+			entry = &ImageEntry{
+				ID: e.ID, Path: e.Path, Name: e.Name, Size: e.Size,
+				LastModified: e.LastModified, CreatedAt: e.CreatedAt,
+				Folder: e.Folder, RootPath: e.RootPath,
+				Width: e.Width, Height: e.Height, IsVideo: e.IsVideo,
+				URL: fmt.Sprintf("/image/%s", e.ID),
 			}
 		}
 	}
-	if !ok || entry.IsVideo {
+	if entry == nil || entry.IsVideo {
 		return
 	}
 	rootPath := strings.ReplaceAll(entry.RootPath, "\\", "/")
@@ -1854,23 +1947,19 @@ func (a *App) removeThumbsByIDs(ids []string) {
 }
 
 // ClearFolderThumbs 清除指定文件夹（含子文件夹）的缩略图缓存
+// ★ M3：图片 ID 从 SQLite 按路径前缀读取（不再依赖内存 folderIndex）。
 func (a *App) ClearFolderThumbs(folderPath string) map[string]interface{} {
 	if folderPath == "" {
 		return map[string]interface{}{"success": false, "error": "请提供文件夹路径"}
 	}
 
-	a.mu.RLock()
-	normalizedInput := strings.ToLower(strings.ReplaceAll(folderPath, "\\", "/"))
+	normalizedInput := strings.ReplaceAll(folderPath, "\\", "/")
 	var idsToRemove []string
-	var matchedFolders int
-	for folderKey, ids := range a.folderIndex {
-		normalizedKey := strings.ToLower(folderKey)
-		if normalizedKey == normalizedInput || strings.HasPrefix(normalizedKey, normalizedInput+"/") {
-			idsToRemove = append(idsToRemove, ids...)
-			matchedFolders++
+	if a.imageDB != nil {
+		if ids, err := a.imageDB.LoadImageCacheIDsUnderPath(normalizedInput); err == nil {
+			idsToRemove = ids
 		}
 	}
-	a.mu.RUnlock()
 
 	if len(idsToRemove) == 0 {
 		return map[string]interface{}{"success": true, "cleaned": 0, "message": "该文件夹无缩略图缓存"}
@@ -1879,8 +1968,8 @@ func (a *App) ClearFolderThumbs(folderPath string) map[string]interface{} {
 	a.removeThumbsByIDs(idsToRemove)
 	thumbGeneration.Add(1)
 
-	fmt.Printf("[缩略图] 已清除文件夹 %s (%d个子目录) 的 %d 个缩略图\n", folderPath, matchedFolders, len(idsToRemove))
-	return map[string]interface{}{"success": true, "cleaned": len(idsToRemove), "folderCount": matchedFolders}
+	fmt.Printf("[缩略图] 已清除文件夹 %s 的 %d 个缩略图\n", folderPath, len(idsToRemove))
+	return map[string]interface{}{"success": true, "cleaned": len(idsToRemove)}
 }
 
 // GetUserDataDir 返回当前用户数据目录
@@ -1910,10 +1999,11 @@ func (a *App) ResumeBackground() {
 // RestartWithNewPaths 执行热重启：关旧 DB → 开新 DB → 加载数据 → 原子替换
 // 路径从 .gallery-userdir 和 .gallery-settings.json 读取（这是唯一的数据源）
 func (a *App) RestartWithNewPaths() map[string]interface{} {
-	// 防止重入：如果已有切换在进行中，直接返回
-	if !a.switchMu.TryLock() {
-		return map[string]interface{}{"success": false, "error": "切换正在进行中，请稍后重试"}
-	}
+	// ★ 排队等待而非拒绝：设置页可能连续修改用户数据目录+缩略图目录，
+	//   触发两次切换调用。若用 TryLock 拒绝第二次，前端会残留"未生效"标记，
+	//   旧兜底逻辑会直接 Quit 退出程序。串行等待即可，第二次调用会以
+	//   最新保存的路径为准再切换一次（幂等，代价小）
+	a.switchMu.Lock()
 	defer a.switchMu.Unlock()
 	// ★ 切换期间暂停后台，无论成功/失败都必须恢复，否则扫描/预生成一直停摆。
 	defer a.bgPaused.Store(0)
@@ -1936,6 +2026,19 @@ func (a *App) RestartWithNewPaths() map[string]interface{} {
 	}
 	a.pendingUserDir = "" // 清除，防止下次误用
 
+	// ★ 失败回滚准备：记住 .gallery-userdir 的旧状态。若热切换失败，
+	//   把它恢复成旧值（原来没有文件则删除），避免出现"界面仍显示旧目录、
+	//   文件却已指向新目录"的半应用状态（下次冷启动会静默用新目录）
+	userDirFilePath := filepath.Join(execDir, ".gallery-userdir")
+	oldUserDirFile, oldUserDirFileErr := os.ReadFile(userDirFilePath)
+	restoreUserDirFile := func() {
+		if oldUserDirFileErr != nil {
+			os.Remove(userDirFilePath)
+		} else {
+			os.WriteFile(userDirFilePath, oldUserDirFile, 0644)
+		}
+	}
+
 	userDataFile := filepath.Join(newUserDir, "user-data.json")
 	// 新目录：创建空 user-data.json 以完成初始化
 	if _, err := os.Stat(userDataFile); err != nil {
@@ -1946,17 +2049,30 @@ func (a *App) RestartWithNewPaths() map[string]interface{} {
 		}
 	}
 
-	var newThumbDBPath string
+	// ★ 缩略图库与用户数据已合并：thumbnails.db 固定放在数据目录内。
+	//   旧版独立的 thumbDir 设置做一次性迁移：若旧库存在且新数据目录没有，
+	//   整个文件搬过来（rename 失败即跨盘，回退为复制）
+	newThumbDBPath := filepath.Join(newUserDir, "thumbnails.db")
 	settings := readGlobalSettings()
-	if dir, ok := settings["thumbDir"].(string); ok && dir != "" {
-		if filepath.Ext(dir) == ".db" {
-			newThumbDBPath = dir
-		} else {
-			newThumbDBPath = filepath.Join(dir, "thumbnails.db")
+	if oldThumbDir, ok := settings["thumbDir"].(string); ok && oldThumbDir != "" {
+		oldDB := oldThumbDir
+		if filepath.Ext(oldDB) != ".db" {
+			oldDB = filepath.Join(oldDB, "thumbnails.db")
 		}
-	}
-	if newThumbDBPath == "" {
-		newThumbDBPath = filepath.Join(newUserDir, "thumbnails.db")
+		if oldDB != newThumbDBPath {
+			if _, err := os.Stat(oldDB); err == nil {
+				if _, err := os.Stat(newThumbDBPath); err != nil {
+					if err := moveFileBestEffort(oldDB, newThumbDBPath); err != nil {
+						fmt.Printf("[热切换] 迁移旧缩略图库失败（忽略，新库将从头生成）: %v\n", err)
+					} else {
+						fmt.Printf("[热切换] 已迁移旧缩略图库: %s -> %s\n", oldDB, newThumbDBPath)
+					}
+				}
+			}
+			// 迁移后删除独立设置项，彻底合并
+			delete(settings, "thumbDir")
+			writeGlobalSettings(settings)
+		}
 	}
 
 	fmt.Printf("[热切换] 目标 userDir: %s, thumbDB: %s\n", newUserDir, newThumbDBPath)
@@ -1984,47 +2100,15 @@ func (a *App) RestartWithNewPaths() map[string]interface{} {
 	// 1. thumbDB 延迟到新库打开成功后再原子替换，避免失败时进入半切换状态
 	a.thumbDBMu.Lock()
 
-	// 2. 后台 goroutine：打开新 SQLite + 加载图片缓存（最耗时操作）
+	// 2. 后台 goroutine：打开新 SQLite（★ M2/M3：不再预加载图片到内存，读取全部按需查 SQL）
 	type loadResult struct {
-		db        *database.ImageDB
-		dbErr     error
-		images    map[string]*ImageEntry
-		folderIdx map[string][]string
+		db    *database.ImageDB
+		dbErr error
 	}
 	ch := make(chan loadResult, 1)
 	go func() {
 		r := loadResult{}
 		r.db, r.dbErr = database.New(filepath.Join(newUserDir, "images.db"))
-		if r.dbErr != nil {
-			ch <- r
-			return
-		}
-		r.images = make(map[string]*ImageEntry)
-		r.folderIdx = make(map[string][]string)
-		if records, err := r.db.LoadAllImageCache(); err == nil {
-			for _, rec := range records {
-				r.images[rec.ID] = &ImageEntry{
-					ID:           rec.ID,
-					Path:         rec.Path,
-					Name:         rec.Name,
-					Size:         rec.Size,
-					LastModified: rec.LastModified,
-					CreatedAt:    rec.CreatedAt,
-					Folder:       rec.Folder,
-					RootPath:     rec.RootPath,
-					URL:          fmt.Sprintf("/image/%s", rec.ID),
-					Width:        rec.Width,
-					Height:       rec.Height,
-					IsVideo:      rec.IsVideo,
-				}
-				rootNorm := strings.ReplaceAll(rec.RootPath, "\\", "/")
-				folderKey := rootNorm
-				if rec.Folder != "" {
-					folderKey = rootNorm + "/" + strings.ReplaceAll(rec.Folder, "\\", "/")
-				}
-				r.folderIdx[folderKey] = append(r.folderIdx[folderKey], rec.ID)
-			}
-		}
 		ch <- r
 	}()
 
@@ -2033,13 +2117,10 @@ func (a *App) RestartWithNewPaths() map[string]interface{} {
 	if r.dbErr != nil {
 		fmt.Printf("[热切换] 打开新 SQLite 失败: %v\n", r.dbErr)
 		a.thumbDBMu.Unlock()
-		return map[string]interface{}{"success": false, "error": fmt.Sprintf("无法打开新数据库: %v", r.dbErr)}
+		restoreUserDirFile()
+		return map[string]interface{}{"success": false, "error": fmt.Sprintf("无法打开新数据库 %s: %v", filepath.Join(newUserDir, "images.db"), r.dbErr)}
 	}
 
-	newFolderCount := make(map[string]int, len(r.folderIdx))
-	for k, v := range r.folderIdx {
-		newFolderCount[k] = len(v)
-	}
 
 	newRegisteredRoots := make(map[string]bool)
 	newFolderTypes := make(map[string]string)
@@ -2077,13 +2158,15 @@ func (a *App) RestartWithNewPaths() map[string]interface{} {
 
 	if err := os.MkdirAll(filepath.Dir(newThumbDBPath), 0755); err != nil {
 		a.thumbDBMu.Unlock()
-		return map[string]interface{}{"success": false, "error": fmt.Sprintf("无法创建缩略图目录: %v", err)}
+		restoreUserDirFile()
+		return map[string]interface{}{"success": false, "error": fmt.Sprintf("无法创建缩略图目录 %s: %v", filepath.Dir(newThumbDBPath), err)}
 	}
 	time.Sleep(50 * time.Millisecond)
 	newThumb, err := bbolt.Open(newThumbDBPath, 0644, &bbolt.Options{Timeout: 3 * time.Second, NoSync: true})
 	if err != nil {
 		a.thumbDBMu.Unlock()
-		return map[string]interface{}{"success": false, "error": fmt.Sprintf("无法打开缩略图数据库: %v", err)}
+		restoreUserDirFile()
+		return map[string]interface{}{"success": false, "error": fmt.Sprintf("无法打开缩略图数据库 %s: %v", newThumbDBPath, err)}
 	}
 	if err := newThumb.Update(func(tx *bbolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists(thumbBucket)
@@ -2091,11 +2174,11 @@ func (a *App) RestartWithNewPaths() map[string]interface{} {
 	}); err != nil {
 		newThumb.Close()
 		a.thumbDBMu.Unlock()
+		restoreUserDirFile()
 		return map[string]interface{}{"success": false, "error": fmt.Sprintf("无法初始化缩略图数据库: %v", err)}
 	}
 
-	fmt.Printf("[热切换] 已加载: images=%d, folders=%d, roots=%d\n",
-		len(r.images), len(r.folderIdx), len(newRegisteredRoots))
+	fmt.Printf("[热切换] 已加载: roots=%d\n", len(newRegisteredRoots))
 
 	// 4. 原子替换
 	a.mu.Lock()
@@ -2110,20 +2193,35 @@ func (a *App) RestartWithNewPaths() map[string]interface{} {
 	a.userDataDB, _ = database.NewUserDataDB(filepath.Join(newUserDir, "user-data.db"))
 	a.thumbDB = newThumb
 
-	a.images = r.images
-	a.folderIndex = r.folderIdx
-	a.folderCount = newFolderCount
 	a.registeredRoots = newRegisteredRoots
 	a.folderTypes = newFolderTypes
+
+	// ★ 目录 mtime 缓存随目录切换重载：否则沿用旧目录的 mtime 表，
+	//   新目录的增量刷新会被"目录未变化"误判跳过（表现为数据残留/不刷新）
+	a.dirMtimes = loadDirMtimes(filepath.Join(newUserDir, dirMtimesFileName))
 	a.mu.Unlock()
+
+	// ★ 参数标签内存缓存失效：内容派生自旧 images.db，不清会导致新库数据
+	//   打开后仍显示旧库聚合结果
+	a.paramTagsMu.Lock()
+	a.paramTagsCache = nil
+	a.paramTagsCacheAt = time.Time{}
+	a.paramTagsMu.Unlock()
+
+	// ★ 预览缓存清空（同上，内容来自旧库）
+	a.invalidatePreviewCache()
+
+	// ★ 旧库延迟关闭：在途的按需缩略图/查询可能仍持有旧库事务，
+	//   立即 Close 会打断它们（bbolt 报错、SQLite busy）。给 3 秒缓冲
+	//   让在途操作自然结束——旧库之后只会被读取，延迟关闭无数据风险
+	if oldThumb != nil {
+		time.AfterFunc(3*time.Second, func() { oldThumb.Close() })
+	}
 	if oldDB != nil {
-		oldDB.Close()
+		time.AfterFunc(3*time.Second, func() { oldDB.Close() })
 	}
 	if oldUserDataDB != nil {
-		oldUserDataDB.Close()
-	}
-	if oldThumb != nil {
-		oldThumb.Close()
+		time.AfterFunc(3*time.Second, func() { oldUserDataDB.Close() })
 	}
 	a.thumbDBMu.Unlock()
 
@@ -2135,7 +2233,7 @@ func (a *App) RestartWithNewPaths() map[string]interface{} {
 	thumbCountsMu.Unlock()
 	thumbGeneration.Add(1)
 
-	fmt.Printf("[热切换] 完成: userDir=%s, images=%d\n", newUserDir, len(r.images))
+	fmt.Printf("[热切换] 完成: userDir=%s\n", newUserDir)
 	return map[string]interface{}{"success": true, "userDataDir": newUserDir}
 }
 
@@ -2155,44 +2253,40 @@ func (a *App) SetUserDataDir(path string) map[string]interface{} {
 	return map[string]interface{}{"success": true, "userDataDir": resolved, "message": "路径已保存（关闭设置后生效）"}
 }
 
-// SetThumbDir 仅保存路径到全局设置，不立即切换（由 RestartWithNewPaths 统一执行）
+// moveFileBestEffort 尽力搬迁文件：同盘 rename（瞬时），跨盘回退为复制后删除
+func moveFileBestEffort(src, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err = io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(dst)
+		return err
+	}
+	if err = out.Close(); err != nil {
+		os.Remove(dst)
+		return err
+	}
+	return os.Remove(src)
+}
+
+// SetThumbDir 兼容保留：缩略图库已并入数据目录，此设置项已废弃。
+// 保留函数避免旧前端/脚本调用报"方法不存在"，实际不再写入任何设置
 func (a *App) SetThumbDir(path string) map[string]interface{} {
-	if path != "" {
-		resolved, err := filepath.Abs(path)
-		if err != nil {
-			return map[string]interface{}{"success": false, "error": "路径解析失败: " + err.Error()}
-		}
-		path = resolved
+	return map[string]interface{}{
+		"success": true,
+		"thumbDir": a.getThumbDBPath(),
+		"message": "缩略图库已并入用户数据目录，无需单独设置",
 	}
-	current := readGlobalSettings()
-	if path == "" {
-		delete(current, "thumbDir")
-	} else {
-		current["thumbDir"] = path
-	}
-	if err := writeGlobalSettings(current); err != nil {
-		return map[string]interface{}{"success": false, "error": "保存设置失败: " + err.Error()}
-	}
-	// ★ 防乌龙：检查目标缩略图库状态，明确提示用户将指向什么。
-	//   避免误指向空目录后重启，出现"数量 0 + 全量重新生成"的困惑。
-	//   thumbDir 支持两种形式：文件夹（自动补 thumbnails.db）或 .db 文件直接指定。
-	msg := "路径已保存（重启后生效）"
-	if path != "" {
-		targetPath := path
-		if filepath.Ext(path) != ".db" {
-			targetPath = filepath.Join(path, "thumbnails.db")
-		}
-		if targetPath != a.GetThumbDir() { // 目标与当前打开的库不同才统计
-			if n := countThumbKeysInFile(targetPath); n < 0 {
-				msg = "路径已保存（重启后生效）。注意：目标位置没有缩略图库，切换后将从空库开始，已有缩略图不会丢失但需要时重新生成"
-			} else if n == 0 {
-				msg = "路径已保存（重启后生效）。注意：目标库为空（0 张缩略图）"
-			} else {
-				msg = fmt.Sprintf("路径已保存（重启后生效）。目标库已有 %d 张缩略图", n)
-			}
-		}
-	}
-	return map[string]interface{}{"success": true, "thumbDir": path, "message": msg}
 }
 
 // countThumbKeysInFile 只读统计指定 BoltDB 文件的缩略图 key 数；文件不存在/无法打开返回 -1

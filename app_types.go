@@ -241,6 +241,13 @@ type PreGenStatus struct {
 	Done    int    `json:"done"`
 	Skipped int    `json:"skipped"`
 	Failed  int    `json:"failed"`
+
+	// ★ 自动预生成（导入/扫描后后台低优补齐）独立状态：不与手动任务的
+	//   running/total/done 混用，避免污染设置页进度条。
+	AutoRunning bool   `json:"autoRunning"`
+	AutoFolder  string `json:"autoFolder"`
+	AutoTotal   int    `json:"autoTotal"`
+	AutoDone    int    `json:"autoDone"`
 }
 
 // DebugScanResult 诊断扫描结果，用于排查图片计数不匹配问题

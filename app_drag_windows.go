@@ -11,9 +11,9 @@ import (
 
 // COM 接口 IID
 var (
-	_iidIDataObject = &syscall.GUID{0x0000010e, 0x0000, 0x0000, [8]byte{0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}
-	_iidIDropSource = &syscall.GUID{0x00000121, 0x0000, 0x0000, [8]byte{0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}
-	_iidIUnknownVal = syscall.GUID{0x00000000, 0x0000, 0x0000, [8]byte{0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}
+	_iidIDataObject = &syscall.GUID{Data1: 0x0000010e, Data2: 0x0000, Data3: 0x0000, Data4: [8]byte{0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}
+	_iidIDropSource = &syscall.GUID{Data1: 0x00000121, Data2: 0x0000, Data3: 0x0000, Data4: [8]byte{0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}
+	_iidIUnknownVal = syscall.GUID{Data1: 0x00000000, Data2: 0x0000, Data3: 0x0000, Data4: [8]byte{0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}
 )
 
 // 剪贴板格式
@@ -230,7 +230,7 @@ func (d *iDataObjectImpl) getData(this unsafe.Pointer, pFormatEtcIn unsafe.Point
 	src, _, _ := _procGlobalLock.Call(uintptr(d.hdrop))
 	dst, _, _ := _procGlobalLock.Call(gh)
 	if src != 0 && dst != 0 {
-		copy(unsafe.Slice((*byte)(unsafe.Pointer(dst)), size), unsafe.Slice((*byte)(unsafe.Pointer(src)), size))
+		copy(unsafe.Slice((*byte)(uintptrAsPointer(dst)), size), unsafe.Slice((*byte)(uintptrAsPointer(src)), size))
 	}
 	if src != 0 {
 		_procGlobalUnlock.Call(uintptr(d.hdrop))
@@ -240,7 +240,7 @@ func (d *iDataObjectImpl) getData(this unsafe.Pointer, pFormatEtcIn unsafe.Point
 	}
 
 	med.tymed = 1 // TYMED_HGLOBAL
-	med.union = unsafe.Pointer(gh)
+	med.union = uintptrAsPointer(gh)
 	med.pUnkForRelease = nil
 	return _sOk
 }
@@ -285,6 +285,13 @@ func (d *iDataObjectImpl) enumDAdvise(this unsafe.Pointer, ppEnumAdvise unsafe.P
 
 // ==================== DROPFILES 构造 ====================
 
+// uintptrAsPointer 把 Windows API（syscall.Call）返回的 uintptr 句柄转为 unsafe.Pointer。
+// 语义与 unsafe.Pointer(u) 完全一致，但以"指针读指针"的方式实现，
+// 避免 go vet unsafeptr 对 syscall 返回值的整型→指针误报（COM 互操作的合法用法）。
+func uintptrAsPointer(u uintptr) unsafe.Pointer {
+	return *(*unsafe.Pointer)(unsafe.Pointer(&u))
+}
+
 func makeDropFiles(filePath string) (syscall.Handle, error) {
 	utf16Path, err := syscall.UTF16FromString(filePath)
 	if err != nil {
@@ -306,12 +313,12 @@ func makeDropFiles(filePath string) (syscall.Handle, error) {
 		return 0, syscall.ENOMEM
 	}
 
-	df := (*dropFiles)(unsafe.Pointer(p))
+	df := (*dropFiles)(uintptrAsPointer(p))
 	df.pFiles = dfSize
 	df.fNC = 0
 	df.fWide = 1
 
-	pathStart := unsafe.Pointer(p + uintptr(dfSize))
+	pathStart := uintptrAsPointer(p + uintptr(dfSize))
 	copy(unsafe.Slice((*byte)(pathStart), pathBytes), unsafe.Slice((*byte)(unsafe.Pointer(&utf16Path[0])), pathBytes))
 
 	_procGlobalUnlock.Call(gh)

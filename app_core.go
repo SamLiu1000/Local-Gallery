@@ -21,8 +21,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"container/list"
-
 	"local-gallery/internal/database"
 
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
@@ -34,14 +32,8 @@ type App struct {
 	userDataDir        string
 	defaultUserDataDir string // 程序启动时的默认路径，用于重置
 
-	images      map[string]*ImageEntry
-	folderIndex map[string][]string
-	folderCount map[string]int
-
-	// LRU 按文件夹加载缓存
-	folderLoaded map[string]bool          // folderKey 是否已加载进 a.images
-	folderLRU    *list.List               // LRU 队列，elem.Value = folderKey
-	lruNodes     map[string]*list.Element // folderKey → LRU 节点
+	// ★ M2/M3 改造：内存图片索引（a.images / folderIndex / folderCount / LRU）已删除，
+	//   图片与文件夹计数全部以 SQLite（image_cache / folders 表）为唯一真相源。
 
 	registeredRoots map[string]bool
 	folderTypes     map[string]string // rootPath -> "ai" | "photo" | "mixed"
@@ -109,12 +101,6 @@ func NewApp(userDataDir, defaultUserDataDir string) *App {
 	app := &App{
 		userDataDir:        userDataDir,
 		defaultUserDataDir: defaultUserDataDir,
-		images:             make(map[string]*ImageEntry),
-		folderIndex:        make(map[string][]string),
-		folderCount:        make(map[string]int),
-		folderLoaded:       make(map[string]bool),
-		folderLRU:          list.New(),
-		lruNodes:           make(map[string]*list.Element),
 		registeredRoots:    make(map[string]bool),
 		folderTypes:        make(map[string]string),
 		userDataFile:       filepath.Join(userDataDir, "user-data.json"),
@@ -185,12 +171,14 @@ func NewApp(userDataDir, defaultUserDataDir string) *App {
 	app.migrateUserData()       // migrate registeredRoots/imageTags/favorites to SQLite
 	logStartupf("NewApp: 步骤 migrateUserData 完成（%s）", time.Since(stepT0).Round(time.Millisecond))
 	stepT0 = time.Now()
-	app.loadFolderIndexLight()  // ★ 轻量索引启动：仅加载文件夹列表+count，图片按需加载
-	logStartupf("NewApp: 步骤 loadFolderIndexLight 完成（%s）", time.Since(stepT0).Round(time.Millisecond))
-	logStartupf("NewApp: 用户数据+轻量索引完成")
+	// ★ M3：不再加载内存索引，文件夹树/图片列表全部按需查 SQLite
+	logStartupf("NewApp: 用户数据加载完成")
 
 	app.startHTTPServer()
 	logStartupf("NewApp: HTTP 服务完成")
+
+	// ★ 恢复 LAN 设置：勾选了"开机自动启动"则自动开启局域网服务
+	app.loadLANSettings()
 
 	return app
 }
@@ -221,14 +209,16 @@ func (a *App) startHTTPServer() {
 	thumbMux := http.NewServeMux()
 
 	// 用户自定义图标目录（优先使用），回退到嵌入的静态资源
-	userIconsDir := filepath.Join(a.userDataDir, "icons")
-	os.MkdirAll(userIconsDir, 0755)
-	fmt.Printf("[Icons] 用户图标目录: %s\n", userIconsDir)
+	// ★ 每次请求时动态读取 a.userDataDir：热切换用户数据目录后（RestartWithNewPaths
+	//   不重建 HTTP 服务器），闭包捕获的旧目录会永久提供旧目录的图标/头像
+	userIconsDir := func() string { return filepath.Join(a.userDataDir, "icons") }
+	os.MkdirAll(userIconsDir(), 0755)
+	fmt.Printf("[Icons] 用户图标目录: %s\n", userIconsDir())
 
 	// avatar 目录：保存裁剪后的头像图片
-	userAvatarDir := filepath.Join(a.userDataDir, "avatar")
-	os.MkdirAll(userAvatarDir, 0755)
-	fmt.Printf("[Avatar] 头像目录: %s\n", userAvatarDir)
+	userAvatarDir := func() string { return filepath.Join(a.userDataDir, "avatar") }
+	os.MkdirAll(userAvatarDir(), 0755)
+	fmt.Printf("[Avatar] 头像目录: %s\n", userAvatarDir())
 
 	// 头像文件服务
 	thumbMux.HandleFunc("/avatar/", func(w http.ResponseWriter, r *http.Request) {
@@ -237,7 +227,7 @@ func (a *App) startHTTPServer() {
 			http.NotFound(w, r)
 			return
 		}
-		avatarPath := filepath.Join(userAvatarDir, fileName)
+		avatarPath := filepath.Join(userAvatarDir(), fileName)
 		data, err := os.ReadFile(avatarPath)
 		if err != nil {
 			http.NotFound(w, r)
@@ -256,7 +246,7 @@ func (a *App) startHTTPServer() {
 			return
 		}
 		// 优先检查用户目录
-		userPath := filepath.Join(userIconsDir, iconName)
+		userPath := filepath.Join(userIconsDir(), iconName)
 		if data, err := os.ReadFile(userPath); err == nil {
 			fmt.Printf("[Icons] 提供用户自定义图标: %s\n", iconName)
 			w.Header().Set("Content-Type", "image/svg+xml")
@@ -405,14 +395,8 @@ func (a *App) SaveAvatar(base64Data string) (string, error) {
 	return "/avatar/" + fileName, nil
 }
 
-// resolveImagePath 先查内存，再回退 SQLite image_cache，返回图片文件路径（空串表示未找到）
+// resolveImagePath 纯 DB 查询（image_cache 为主，退化为搜索索引子集），返回图片文件路径（空串表示未找到）
 func (a *App) resolveImagePath(imageID string) string {
-	a.mu.RLock()
-	entry, ok := a.images[imageID]
-	a.mu.RUnlock()
-	if ok {
-		return entry.Path
-	}
 	if a.imageDB != nil {
 		// ★ 优先查 image_cache（扫描全集）；退化时再查 images（搜索索引子集）
 		if e, err := a.imageDB.GetImageEntry(imageID); err == nil && e != nil {
@@ -653,7 +637,10 @@ func (a *App) ScanFolderQuick(path, folderType string, quick bool) *ScanResult {
 	//   仅注册并在侧栏呈现（父目录内折叠入口 + 顶层独立入口）。
 	if isNested {
 		a.setScanInProgress(resolvedPath, false)
-		n := a.rootSubtreeCount(resolvedPath)
+		n := a.dbSubtreeCount(strings.ReplaceAll(resolvedPath, "\\", "/"))
+		if n < 0 {
+			n = 0
+		}
 		fmt.Printf("[导入] 嵌套虚拟根已注册（内容由父目录持有）: %s（当前已索引 %d 张）\n", resolvedPath, n)
 		if a.ctx != nil {
 			wailsruntime.EventsEmit(a.ctx, "folder:importing", map[string]interface{}{
@@ -693,10 +680,7 @@ func (a *App) ScanFolderQuick(path, folderType string, quick bool) *ScanResult {
 				}
 			}()
 			fmt.Printf("[导入] 快速扫描开始: %s\n", resolvedPath)
-			// ★ 占住"扫描中"标记：GetImages 自愈会触发 scanAllFolders→scanRootAsync，
-			//   若与本次快速扫描并发改同一批 memory/SQLite，会被 scanRootAsync 末尾的
-			//   rebuildFolderCountsFromSQL 覆盖成 0、子文件夹索引丢失。
-			//   占住 scanningRoots 让 scanRootAsync 直接拒绝，保证快速扫描独占该根目录。
+			// ★ 占住"扫描中"标记：避免与即席扫描/scanRootAsync 并发写同一批 SQLite。
 			a.scanMu.Lock()
 			if a.scanningRoots == nil {
 				a.scanningRoots = make(map[string]bool)
@@ -709,11 +693,40 @@ func (a *App) ScanFolderQuick(path, folderType string, quick bool) *ScanResult {
 				a.scanMu.Unlock()
 			}()
 
-			localImages, localFolderIndex, imageCount := a.countFilesQuick(resolvedPath)
+			normalizedRoot := strings.ReplaceAll(resolvedPath, "\\", "/")
+			// ★ M2：磁盘 walk → 每目录批次直接 upsert SQLite（SaveImageCacheBatchCounted，
+			//   事务内增量维护 folders 计数），同时发 scan:batch 让前端计数实时上升。
+			totalSoFar := 0
+			localEntries := make(map[string]*ImageEntry)
+			a.scanWalkBatched(resolvedPath, func(entries []database.ImageCacheEntry, folderRel string, count int) {
+				a.mu.RLock()
+				registered := a.registeredRoots[resolvedPath]
+				a.mu.RUnlock()
+				if !registered {
+					return
+				}
+				a.writeScanBatchToDB(resolvedPath, entries)
+				for _, e := range entries {
+					localEntries[e.ID] = toImageEntry(e)
+				}
+				totalSoFar += count
+				if a.ctx != nil && count > 0 {
+					thumbCount := 0
+					if thumbCounts := a.getCachedThumbCounts(); thumbCounts != nil {
+						thumbCount = thumbCounts[normalizedRoot]
+					}
+					wailsruntime.EventsEmit(a.ctx, "scan:batch", map[string]interface{}{
+						"rootPath":   resolvedPath,
+						"folder":     folderRel,
+						"count":      count,
+						"totalSoFar": totalSoFar,
+						"thumbCount": thumbCount,
+					})
+				}
+			})
+			fmt.Printf("[导入] 快速扫描 walk 完成: %s = %d 个文件\n", resolvedPath, totalSoFar)
 
 			// ★ 扫描期间该根目录被删除了（用户在导入中点了删除）→ 丢弃本次结果。
-			//   否则下面会把图片重新写回 image_cache / 计数，删除后再导入就出现
-			//   "数量翻倍 / 只重复一部分"（残留的旧数据 + 新扫描的数据叠在一起）。
 			a.mu.RLock()
 			stillRegistered := a.registeredRoots[resolvedPath]
 			a.mu.RUnlock()
@@ -723,60 +736,46 @@ func (a *App) ScanFolderQuick(path, folderType string, quick bool) *ScanResult {
 				return
 			}
 
-			normalizedRoot := strings.ReplaceAll(resolvedPath, "\\", "/")
-			a.mu.Lock()
-			// ★ 只增不减：countFilesQuick 幂等合并时，被即席扫描/并发扫描"先索引过"的图片
-			//   会被跳过，返回的 imageCount 只是本次新增数；直接覆盖会把已算好的完整计数
-			//   压成偏小甚至 0。这里只在比当前值更大时才更新。
-			if imageCount > a.folderCount[normalizedRoot] {
-				a.folderCount[normalizedRoot] = imageCount
+			// ★ 扫描结束统一校准 folders 计数（幂等兜底，吸收并发写入造成的偏差）。
+			if a.imageDB != nil {
+				a.imageDB.RecomputeFolderCountsForRoot(resolvedPath, nil)
 			}
-			a.mu.Unlock()
-			fmt.Printf("[导入] countFilesQuick 完成: %s = %d 个文件\n", resolvedPath, imageCount)
-
-			a.saveRegisteredRoots()
-
-			// ★ 修复计数倒退：并发 GetImages（前端一导入就打开该文件夹）会触发 evictLRU
-			//   （32 文件夹/5 万张上限），把刚扫进 a.images 的图片淘汰掉一部分，导致
-			//   saveImageIndexByRoot / rebuildFolderIndexForRoot 只读到残缺子集
-			//   （实测 125504 → 只落库 17151）。这里在落库前把本次扫到的【完整集合】回填进
-			//   a.images / folderIndex，确保 SQLite 和计数都基于完整数据（先落库，之后才允许淘汰）。
-			a.mu.Lock()
-			for k, v := range localImages {
-				a.images[k] = v
-			}
-			for fk, ids := range localFolderIndex {
-				a.folderIndex[fk] = append(a.folderIndex[fk], ids...)
-			}
-			a.mu.Unlock()
-			fmt.Printf("[导入] 已回填完整集合（%d 张）到内存，准备落库: %s\n", len(localImages), resolvedPath)
-
-			// ★ 先同步写入 SQLite image_cache，再发 scan:complete。
-			//   前端收到 scan:complete 后立即调用 GetImages，而 GetImages 优先走
-			//   SQLite image_cache（LoadImageCacheByFolderTreePaged）。若此时缓存未写入，
-			//   图廊只会显示部分/空图片，需手动刷新 1~2 次才完整。
-			a.saveImageIndexForRoot(resolvedPath)
-			fmt.Printf("[导入] 索引已写入 image_cache: %s\n", resolvedPath)
-			// ★ 权威重建该根目录的 folderIndex/folderCount：扫描期间是增量写入的，
-			//   若被并发/即席扫描抢写过，可能只覆盖部分子文件夹。这里用内存完整图片集合重算，
-			//   保证侧栏子文件夹全部显示、计数正确（否则要刷新页面才完整）。
-			a.rebuildFolderIndexForRoot(resolvedPath)
-			// ★ 计数以 SQLite 为唯一真相：重新从 SQLite 重建 folderCount（而非仅从可能被 LRU
-			//   淘汰的 a.images），确保当前内存计数 == 数据库真实数量，刷新后不再出现偏差。
-			//   （该函数自己加锁，且不再在锁内跑全表 GROUP BY。）
-			a.rebuildFolderCountsFromSQL()
 			// ★ 扫描完成，清除"扫描中"标记（中断退出时该标记残留，下次启动补扫）
 			a.setScanInProgress(resolvedPath, false)
+
+			a.invalidatePreviewCache()
+			a.invalidateParamTags()
+
+			// ★ 扫描完成：自动低优预生成缺失缩略图（后台 goroutine，不阻塞 scan:complete）。
+			if totalSoFar > 0 && len(localEntries) > 0 {
+				preEntries := make([]*ImageEntry, 0, len(localEntries))
+				for _, e := range localEntries {
+					preEntries = append(preEntries, e)
+				}
+				go a.triggerAutoPreGen(filepath.Base(resolvedPath), preEntries)
+			}
+
+			// ★ 元数据索引（与全量扫描一致：ai 类型全量索引）
+			if totalSoFar > 0 {
+				ft := a.folderTypes[resolvedPath]
+				if ft == "" {
+					ft = "ai"
+				}
+				if ft != "photo" {
+					go a.batchIndexImages(localEntries, ft)
+				}
+			}
 
 			if a.ctx != nil {
 				thumbCount := 0
 				if thumbCounts := a.getCachedThumbCounts(); thumbCounts != nil {
 					thumbCount = thumbCounts[normalizedRoot]
 				}
-				// ★ 用重建后的最新计数（finalCount 是重建前的旧值，可能因已有底数而偏小）
-				a.mu.RLock()
-				actualCount := a.folderCount[normalizedRoot]
-				a.mu.RUnlock()
+				// ★ 计数以 SQLite 为唯一真相（folders 表根行的 subtree_count）
+				actualCount := a.dbSubtreeCount(normalizedRoot)
+				if actualCount < 0 {
+					actualCount = totalSoFar
+				}
 				wailsruntime.EventsEmit(a.ctx, "scan:complete", map[string]interface{}{
 					"rootPath":   resolvedPath,
 					"count":      actualCount,
@@ -821,51 +820,6 @@ func (a *App) ScanFolderQuick(path, folderType string, quick bool) *ScanResult {
 		Folder:     folder,
 		Message:    fmt.Sprintf("已添加文件夹: %s", rootName),
 	}
-}
-
-// countFilesQuick 分批扫描文件夹：每扫完一个目录就把图片写入内存并发出
-// scan:batch 事件，前端侧栏计数随扫描实时增长，点击文件夹也能立即看到
-// 已扫描的图片（GetImages 内存回退）。返回该文件夹的【完整图片集合】与总图片数。
-// ★ 必须返回完整集合（而非只依赖会被 LRU 淘汰的全局 a.images）：否则并发
-//   GetImages→evictLRU（32 文件夹/5 万张上限）会把部分图片从 a.images 清掉，
-//   导致 saveImageIndexByRoot / rebuildFolderIndexForRoot 只读到残缺子集，
-//   表现为"导入计数从 N 倒退到 M"（如 125504→17151）。
-// 使用 os.ReadDir 递归替代 filepath.Walk，对机械硬盘更友好（批量读取目录条目）。
-func (a *App) countFilesQuick(rootPath string) (map[string]*ImageEntry, map[string][]string, int) {
-	normalizedRoot := strings.ReplaceAll(rootPath, "\\", "/")
-	localImages := make(map[string]*ImageEntry)
-	localFolderIndex := make(map[string][]string)
-	totalCount := 0
-
-	a.scanWalkBatched(rootPath, func(batchImages map[string]*ImageEntry, batchFolderIndex map[string][]string, folderRel string, batchCount int) {
-		// ★ 幂等合并：已在内存中的图片(可能被即席扫描先索引)跳过，
-		//   folderIndex 不重复追加、folderCount 不重复计数。
-		newEntries := a.mergeScanBatchIntoMemory(batchImages, batchFolderIndex)
-		totalCount += len(newEntries)
-		// ★ 本地完整集合：收集本次扫到的全部（含幂等合并跳过的），不受 a.images LRU 淘汰影响
-		for k, v := range batchImages {
-			localImages[k] = v
-		}
-		for fk, ids := range batchFolderIndex {
-			localFolderIndex[fk] = append(localFolderIndex[fk], ids...)
-		}
-		// 发 scan:batch 事件，前端侧栏数字实时上升
-		if a.ctx != nil && len(newEntries) > 0 {
-			thumbCount := 0
-			if thumbCounts := a.getCachedThumbCounts(); thumbCounts != nil {
-				thumbCount = thumbCounts[normalizedRoot]
-			}
-			wailsruntime.EventsEmit(a.ctx, "scan:batch", map[string]interface{}{
-				"rootPath":   rootPath,
-				"folder":     folderRel,
-				"count":      len(newEntries),
-				"totalSoFar": totalCount,
-				"thumbCount": thumbCount,
-			})
-		}
-	})
-
-	return localImages, localFolderIndex, totalCount
 }
 
 func (a *App) RemoveFolder(path string) *ScanResult {
@@ -959,43 +913,42 @@ func (a *App) getDBRootsForDiag() []string {
 	return paths
 }
 
-// RemoveImages 批量删除图片（从内存、缩略图缓存、数据库中移除）
+// RemoveImages 批量删除图片（从缩略图缓存、数据库中移除）
+// ★ M2：不再操作内存索引，删除后按受影响根目录校准 folders 计数。
 func (a *App) RemoveImages(ids []string) map[string]interface{} {
 	if len(ids) == 0 {
 		return map[string]interface{}{"success": true, "removed": 0}
 	}
 
-	a.mu.Lock()
-	for _, id := range ids {
-		delete(a.images, id)
-	}
-	// 清理 folderIndex 中的无效 ID
-	for folderKey, folderIDs := range a.folderIndex {
-		var remaining []string
-		for _, id := range folderIDs {
-			if _, exists := a.images[id]; exists {
-				remaining = append(remaining, id)
+	// 收集受影响的根目录（删除后校准计数用）
+	affectedRoots := make(map[string]bool)
+	if a.imageDB != nil {
+		for _, id := range ids {
+			if e, err := a.imageDB.GetImageEntry(id); err == nil && e != nil {
+				affectedRoots[e.RootPath] = true
 			}
 		}
-		if len(remaining) == 0 {
-			delete(a.folderIndex, folderKey)
-		} else {
-			a.folderIndex[folderKey] = remaining
-		}
 	}
-	a.mu.Unlock()
 
 	// 删除缩略图
 	a.removeThumbsByIDs(ids)
 
-	// 删除数据库中记录
+	// 删除数据库中记录（image_cache 全集 + 搜索索引）
 	if a.imageDB != nil {
 		if err := a.imageDB.DeleteImagesBatch(ids); err != nil {
 			fmt.Printf("[RemoveImages] 数据库删除失败: %v\n", err)
 		}
+		if err := a.imageDB.DeleteImageCacheBatch(ids); err != nil {
+			fmt.Printf("[RemoveImages] image_cache 删除失败: %v\n", err)
+		}
+		// ★ 校准受影响根目录的 folders 计数
+		for root := range affectedRoots {
+			a.imageDB.RecomputeFolderCountsForRoot(root, nil)
+		}
 	}
 
-	a.saveImageIndex()
+	a.invalidatePreviewCache()
+	a.invalidateParamTags()
 	fmt.Printf("[RemoveImages] 已删除 %d 张图片\n", len(ids))
 	return map[string]interface{}{"success": true, "removed": len(ids)}
 }
@@ -1011,7 +964,6 @@ func (a *App) Refresh() (result *ScanResult) {
 	}()
 	a.loadUserData()
 	count := a.scanAllFolders()
-	a.saveImageIndex()
 	return &ScanResult{Success: true, FileCount: count, Message: fmt.Sprintf("已重新扫描磁盘，共 %d 张图片", count)}
 }
 
@@ -1042,16 +994,19 @@ func (a *App) DebugScanRoot(rootPath string) *DebugScanResult {
 		return nil
 	})
 
-	// 第 2 步：用应用的 scanWalk 扫描同一目录
-	localImages := make(map[string]*ImageEntry)
-	localFolderIndex := make(map[string][]string)
-	scanRes := a.scanWalk(resolved, localImages, localFolderIndex, false)
-	res.AppScanCount = scanRes.count
+	// 第 2 步：用应用的批量扫描（与真实导入同一 walk 路径）扫描同一目录
+	var scanned []*ImageEntry
+	a.scanWalkBatched(resolved, func(entries []database.ImageCacheEntry, folderRel string, count int) {
+		for _, e := range entries {
+			scanned = append(scanned, toImageEntry(e))
+		}
+	})
+	res.AppScanCount = len(scanned)
 
 	// 第 3 步：找出磁盘有但应用没扫到的文件
 	for p := range diskImageSet {
 		found := false
-		for _, entry := range scanRes.images {
+		for _, entry := range scanned {
 			if entry.Path == p {
 				found = true
 				break
@@ -1065,7 +1020,7 @@ func (a *App) DebugScanRoot(rootPath string) *DebugScanResult {
 	}
 
 	// 第 4 步：检查扫描过程中跳过/失败的文件（通过 scanWalk 的日志无法捕获，这里做二次验证）
-	for _, entry := range scanRes.images {
+	for _, entry := range scanned {
 		if _, err := os.Stat(entry.Path); err != nil {
 			res.FailedFiles = append(res.FailedFiles, entry.Path)
 		}
@@ -1077,41 +1032,37 @@ func (a *App) DebugScanRoot(rootPath string) *DebugScanResult {
 }
 
 // DebugAppState 诊断内部状态，输出到终端 stdout，同时返回数据给前端。
+// ★ M3：改用 SQLite 计数（folders 表 / image_cache），不再依赖内存索引。
 func (a *App) DebugAppState() map[string]interface{} {
 	a.mu.RLock()
-	defer a.mu.RUnlock()
+	roots := make([]string, 0, len(a.registeredRoots))
+	for rp := range a.registeredRoots {
+		roots = append(roots, rp)
+	}
+	a.mu.RUnlock()
 
 	fmt.Println("")
 	fmt.Println("========== 诊断：应用内部状态 ==========")
-	fmt.Printf("已注册根目录: %d\n", len(a.registeredRoots))
-	fmt.Printf("images 总数:   %d\n", len(a.images))
-	fmt.Printf("folderIndex 键数: %d\n", len(a.folderIndex))
-	fmt.Printf("folderCount 键数: %d\n", len(a.folderCount))
+	fmt.Printf("已注册根目录: %d\n", len(roots))
+	fmt.Printf("image_cache 总数: %d\n", func() int {
+		if a.imageDB == nil {
+			return 0
+		}
+		n, _ := a.imageDB.CountImageCache()
+		return n
+	}())
 	fmt.Println("")
 
-	rootsData := make([]map[string]interface{}, 0, len(a.registeredRoots))
-	for rp := range a.registeredRoots {
+	rootsData := make([]map[string]interface{}, 0, len(roots))
+	for _, rp := range roots {
 		norm := strings.ReplaceAll(rp, "\\", "/")
-		fc := a.folderCount[norm]
-
-		imgCount := 0
-		for _, entry := range a.images {
-			if entry.RootPath == rp {
-				imgCount++
-			}
+		fc := a.dbSubtreeCount(norm)
+		if fc < 0 {
+			fc = 0
 		}
-
-		idxCount := 0
-		seen := make(map[string]bool)
-		for folderKey, ids := range a.folderIndex {
-			if folderKey == norm || strings.HasPrefix(folderKey, norm+"/") {
-				for _, id := range ids {
-					if !seen[id] {
-						seen[id] = true
-						idxCount++
-					}
-				}
-			}
+		dbCount := 0
+		if a.imageDB != nil {
+			dbCount = a.imageDB.CountByRoot(rp)
 		}
 
 		diskCount := 0
@@ -1127,117 +1078,93 @@ func (a *App) DebugAppState() map[string]interface{} {
 
 		fmt.Printf("[%s]\n", filepath.Base(rp))
 		fmt.Printf("  路径:              %s\n", rp)
-		fmt.Printf("  folderCount:       %d\n", fc)
-		fmt.Printf("  images(内存):      %d\n", imgCount)
-		fmt.Printf("  folderIndex(去重): %d\n", idxCount)
+		fmt.Printf("  folders 表计数:    %d\n", fc)
+		fmt.Printf("  image_cache 记录:  %d\n", dbCount)
 		fmt.Printf("  磁盘实际图片数:    %d", diskCount)
-		if diskCount != imgCount {
-			fmt.Printf("  ← 不匹配！差 %d 张", diskCount-imgCount)
+		if diskCount != fc {
+			fmt.Printf("  ← 不匹配！差 %d 张", diskCount-fc)
 		}
 		fmt.Println("")
 
 		rootsData = append(rootsData, map[string]interface{}{
 			"path":             rp,
 			"folderCount":      fc,
-			"imagesCount":      imgCount,
-			"folderIndexCount": idxCount,
+			"imagesCount":      dbCount,
+			"folderIndexCount": fc, // 兼容旧诊断字段（内存索引已删除，与 folders 表计数一致）
 			"diskCount":        diskCount,
 		})
 	}
 	fmt.Println("========================================")
 	fmt.Println("")
 
-	// 子文件夹诊断：抽查 folderIndex 中的前 5 个文件夹，对比 folderCount 与磁盘实际数
-	fmt.Println("--- 子文件夹抽样对比 (folderIndex 前5个) ---")
-	var firstRoot string
-	for r := range a.registeredRoots {
-		firstRoot = r
-		break
-	}
-	normRoot := strings.ReplaceAll(firstRoot, "\\", "/")
-	checked := 0
-	for folderKey := range a.folderIndex {
-		if checked >= 5 {
-			break
-		}
-		diskSubCount := 0
-		// folderKey 格式: "K:/Child Modeling Agency/sub1/sub2"
-		// 去掉 rootNorm 前缀，拼接 firstRoot 得到磁盘路径
-		if strings.HasPrefix(folderKey, normRoot+"/") {
-			relPart := folderKey[len(normRoot)+1:]
-			diskPath := filepath.Join(firstRoot, filepath.FromSlash(relPart))
-			filepath.Walk(diskPath, func(p string, fi os.FileInfo, err error) error {
-				if err != nil {
-					return filepath.SkipDir
+	// 子文件夹抽样对比：抽查 folders 表前 5 个子文件夹，对比计数与磁盘实际数
+	if a.imageDB != nil && len(roots) > 0 {
+		fmt.Println("--- 子文件夹抽样对比 (folders 表前5个) ---")
+		firstRoot := roots[0]
+		rows, err := a.imageDB.LoadFolderTree(firstRoot)
+		if err == nil {
+			checked := 0
+			for _, row := range rows {
+				if row.Folder == "" || checked >= 5 {
+					continue
 				}
-				if !fi.IsDir() && (isImageFile(fi.Name()) || isVideoFile(fi.Name())) {
-					diskSubCount++
+				diskPath := filepath.Join(firstRoot, filepath.FromSlash(row.Folder))
+				diskSubCount := 0
+				filepath.Walk(diskPath, func(p string, fi os.FileInfo, err error) error {
+					if err != nil {
+						return filepath.SkipDir
+					}
+					if !fi.IsDir() && (isImageFile(fi.Name()) || isVideoFile(fi.Name())) {
+						diskSubCount++
+					}
+					return nil
+				})
+				match := "OK"
+				if row.SubtreeCount != diskSubCount {
+					match = fmt.Sprintf("MISMATCH diff=%d", diskSubCount-row.SubtreeCount)
 				}
-				return nil
-			})
+				fmt.Printf("  [%s] subtreeCount=%d  disk=%d  %s\n", row.Folder, row.SubtreeCount, diskSubCount, match)
+				checked++
+			}
 		}
-		fc := a.folderCount[folderKey]
-		match := "OK"
-		if fc != diskSubCount {
-			match = fmt.Sprintf("MISMATCH diff=%d", diskSubCount-fc)
-		}
-		fmt.Printf("  [%s] folderCount=%d  disk=%d  %s\n", folderKey, fc, diskSubCount, match)
-		checked++
 	}
 
 	return map[string]interface{}{
-		"totalImages": len(a.images),
-		"totalRoots":  len(a.registeredRoots),
-		"roots":       rootsData,
+		"totalImages": func() int {
+			if a.imageDB == nil {
+				return 0
+			}
+			n, _ := a.imageDB.CountImageCache()
+			return n
+		}(),
+		"totalRoots": len(roots),
+		"roots":      rootsData,
 	}
 }
 
 // DebugPagination 诊断分页：对指定文件夹模拟 GetImages 逻辑，报告每一步的计数。
 // 使用: window.go.main.App.DebugPagination("K:\\Child Modeling Agency\\Olesya")
+// ★ M3：改用 SQLite 查询（image_cache 路径前缀计数 + folders 表计数）。
 func (a *App) DebugPagination(folderPath string) map[string]interface{} {
 	normalizedFolder := strings.ReplaceAll(folderPath, "\\", "/")
 
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-
-	// 模拟 GetImages 的匹配逻辑
-	matchedKeys := 0
-	totalIDs := 0
 	uniqueIDs := 0
-	seen := make(map[string]bool)
-	var sampleKeys []string
-
-	for folderKey, ids := range a.folderIndex {
-		if folderKey == normalizedFolder || strings.HasPrefix(folderKey, normalizedFolder+"/") {
-			matchedKeys++
-			totalIDs += len(ids)
-			for _, id := range ids {
-				if !seen[id] {
-					seen[id] = true
-					uniqueIDs++
-				}
-			}
-			if len(sampleKeys) < 10 {
-				sampleKeys = append(sampleKeys, fmt.Sprintf("%s (%d ids)", folderKey, len(ids)))
-			}
+	if a.imageDB != nil {
+		if ids, err := a.imageDB.LoadImageCacheIDsUnderPath(normalizedFolder); err == nil {
+			uniqueIDs = len(ids)
 		}
 	}
-
-	// folderCount 值
-	fc := a.folderCount[normalizedFolder]
+	fc := a.dbSubtreeCount(normalizedFolder)
 
 	fmt.Println("")
 	fmt.Println("========== 分页诊断 ==========")
 	fmt.Printf("请求文件夹: %s\n", folderPath)
 	fmt.Printf("规范化:     %s\n", normalizedFolder)
-	fmt.Printf("匹配到的 folderIndex 键数: %d\n", matchedKeys)
-	fmt.Printf("匹配键样例: %v\n", sampleKeys)
-	fmt.Printf("ID 总数(含重复): %d\n", totalIDs)
-	fmt.Printf("去重后 ID 数:    %d\n", uniqueIDs)
-	fmt.Printf("folderCount 值:  %d\n", fc)
-	fmt.Printf("images 中存在:   %d\n", len(seen)) // seen has unique IDs that exist in folderIndex
+	fmt.Printf("image_cache 子树记录数: %d\n", uniqueIDs)
+	fmt.Printf("folders 表计数:  %d\n", fc)
+	fmt.Printf("image_cache 中存在:   %d\n", uniqueIDs)
 	if uniqueIDs != fc {
-		fmt.Printf("*** 不一致！GetImages total=%d, folderCount=%d, 差=%d ***\n", uniqueIDs, fc, fc-uniqueIDs)
+		fmt.Printf("*** 不一致！GetImages total=%d, folders 表=%d, 差=%d ***\n", uniqueIDs, fc, fc-uniqueIDs)
 	}
 	fmt.Println("===============================")
 	fmt.Println("")
@@ -1245,11 +1172,11 @@ func (a *App) DebugPagination(folderPath string) map[string]interface{} {
 	return map[string]interface{}{
 		"folderPath":       folderPath,
 		"normalizedFolder": normalizedFolder,
-		"matchedKeys":      matchedKeys,
-		"totalIDs":         totalIDs,
+		"matchedKeys":      0, // 兼容旧诊断字段（内存索引已删除）
+		"totalIDs":         uniqueIDs,
 		"uniqueIDs":        uniqueIDs,
 		"folderCount":      fc,
-		"sampleKeys":       sampleKeys,
+		"sampleKeys":       []string{},
 	}
 }
 
@@ -1333,7 +1260,9 @@ func (a *App) FullRescanFolder(rootPath string) (result *ScanResult) {
 			if w > 0 && h > 0 && a.imageDB != nil {
 				a.imageDB.UpdateImageDimensions(e.ID, w, h)
 			}
-			time.Sleep(30 * time.Millisecond) // 限速，让出慢盘给缩略图
+			// ★ fastImageDimensions 只读文件头（<1ms/张），旧实现的 30ms 限速已无必要；
+			//   保留 2ms 让出调度，避免紧循环饿缩略图 worker。
+			time.Sleep(2 * time.Millisecond)
 		}
 	}
 
@@ -1344,282 +1273,112 @@ func (a *App) FullRescanFolder(rootPath string) (result *ScanResult) {
 		limit = 500
 	}
 
-	// 先做轻量检查（不持锁）：folderIndex 是否为空
-	a.mu.RLock()
-	folderIndexLen := len(a.folderIndex)
-	registeredRootsLen := len(a.registeredRoots)
-	a.mu.RUnlock()
-
-	// 自修复：folderIndex 为空但有已注册目录时，触发后台扫描
-	if folderIndexLen == 0 && registeredRootsLen > 0 {
-		// ★ 冷启动自愈：仅对"根目录/无文件夹"查询触发全量后台扫描。
-		//   若点开的是某个已注册根内的子文件夹，不要在这里直接返回空——交给下方
-		//   folder!="" 分支做"即席优先扫描"，否则子文件夹点击永远不出图
-		//   （自愈的 scanAllFolders→scanRootAsync 又被 scanningRoots 标记挡住）。
-		if folder == "" || !a.folderIsSubfolder(strings.ReplaceAll(folder, "\\", "/")) {
-			fmt.Println("[自修复] folderIndex 为空但有注册目录，触发后台全量扫描")
-			go a.scanAllFolders()
-			return &ImageListResult{Items: []SafeImage{}, Total: 0, Offset: offset, Limit: limit}
-		}
-	}
-
-	var results []*ImageEntry
-	var total int
+	// ★ M3：读取纯 SQL（image_cache 路径前缀分页），不再有内存回退/LRU 分支。
 
 	if folder != "" {
 		normalizedFolder := strings.ReplaceAll(folder, "\\", "/")
 
-		// ★ 自愈：打开的文件夹在磁盘上已不存在 → 立即清理整棵子树并返回空，
+		// ★ 自愈：打开的文件夹在磁盘上已不存在 → 清理整棵子树并返回空，
 		//   避免图廊显示一堆指向不存在文件的破图（导航栏残留的幽灵文件夹被点击时触发）。
 		if info, err := os.Stat(normalizedFolder); err != nil || !info.IsDir() {
-			a.mu.RLock()
-			var deadKeys []string
-			for k := range a.folderIndex {
-				if k == normalizedFolder || strings.HasPrefix(k, normalizedFolder+"/") {
-					deadKeys = append(deadKeys, k)
-				}
-			}
-			a.mu.RUnlock()
-			if len(deadKeys) > 0 {
-				fmt.Printf("[幽灵清理] 打开的文件夹已不存在，自动清理子树: %s\n", normalizedFolder)
-				a.pruneFolderKeys(deadKeys)
-			}
+			fmt.Printf("[幽灵清理] 打开的文件夹已不存在，自动清理子树: %s\n", normalizedFolder)
+			a.pruneFolderKeys([]string{normalizedFolder})
 			return &ImageListResult{Items: []SafeImage{}, Total: 0, Offset: offset, Limit: limit}
 		}
 
 		// ★ 共存修复：按绝对路径前缀查询，不依赖"记录归属哪个根"。
 		//   嵌套根与父根覆盖同一批文件时都能查到同一批记录（记录存的是完整路径），
-		//   两者可共存浏览；也消除了 map 随机遍历匹配根目录带来的不确定性。
+		//   两者可共存浏览。
 		pathPrefix := strings.ReplaceAll(normalizedFolder, "/", "\\")
 
-		debugSwitchf("[GetImages] 查询 SQLite: folder=%s pathPrefix=%s offset=%d limit=%d sort=%s", normalizedFolder, pathPrefix, offset, limit, sortOrder)
+	// buildItems 把 DB 条目转为 SafeImage 列表（按需尺寸 + 后台回填 + 首屏预生成）
+	buildItems := func(entries []database.ImageCacheEntry, dbTotal int) *ImageListResult {
+		safe := make([]SafeImage, len(entries))
+		var dimBackfill []*ImageEntry
+		var dimUpdates []dimUpdate
+		syncBudget := dimSyncBudgetPerPage
+		for i, e := range entries {
+			w, h := e.Width, e.Height
+			needBackfill := !e.IsVideo && (w == 0 || h == 0)
+			if needBackfill && syncBudget > 0 {
+				// ★ 尺寸按需优先：与缩略图一样"当前页面优先"——头部快路径 <1ms/张，
+				//   首屏直接返回真实宽高，瀑布流第一屏就是正确的（不再显示占位比例）。
+				if sw, sh := fastImageDimensions(e.Path); sw > 0 && sh > 0 {
+					w, h = sw, sh
+					needBackfill = false
+					syncBudget--
+					dimUpdates = append(dimUpdates, dimUpdate{id: e.ID, w: sw, h: sh})
+				}
+			}
+			// ★ 不再伪造 400×300：快路径没赶上的（预算耗尽/解析失败）返回真 0，
+			//   前端显示"未知"并用占位比例渲染 + onload 自校正，由后台回填写库兜底。
+			safe[i] = SafeImage{
+					ID:           e.ID,
+					Name:         e.Name,
+					Path:         e.Path,
+					Size:         e.Size,
+					LastModified: e.LastModified,
+					CreatedAt:    e.CreatedAt,
+					Folder:       e.Folder,
+					RootPath:     e.RootPath,
+					URL:          "",
+					ThumbURL:     fmt.Sprintf("/thumb/%s", e.ID),
+					Width:        w,
+					Height:       h,
+					IsVideo:      e.IsVideo,
+				}
+				if needBackfill {
+					dimBackfill = append(dimBackfill, toImageEntry(e))
+				}
+			}
+			// ★ 后台异步回填剩余缺失尺寸(不阻塞 GetImages)；同步补齐的先批量写库。
+			a.writeDimsAsync(dimUpdates)
+			if len(dimBackfill) > 0 {
+				go a.backfillImageDimensions(dimBackfill)
+			}
+			// ★ 预生成：首次加载(offset==0)该文件夹后就让它进入后台自动预生成，
+			//   缺缩略图由 worker 低优先级补齐。只对 offset==0 首次加载触发。
+			if offset == 0 && len(entries) > 0 {
+				preEntries := make([]*ImageEntry, 0, len(entries))
+				for _, e := range entries {
+					preEntries = append(preEntries, toImageEntry(e))
+				}
+				go a.triggerAutoPreGen(filepath.Base(normalizedFolder), preEntries)
+			}
+			return &ImageListResult{Items: safe, Total: dbTotal, Offset: offset, Limit: limit}
+		}
+
 		if a.imageDB != nil {
+			debugSwitchf("[GetImages] 查询 SQLite: folder=%s pathPrefix=%s offset=%d limit=%d sort=%s", normalizedFolder, pathPrefix, offset, limit, sortOrder)
 			tSQL0 := time.Now()
 			entries, dbTotal, err := a.imageDB.LoadImageCacheByPathPrefixPaged(pathPrefix, offset, limit, sortOrder)
 			debugSwitchf("[GetImages] SQLite 返回: dbTotal=%d entries=%d err=%v 耗时=%.1fms", dbTotal, len(entries), err, time.Since(tSQL0).Seconds()*1000)
-			if err == nil && dbTotal > 0 {
-				safe := make([]SafeImage, len(entries))
-				loadedEntries := make(map[string]*ImageEntry, len(entries))
-				// ★ 非阻塞尺寸：GetImages 不再同步 getImageDimensions（读图片文件头 + 写回 DB）。
-				//   RPC 实测：大文件夹(返回500张/尺寸未缓存)首开要给前250张算尺寸 ≈24ms/张。
-				//   但实测 4800px 大图在慢盘(L 盘)上每张要 ~920ms(DecodeConfig + EXIF +
-				//   Vips 三次读文件) —— 这正是"点文件夹等一两分钟"的根因
-				//   (行 8: 计算尺寸 24 张, 总耗时=22141ms)。
-				//   ★ 改为【完全不在 GetImages 同步算尺寸】：返回默认宽高比(不卡)，真正的尺寸
-				//   交给后台异步回填写库，后续视图/二次打开命中缓存；图廊布局(grid 固定卡片
-				//   尺寸)不受影响，瀑布流随缩略图加载按真实比例校正。
-				var dimBackfill []*ImageEntry
-				for i, e := range entries {
-					w, h := e.Width, e.Height
-					needBackfill := !e.IsVideo && (w == 0 || h == 0)
-					if needBackfill {
-						// 不同步算：默认 4:3，避免 22s 卡顿；尺寸由后台回填。
-						w, h = 400, 300
-					}
-					entry := toImageEntry(e)
-					entry.Width = w
-					entry.Height = h
-					if needBackfill {
-						dimBackfill = append(dimBackfill, entry)
-					}
-					loadedEntries[e.ID] = entry
-					safe[i] = SafeImage{
-						ID:           e.ID,
-						Name:         e.Name,
-						Path:         e.Path,
-						Size:         e.Size,
-						LastModified: e.LastModified,
-						CreatedAt:    e.CreatedAt,
-						Folder:       e.Folder,
-						RootPath:     e.RootPath,
-						URL:          "",
-						ThumbURL:     fmt.Sprintf("/thumb/%s", e.ID),
-						Width:        w,
-						Height:       h,
-						IsVideo:      e.IsVideo,
-					}
-				}
-				// ★ 后台异步回填尺寸(不阻塞 GetImages)：把本次加载里缺失尺寸的图片算好写库。
-				//   GetImages 已返回默认比例(400×300)快速渲染；后台慢慢补真实尺寸，
-				//   之后二次打开/瀑布流用正确宽高比。限速 30ms/张，避免与缩略图 worker
-				//   抢慢盘(L 盘)带宽。getImageDimensions 在慢盘实测 ~920ms/张。
-				if len(dimBackfill) > 0 {
-					go a.backfillImageDimensions(dimBackfill)
-				}
-				a.mu.Lock()
-				for id, entry := range loadedEntries {
-					a.images[id] = entry
-				}
-				a.mu.Unlock()
-				// ★ 预生成：首次加载(offset==0)该文件夹后就让它进入后台自动预生成，
-				//   缺缩略图由 worker 低优先级补齐。这样"反复点同一文件夹/第二次浏览"
-				//   直接命中缓存，不再逐张现场生成(主进程不再被挤满)。
-				//   triggerAutoPreGen 会取消上一轮自动任务 → 预生成跟随当前文件夹。
-				//   只对 offset==0 首次加载，避免滚动增量加载反复取消/重启。
-				if offset == 0 && len(loadedEntries) > 0 {
-					preEntries := make([]*ImageEntry, 0, len(loadedEntries))
-					for _, entry := range loadedEntries {
-						preEntries = append(preEntries, entry)
-					}
-					go a.triggerAutoPreGen(filepath.Base(normalizedFolder), preEntries)
-				}
-				debugSwitchf("[GetImages] SQL 命中返回: folder=%q returned=%d total=%d (a.images 写入 %d 张)", normalizedFolder, len(safe), dbTotal, len(loadedEntries))
-				fmt.Printf("[GetImages] SQL folder=%q offset=%d limit=%d returned=%d total=%d\n", normalizedFolder, offset, limit, len(safe), dbTotal)
-				return &ImageListResult{Items: safe, Total: dbTotal, Offset: offset, Limit: limit}
-			}
 			if err != nil {
-				fmt.Printf("[GetImages] SQL folder pagination failed, fallback to memory index: %v\n", err)
+				fmt.Printf("[GetImages] SQL folder pagination failed: %v\n", err)
+			} else if dbTotal > 0 {
+				fmt.Printf("[GetImages] SQL folder=%q offset=%d limit=%d returned=%d total=%d\n", normalizedFolder, offset, limit, len(entries), dbTotal)
+				return buildItems(entries, dbTotal)
 			}
-			// err==nil 但 dbTotal==0：SQLite 尚无该文件夹数据（扫描进行中或未落库），
-			// 回退内存索引，让用户能立即看到已扫描的图片。
+			// err==nil 但 dbTotal==0：SQLite 尚无该文件夹数据（扫描进行中或未落库）。
 
-		}
-		// 走到这里 = SQLite 无该文件夹数据（dbTotal==0 或查询失败）→ 回退内存索引。
-		if a.imageDB != nil {
-			debugSwitchf("[GetImages] SQLite 无结果/失败 → 回退内存索引: folder=%q (folderIndexLen=%d)", normalizedFolder, folderIndexLen)
-		}
-		// 收集匹配的 folderKey（未加载的需 ensure）
-		a.mu.RLock()
-		var matchingKeys []string
-		for folderKey := range a.folderIndex {
-			if folderKey == normalizedFolder || strings.HasPrefix(folderKey, normalizedFolder+"/") {
-				matchingKeys = append(matchingKeys, folderKey)
-			}
-		}
-		a.mu.RUnlock()
-
-		// 对未加载的 folderKey 触发按需加载（ensureFolderLoaded 自管锁）
-		for _, fk := range matchingKeys {
-			a.ensureFolderLoaded(fk)
-		}
-
-		// 自修复：无匹配 folderKey 且根目录未扫描时，触发扫描
-		if len(matchingKeys) == 0 && folderIndexLen == 0 {
-			needsScan := false
-			a.mu.RLock()
-			for root := range a.registeredRoots {
-				rootNorm := strings.ReplaceAll(root, "\\", "/")
-				if normalizedFolder == rootNorm || strings.HasPrefix(normalizedFolder, rootNorm+"/") {
-					if _, ok := a.folderCount[rootNorm]; !ok || a.folderCount[rootNorm] == 0 {
-						needsScan = true
-					}
-					break
-				}
-			}
-			a.mu.RUnlock()
-			if needsScan {
-				fmt.Println("[自修复] 文件夹无结果但根目录未扫描，触发异步扫描")
-				go a.scanRootAsync(folder)
-				return &ImageListResult{Items: []SafeImage{}, Total: 0, Offset: offset, Limit: limit}
-			}
-		}
-
-		// 遍历收集结果
-		a.mu.RLock()
-		seen := make(map[string]bool)
-		for _, fk := range matchingKeys {
-			ids := a.folderIndex[fk]
-			for _, id := range ids {
-				if seen[id] {
-					continue
-				}
-				seen[id] = true
-				if entry, ok := a.images[id]; ok {
-					results = append(results, entry)
-				}
-			}
-		}
-		a.mu.RUnlock()
-
-		fmt.Printf("[GetImages] folder=%q results=%d\n", normalizedFolder, len(results))
-		if len(results) == 0 {
-			sampleKeys := make([]string, 0, 5)
-			a.mu.RLock()
-			for k := range a.folderIndex {
-				sampleKeys = append(sampleKeys, k)
-				if len(sampleKeys) >= 5 {
-					break
-				}
-			}
-			a.mu.RUnlock()
-			fmt.Printf("[GetImages] 查询无结果: normalizedFolder=%q folderIndexSamples=%v\n",
-				normalizedFolder, sampleKeys)
-			// ★ 即席优先扫描：点开的子文件夹还没被后台大扫描扫到时，
-			//   立即只扫这一个文件夹(含子树)，扫到内容就直接返回（"点哪个先出哪个"）。
-			//   仅首屏(offset==0)触发；根目录/未注册目录由 scanSubfolderImmediate 返回 nil 交给常规流程。
-			// ★ 用原始反斜杠路径(folder)做磁盘 IO，iBeacon: Windows 更稳;内部再做大小写不敏感匹配。
+			// ★ 即席优先扫描（仅首屏）：点开的子文件夹还没被后台大扫描扫到时，
+			//   立即只扫这一个文件夹（含子树），diff 直写 DB，然后重查一次。
+			//   ★ 用原始反斜杠路径(folder)做磁盘 IO，Windows 更稳；内部再做大小写不敏感匹配。
 			if offset == 0 {
-				if scanned := a.scanSubfolderImmediate(folder); len(scanned) > 0 {
-					results = results[:0]
-					seen2 := make(map[string]bool)
-					a.mu.RLock()
-					for fk := range a.folderIndex {
-						if fk == normalizedFolder || strings.HasPrefix(fk, normalizedFolder+"/") {
-							for _, id := range a.folderIndex[fk] {
-								if seen2[id] {
-									continue
-								}
-								seen2[id] = true
-								if e, ok := a.images[id]; ok {
-									results = append(results, e)
-								}
-							}
-						}
+				if scanned := a.scanSubfolderImmediate(folder); scanned > 0 {
+					entries2, dbTotal2, err2 := a.imageDB.LoadImageCacheByPathPrefixPaged(pathPrefix, offset, limit, sortOrder)
+					if err2 == nil && dbTotal2 > 0 {
+						fmt.Printf("[GetImages] 即席扫描后 SQL 命中: folder=%q total=%d\n", normalizedFolder, dbTotal2)
+						return buildItems(entries2, dbTotal2)
 					}
-					a.mu.RUnlock()
 				}
-			}
-			if len(results) == 0 {
 				// ★ 自愈：目录存在但无任何记录（历史误删/中断扫描）→ 后台补扫该文件夹，
 				//   完成后 scan:complete 驱动前端自动重拉，标签点击无需手动刷新即可恢复。
 				a.autoHealMissingFolder(normalizedFolder)
 			}
 		}
 
-		total = len(results)
-		// 排序
-		sortImageEntries(results, sortOrder)
-		// 分页
-		if offset > len(results) {
-			offset = len(results)
-		}
-		end := len(results)
-		if limit > 0 && offset+limit < end {
-			end = offset + limit
-		}
-		paged := results[offset:end]
-
-		safe := make([]SafeImage, len(paged))
-		// ★ 懒尺寸：不再同步算(慢盘 ~920ms/张 × 250 = 数分钟卡顿！)，
-		//   默认 4:3 占位，尺寸由后台 backfillImageDimensions 回填。
-		var dimBackfill []*ImageEntry
-		for i, entry := range paged {
-			w, h := entry.Width, entry.Height
-			needBackfill := !entry.IsVideo && (w == 0 || h == 0)
-			if needBackfill {
-				w, h = 400, 300
-				dimBackfill = append(dimBackfill, entry)
-			}
-			safe[i] = SafeImage{
-				ID:           entry.ID,
-				Name:         entry.Name,
-				Path:         entry.Path,
-				Size:         entry.Size,
-				LastModified: entry.LastModified,
-				CreatedAt:    entry.CreatedAt,
-				Folder:       entry.Folder,
-				RootPath:     entry.RootPath,
-				URL:          entry.URL,
-				ThumbURL:     fmt.Sprintf("/thumb/%s", entry.ID),
-				Width:        w,
-				Height:       h,
-				IsVideo:      entry.IsVideo,
-			}
-		}
-		if len(dimBackfill) > 0 {
-			go a.backfillImageDimensions(dimBackfill)
-		}
-		return &ImageListResult{Items: safe, Total: total, Offset: offset, Limit: limit}
+		return &ImageListResult{Items: []SafeImage{}, Total: 0, Offset: offset, Limit: limit}
 	}
 
 	// folder == ""：SQL 分页加载（不再全量遍历 a.images）
@@ -1630,15 +1389,25 @@ func (a *App) FullRescanFolder(rootPath string) (result *ScanResult) {
 			return &ImageListResult{Items: []SafeImage{}, Total: 0, Offset: offset, Limit: limit}
 		}
 		count, _ := a.imageDB.CountImageCache()
-		total = count
+		total := count
 		safe := make([]SafeImage, len(entries))
 		var dimBackfill []*ImageEntry
+		var dimUpdates []dimUpdate
+		syncBudget := dimSyncBudgetPerPage
 		for i, e := range entries {
 			entry := toImageEntry(e)
 			w, h := entry.Width, entry.Height
 			needBackfill := !entry.IsVideo && (w == 0 || h == 0)
+			if needBackfill && syncBudget > 0 {
+				// ★ 尺寸按需优先（同 folder 分支）：首屏页内快路径同步补齐
+				if sw, sh := fastImageDimensions(entry.Path); sw > 0 && sh > 0 {
+					w, h = sw, sh
+					needBackfill = false
+					syncBudget--
+					dimUpdates = append(dimUpdates, dimUpdate{id: entry.ID, w: sw, h: sh})
+				}
+			}
 			if needBackfill {
-				w, h = 400, 300
 				dimBackfill = append(dimBackfill, entry)
 			}
 			safe[i] = SafeImage{
@@ -1657,6 +1426,7 @@ func (a *App) FullRescanFolder(rootPath string) (result *ScanResult) {
 				IsVideo:      entry.IsVideo,
 			}
 		}
+		a.writeDimsAsync(dimUpdates)
 		if len(dimBackfill) > 0 {
 			go a.backfillImageDimensions(dimBackfill)
 		}
@@ -1698,11 +1468,21 @@ func (a *App) GetImagesByPaths(paths []string, offset int, limit int, sortOrder 
 
 	safe := make([]SafeImage, len(paged))
 	var dimBackfill []*ImageEntry
+	var dimUpdates []dimUpdate
+	syncBudget := dimSyncBudgetPerPage
 	for i, entry := range paged {
 		w, h := entry.Width, entry.Height
 		needBackfill := !entry.IsVideo && (w == 0 || h == 0)
+		if needBackfill && syncBudget > 0 {
+			// ★ 尺寸按需优先（同 GetImages）：页内快路径同步补齐
+			if sw, sh := fastImageDimensions(entry.Path); sw > 0 && sh > 0 {
+				w, h = sw, sh
+				needBackfill = false
+				syncBudget--
+				dimUpdates = append(dimUpdates, dimUpdate{id: entry.ID, w: sw, h: sh})
+			}
+		}
 		if needBackfill {
-			w, h = 400, 300
 			dimBackfill = append(dimBackfill, entry)
 		}
 		safe[i] = SafeImage{
@@ -1721,10 +1501,35 @@ func (a *App) GetImagesByPaths(paths []string, offset int, limit int, sortOrder 
 			IsVideo:      entry.IsVideo,
 		}
 	}
+	a.writeDimsAsync(dimUpdates)
 	if len(dimBackfill) > 0 {
 		go a.backfillImageDimensions(dimBackfill)
 	}
 	return &ImageListResult{Items: safe, Total: total, Offset: offset, Limit: limit}
+}
+
+// dimUpdate 一次按需补齐的尺寸（待写库）
+type dimUpdate struct {
+	id string
+	w  int
+	h  int
+}
+
+// dimSyncBudgetPerPage 每次 GetImages 响应里同步快解析尺寸的预算（张）。
+// 头部快路径 <1ms/张，300 张 ≈ 100ms 内；超出预算与快路径失败的转后台回填，
+// 保证 GetImages 永不被慢路径（vips/全文件 EXIF）拖住。
+const dimSyncBudgetPerPage = 300
+
+// writeDimsAsync 批量把按需补齐的尺寸写库（异步，不阻塞响应；重复写幂等）
+func (a *App) writeDimsAsync(updates []dimUpdate) {
+	if len(updates) == 0 || a.imageDB == nil {
+		return
+	}
+	go func() {
+		for _, u := range updates {
+			a.imageDB.UpdateImageDimensions(u.id, u.w, u.h)
+		}
+	}()
 }
 
 // sortImageEntries 根据 sortOrder 排序图片列表（原地）。
@@ -1783,6 +1588,7 @@ func sortImageEntries(results []*ImageEntry, sortOrder string) {
 	}
 }
 
+// GetFolders 文件夹树（★ M3：纯 SQL——folders 表 + 预览 DB 兜底，不再构建内存索引）。
 func (a *App) GetFolders() []*FolderNode {
 	// ★ 直接读内存缓存的 thumbCounts，不触发 BoltDB 全表扫描
 	thumbCounts := a.getCachedThumbCounts()
@@ -1797,33 +1603,50 @@ func (a *App) GetFolders() []*FolderNode {
 	}
 	// ★ 已开启"子文件夹缩略图预览"的路径集合（读 SQLite，不放锁内）
 	previewRoots := a.loadPreviewRoots()
-	// ★ 预取开启预览文件夹的预览数据：内存 folderIndex 已加载的直接取，
-	//   未加载（LRU 未命中）的走 SQLite 兜底，保证预览不依赖内存加载状态
+	// ★ 预取开启预览文件夹的预览数据：全部走 SQLite（带内存缓存，避免重复 COUNT+OFFSET 查询）
 	previews := a.collectPreviewData(previewRoots)
 	fmt.Printf("[预览] GetFolders: 开启 %d 个预览根, 预取到 %d 个文件夹的预览\n", len(previewRoots), len(previews))
+
+	// 从 folders 表加载全部根的树（一次查询，按根分组）
+	rowsByRoot := make(map[string][]database.FolderRow)
+	if a.imageDB != nil {
+		if allRows, err := a.imageDB.LoadAllFolderTrees(); err == nil {
+			for _, row := range allRows {
+				rowsByRoot[row.RootPath] = append(rowsByRoot[row.RootPath], row)
+			}
+		}
+	}
+
+	// 快照已注册根目录（不持锁做树构建）
 	a.mu.RLock()
-	defer a.mu.RUnlock()
-	fmt.Printf("[GetFolders] registeredRoots 数量 = %d\n", len(a.registeredRoots))
-	var roots []*FolderNode
+	rootPaths := make([]string, 0, len(a.registeredRoots))
 	for rootPath := range a.registeredRoots {
+		rootPaths = append(rootPaths, rootPath)
+	}
+	a.mu.RUnlock()
+
+	fmt.Printf("[GetFolders] registeredRoots 数量 = %d\n", len(rootPaths))
+	var roots []*FolderNode
+	for _, rootPath := range rootPaths {
 		rootName := filepath.Base(rootPath)
 		normalizedRoot := strings.ReplaceAll(rootPath, "\\", "/")
+		// ★ 计数以 folders 表为唯一真相（嵌套根记在外层父根名下）
+		imageCount := a.dbSubtreeCount(normalizedRoot)
+		if imageCount < 0 {
+			imageCount = 0
+		}
 		node := &FolderNode{
 			Name:       rootName,
 			Path:       rootPath,
-			ImageCount: a.folderCount[normalizedRoot],
+			ImageCount: imageCount,
 			ThumbCount: thumbCounts[normalizedRoot],
-			Children:   a.buildFolderTreeFromIndex(rootPath, thumbCounts, previews),
+			Children:   a.buildFolderTreeFromDB(rootPath, rowsByRoot[rootPath], thumbCounts, previews),
 		}
 		// ★ 根节点自身也支持预览
 		if ps, ok := previews[normalizedRoot]; ok && len(ps) > 0 {
 			node.Previews = ps
 		}
 		roots = append(roots, node)
-		// ★ 诊断：每个根的实际计数 + folderCount 里是否缺该键
-		fc, hasFC := a.folderCount[normalizedRoot]
-		fmt.Printf("[删除诊断] GetFolders 根=%s ImageCount=%d folderCount[%s]=%d hasKey=%v folderIndexKeys=%d\n",
-			rootPath, node.ImageCount, normalizedRoot, fc, hasFC, len(a.folderIndex))
 	}
 	sort.Slice(roots, func(i, j int) bool {
 		return roots[i].Name < roots[j].Name
@@ -1832,32 +1655,27 @@ func (a *App) GetFolders() []*FolderNode {
 }
 
 // collectPreviewData 为所有命中"已开启预览"子树的文件夹取预览数据。
-// 内存 folderIndex 已加载的直接用；未加载进 LRU 的走 SQLite 兜底（不污染 LRU/内存）。
+// ★ M3：全部走 SQLite（folderPreviewsCachedFromDB 带内存缓存），不依赖内存索引。
 func (a *App) collectPreviewData(previewRoots map[string]bool) map[string][]FolderPreview {
 	result := make(map[string][]FolderPreview)
-	if len(previewRoots) == 0 {
+	if len(previewRoots) == 0 || a.imageDB == nil {
 		return result
 	}
-	// 1. 内存路径：命中预览子树的文件夹，folderIndex 有 ID 就直接取
-	var dbKeys []string
-	a.mu.RLock()
-	for key := range a.folderIndex {
+	allRows, err := a.imageDB.LoadAllFolderTrees()
+	if err != nil {
+		return result
+	}
+	for _, row := range allRows {
+		rootNorm := strings.ReplaceAll(row.RootPath, "\\", "/")
+		key := rootNorm
+		if row.Folder != "" {
+			key = rootNorm + "/" + row.Folder
+		}
 		if !inPreviewSubtree(key, previewRoots) {
 			continue
 		}
-		if ids := a.folderIndex[key]; len(ids) > 0 {
-			result[key] = a.pickFolderPreviews(ids, key, 4)
-		} else {
-			dbKeys = append(dbKeys, key) // 未加载，待 SQLite 兜底
-		}
-	}
-	a.mu.RUnlock()
-	// 2. SQLite 兜底：未加载进 LRU 的文件夹也能取到预览（带内存缓存，避免反复 COUNT+OFFSET 查询）
-	if len(dbKeys) > 0 && a.imageDB != nil {
-		for _, key := range dbKeys {
-			if ps := a.folderPreviewsCachedFromDB(key, 4); len(ps) > 0 {
-				result[key] = ps
-			}
+		if ps := a.folderPreviewsCachedFromDB(key, 4); len(ps) > 0 {
+			result[key] = ps
 		}
 	}
 	return result
@@ -1967,39 +1785,13 @@ func (a *App) loadPreviewRoots() map[string]bool {
 	return result
 }
 
-// GetFolderCount 只返回单个文件夹的图片数量，不重建整棵树。
+// GetFolderCount 只返回单个文件夹的图片数量（含子树），不重建整棵树。
 // pollScanProgress 用这个替代 GetFolders，避免每次轮询都 O(N) 构建树。
-// 返回 -1 表示该路径尚未被 registeredRoots 覆盖。
+// ★ M3：直接查 folders 表（dbSubtreeCount），返回 -1 表示该路径尚未被
+// registeredRoots 覆盖（语义与旧内存实现一致）。
 func (a *App) GetFolderCount(folderPath string) int {
 	normalized := strings.ReplaceAll(folderPath, "\\", "/")
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-
-	// 先精确匹配
-	if c, ok := a.folderCount[normalized]; ok {
-		return c
-	}
-	// 无直接记录时，检查是否属于某个已注册根目录的子路径
-	for root := range a.registeredRoots {
-		rootNorm := strings.ReplaceAll(root, "\\", "/")
-		if strings.HasPrefix(normalized, rootNorm+"/") {
-			// 子文件夹：从 folderIndex 计算
-			count := 0
-			seen := make(map[string]bool)
-			for folderKey, ids := range a.folderIndex {
-				if folderKey == normalized || strings.HasPrefix(folderKey, normalized+"/") {
-					for _, id := range ids {
-						if !seen[id] {
-							seen[id] = true
-							count++
-						}
-					}
-				}
-			}
-			return count
-		}
-	}
-	return -1
+	return a.dbSubtreeCount(normalized)
 }
 
 func (a *App) GetFolderProgress(folderPath string) map[string]int {
@@ -2019,25 +1811,21 @@ func (a *App) GetFolderProgress(folderPath string) map[string]int {
 }
 
 func (a *App) GetImageFile(imageID string) *FileData {
-	a.mu.RLock()
-	entry, ok := a.images[imageID]
-	a.mu.RUnlock()
-	if !ok {
-		// LRU 未命中：回退 SQLite 单点查询
-		if a.imageDB != nil {
-			if e, err := a.imageDB.GetImageEntry(imageID); err == nil && e != nil {
-				entry = &ImageEntry{
-					ID: e.ID, Path: e.Path, Name: e.Name, Size: e.Size,
-					LastModified: e.LastModified, CreatedAt: e.CreatedAt,
-					Folder: e.Folder, RootPath: e.RootPath,
-					Width: e.Width, Height: e.Height, IsVideo: e.IsVideo,
-					URL: fmt.Sprintf("/image/%s", e.ID),
-				}
+	// ★ M3：纯 DB 单点查询（image_cache 全集）
+	var entry *ImageEntry
+	if a.imageDB != nil {
+		if e, err := a.imageDB.GetImageEntry(imageID); err == nil && e != nil {
+			entry = &ImageEntry{
+				ID: e.ID, Path: e.Path, Name: e.Name, Size: e.Size,
+				LastModified: e.LastModified, CreatedAt: e.CreatedAt,
+				Folder: e.Folder, RootPath: e.RootPath,
+				Width: e.Width, Height: e.Height, IsVideo: e.IsVideo,
+				URL: fmt.Sprintf("/image/%s", e.ID),
 			}
 		}
-		if entry == nil {
-			return nil
-		}
+	}
+	if entry == nil {
+		return nil
 	}
 	// ★ 高优先级队列：大图文件读取在独立 goroutine 中执行，
 	//   不会被排队中的缩略图生成（LOW）拖住。

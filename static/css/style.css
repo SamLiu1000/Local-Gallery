@@ -183,6 +183,8 @@ html, body {
     position: relative;
     gap: 6px;
     flex-wrap: wrap;
+    /* ★ 允许中栏收缩到内容以下，窄窗口时先压缩搜索条而不是挤开/重叠两侧 */
+    min-width: 0;
 }
 .topbar-right {
     flex-shrink: 0;
@@ -209,8 +211,10 @@ html, body {
     margin: 0 auto;
     width: 100%;
     max-width: 740px;
-    transform: translateX(65px);
     box-sizing: border-box;
+    /* ★ 移除 translateX(65px) 视觉居中 hack：窗口缩小时它会把搜索组推出
+       中栏、压到 topbar-right 按钮上。居中由 topbar-center 的 flex 分配完成 */
+    min-width: 0;
 }
 .search-bar {
     flex: 1;
@@ -1403,7 +1407,8 @@ body.is-resizing .panel-resizer {
     margin: 1px 0;
 }
 .tree-node.is-folder-dragging {
-    opacity: 0.3;
+    /* 拖拽中的文件夹：轻微半透明即可——之前 0.3 几乎看不清拖的是什么 */
+    opacity: 0.9;
 }
 /* 拖拽排序期间禁用所有非拖拽项的 hover 效果 */
 .is-dragging .tree-node-header:hover {
@@ -1774,6 +1779,16 @@ button {
     display: flex;
     align-items: center;
     gap: 8px;
+}
+/* ★ 收缩策略：右栏（提示词/锁/排序）永不缩让、绝不被遮挡；
+   左栏允许收缩并优雅截断（溢出隐藏），配合下方媒体查询逐级收纳 */
+.toolbar-left {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+}
+.toolbar-right {
+    flex-shrink: 0;
 }
 .layout-btn {
     background: var(--bg-input);
@@ -3410,14 +3425,38 @@ button {
 }
 .tag-tree .tag-tree-container.edit-tags .tag-item {
     padding-right: 0;
-    cursor: pointer;
+    cursor: grab;
+    /* ★ 无把手，整标签可拖；左侧删除坞位外扩 18px，需预留间距不压前一个标签 */
+    margin-right: 20px;
+}
+.tag-tree .tag-tree-container.edit-tags .tag-item:active {
+    cursor: grabbing;
 }
 .tag-tree .tag-tree-container.edit-tags .tag-item .tag-delete-btn {
     display: flex;
+    /* ★ 删除按钮 = 左侧独立坞位：固定尺寸小块，底色+描边+阴影，
+       不再挤在标签内部（标签文字因此不再被顶到边缘） */
+    position: absolute;
+    left: -18px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    margin: 0;
+    border-radius: 6px;
+    background: var(--bg-secondary, #2a2a35);
+    border: 1px solid var(--border-color, #444);
+    box-shadow: 0 1px 4px rgba(0,0,0,0.25);
+    color: var(--text-secondary);
+    z-index: 2;
+    transition: transform .12s, color .12s, border-color .12s, background .12s;
 }
-/* 拖拽手柄在编辑模式下的光标样式 */
-.tag-tree .tag-tree-container.edit-tags .tag-item .tag-drag-handle {
-    cursor: grab;
+.tag-tree .tag-tree-container.edit-tags .tag-item .tag-delete-btn:hover {
+    transform: translateY(-50%) scale(1.1);
+    color: #e94560;
+    border-color: rgba(233, 69, 96, 0.55);
+    background: rgba(233, 69, 96, 0.12);
 }
 .tag-tree .tag-tree-container.edit-tags .tag-item .tag-drag-handle:active {
     cursor: grabbing;
@@ -3604,7 +3643,8 @@ button {
     box-shadow: 0 0 0 2px rgba(0,0,0,0.06), 0 3px 12px rgba(0,0,0,0.18);
     outline: 2px solid rgba(0,0,0,0.06);
     outline-offset: 2px;
-    transition: margin-left 0.2s cubic-bezier(0.34, 1.56, 0.64, 1), width 0.2s ease-out;
+    /* ★ 不加过渡：拖拽时占位条必须零延迟跟手；
+       0.2s 弹性 margin-left 过渡会让占位条永远慢半拍并回弹 */
 }
 
 /* --- 创建标签对话框：样式选择器 --- */
@@ -3787,9 +3827,11 @@ button {
 }
 .tag-folder-icon {
     font-size: 11px;
-    margin-left: 4px;
-    opacity: 0.6;
+    /* ★ 与文字保持一档间距，右侧不贴胶囊描边 */
+    margin: 0 2px 0 6px;
+    opacity: 0.65;
     flex-shrink: 0;
+    line-height: 1;
 }
 
 .tag-icon-img {
@@ -4230,6 +4272,20 @@ button {
         --left-panel-width: 260px;
         --right-panel-width: 360px;
     }
+    /* ★ 窄窗口：顶栏按钮退化为纯图标，避免与搜索组互相挤压遮挡 */
+    .topbar-right button span[data-i18n] { display: none; }
+    .topbar-right button { padding: 6px 9px; }
+    .app-version { display: none; }
+    /* ★ 画廊工具栏逐级收纳：先收次要信息，再收文字只留图标 */
+    #thumbnailSizeValue { display: none; }
+    .thumbnail-slider input[type="range"] { width: 64px; }
+    .image-count { display: none; }
+    .toolbar-left button span[data-i18n] { display: none; }
+    .toolbar-left button { padding: 6px 8px; }
+}
+@media (max-width: 1000px) {
+    /* ★ 更窄：缩略图滑条整体收起（布局切换按钮仍在） */
+    .thumbnail-slider { display: none; }
 }
 @media (max-width: 900px) {
     :root {
@@ -5422,3 +5478,173 @@ body.mobile .image-viewer-container.fullscreen .image-viewer-shortcuts {
 }
 
 #btnRefresh.spinning .icon-reload { animation: spin 0.8s linear infinite; }
+
+/* ==================== 编辑模式：双击重命名浮窗 ==================== */
+.folder-rename-popover {
+    position: fixed;
+    z-index: 10000;
+    background: var(--bg-panel, #1e1f22);
+    border: 1px solid var(--border-color, #3a3b3f);
+    border-radius: var(--radius-md, 8px);
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    animation: frp-in 120ms ease-out;
+}
+@keyframes frp-in {
+    from { opacity: 0; transform: translateY(-4px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+.folder-rename-popover .frp-title {
+    font-size: 12px;
+    color: var(--text-secondary, #9aa0a6);
+}
+.folder-rename-popover .frp-input {
+    width: 100%;
+    box-sizing: border-box;
+}
+.folder-rename-popover .frp-btn-row {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+}
+.folder-rename-popover .frp-btn {
+    padding: 4px 14px;
+    border-radius: var(--radius-sm, 6px);
+    border: 1px solid var(--border-color, #3a3b3f);
+    background: transparent;
+    color: var(--text-primary, #e8eaed);
+    cursor: pointer;
+    font-size: 12px;
+}
+.folder-rename-popover .frp-btn:hover {
+    background: var(--bg-tertiary, #2a2b2f);
+}
+.folder-rename-popover .frp-ok {
+    background: var(--accent, #e94560);
+    border-color: var(--accent, #e94560);
+    color: #fff;
+}
+.folder-rename-popover .frp-ok:hover {
+    filter: brightness(1.1);
+    background: var(--accent, #e94560);
+}
+
+/* ==================== 收纳夹：横向半透明长条 ==================== */
+.folder-bin {
+    margin: 4px 0;
+}
+.folder-bin-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    box-sizing: border-box;
+    min-height: 34px;
+    padding: 4px 10px;
+    border-radius: var(--radius-md, 8px);
+    background: rgba(233, 69, 96, 0.10);
+    border: 1px solid rgba(233, 69, 96, 0.25);
+    backdrop-filter: blur(2px);
+    cursor: pointer;
+    transition: background 150ms ease, border-color 150ms ease;
+}
+.folder-bin-bar:hover {
+    background: rgba(233, 69, 96, 0.16);
+    border-color: rgba(233, 69, 96, 0.4);
+}
+.folder-bin-bar.drag-over-bin {
+    background: rgba(233, 69, 96, 0.28);
+    border-color: var(--accent, #e94560);
+    box-shadow: 0 0 0 1px var(--accent, #e94560) inset;
+}
+.folder-bin-bar .bin-handle {
+    cursor: grab;
+    opacity: 0.55;
+}
+.folder-bin-bar .bin-toggle {
+    font-size: 10px;
+    color: var(--text-secondary, #9aa0a6);
+    width: 12px;
+    flex-shrink: 0;
+}
+.folder-bin-bar .bin-icon {
+    display: flex;
+    align-items: center;
+}
+.folder-bin-bar .bin-name {
+    font-weight: 600;
+    font-size: 13px;
+    color: var(--text-primary, #e8eaed);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.folder-bin-bar .bin-count {
+    font-size: 11px;
+    color: var(--text-secondary, #9aa0a6);
+    flex-shrink: 0;
+}
+.folder-bin-bar .bin-actions {
+    margin-left: auto;
+    display: flex;
+    visibility: hidden;
+    opacity: 0;
+    transition: opacity 120ms ease;
+}
+.folder-bin-bar:hover .bin-actions {
+    visibility: visible;
+    opacity: 1;
+}
+.bin-dissolve-btn {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: var(--radius-sm, 6px);
+    border: 1px solid var(--border-color, #3a3b3f);
+    background: transparent;
+    color: var(--text-secondary, #9aa0a6);
+    cursor: pointer;
+}
+.bin-dissolve-btn:hover {
+    color: var(--text-primary, #e8eaed);
+    border-color: var(--accent, #e94560);
+}
+/* 收纳夹内部文件夹：缩进 + 左侧引导线 */
+.folder-bin-children {
+    margin: 2px 0 6px 14px;
+    padding-left: 6px;
+    border-left: 2px solid rgba(233, 69, 96, 0.25);
+}
+
+/* ★ 后台操作状态徽标（图廊工具栏）：扫描/导入、自动预生成缩略图期间显示 */
+.bg-op-status {
+    display: none;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    line-height: 18px;
+    color: var(--text-secondary, #9aa0a6);
+    background: var(--bg-tertiary, rgba(127, 127, 127, 0.12));
+    border: 1px solid var(--border-color, rgba(127, 127, 127, 0.25));
+    border-radius: 999px;
+    padding: 2px 10px 2px 8px;
+    white-space: nowrap;
+    max-width: 340px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.bg-op-status::before {
+    content: '';
+    flex-shrink: 0;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--accent, #4a9eff);
+    animation: bgop-pulse 1.2s ease-in-out infinite;
+}
+@keyframes bgop-pulse {
+    0%, 100% { opacity: 0.3; }
+    50% { opacity: 1; }
+}

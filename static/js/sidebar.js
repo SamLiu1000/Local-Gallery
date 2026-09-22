@@ -481,6 +481,15 @@ const Sidebar = (() => {
             btnEditFolderOrder.addEventListener('click', toggleEditFolderOrder);
         }
 
+        // ★ 新建收纳夹（编辑模式显示）
+        const btnAddFolderBin = document.getElementById('btnAddFolderBin');
+        if (btnAddFolderBin) {
+            btnAddFolderBin.addEventListener('click', () => {
+                if (!isEditingFolderOrder) return;
+                addFolderBin();
+            });
+        }
+
         const btnCollapseAll = document.getElementById('btnCollapseAllFolders');
         if (btnCollapseAll) {
             btnCollapseAll.addEventListener('click', collapseAllFolders);
@@ -664,6 +673,15 @@ const Sidebar = (() => {
     /**
      * 从 SQLite 加载文件夹展开状态
      */
+    // ★ 展开状态缓存的统一键：同一文件夹在不同来源（后端返回/前端乐观插入/
+    //   定位跳转）路径写法可能不同（盘符大小写/斜杠方向），原始字符串做键会把
+    //   "展开=true"和"折叠=false"写到两个键上——刷新时旧 true 被重新应用，
+    //   表现为"导入/刷新时其它文件夹莫名其妙自动展开"。统一规范化后一个
+    //   文件夹只有一个键。
+    function pathCacheKey(p) {
+        return (p || '').replace(/[\\\/]+/g, '/').replace(/\/+$/g, '').toLowerCase();
+    }
+
     async function initExpandedStates() {
         if (expandedStateCache !== null) return;
         expandedStateCache = new Map();
@@ -697,7 +715,7 @@ const Sidebar = (() => {
         } catch (e) {}
         if (saved) {
             for (const [path, expanded] of Object.entries(saved)) {
-                expandedStateCache.set(path, expanded);
+                expandedStateCache.set(pathCacheKey(path), expanded);
             }
         }
     }
@@ -706,8 +724,8 @@ const Sidebar = (() => {
     function applyExpandedStates(treeNodes) {
         function apply(nodes) {
             for (const node of nodes) {
-                if (expandedStateCache.has(node.path)) {
-                    node.expanded = expandedStateCache.get(node.path);
+                if (expandedStateCache.has(pathCacheKey(node.path))) {
+                    node.expanded = expandedStateCache.get(pathCacheKey(node.path));
                 } else {
                     // 新文件夹默认折叠，用户手动展开
                     node.expanded = false;
@@ -758,20 +776,30 @@ const Sidebar = (() => {
 
             if (!Array.isArray(orderList)) orderList = [];
 
-            // 构建顺序 Map
+            // 构建顺序 Map：★ 键用规范化路径——后端 GetFolders 根顺序来自 Go map
+            //   遍历（每次随机），且不同来源路径斜杠/大小写可能不同，原始字符串
+            //   匹配会失配 → 整树每次按随机顺序重建并写回，表现为"文件夹随机跑"。
             const orderMap = new Map();
             orderList.forEach((path, index) => {
-                orderMap.set(path, index);
+                orderMap.set(pathCacheKey(path), index);
             });
 
-            // 新文件夹自动追加到列表末尾
+            // ★ 新文件夹确定性追加到列表末尾：按添加时间（旧→新）再按名称排序，
+            //   保证"新导入的固定在底部"，不受后端随机顺序影响。
+            const known = treeNodes.filter(n => orderMap.has(pathCacheKey(n.path)));
+            const fresh = treeNodes.filter(n => !orderMap.has(pathCacheKey(n.path)));
+            fresh.sort((a, b) => {
+                const ad = a.addedAt || '', bd = b.addedAt || '';
+                if (ad !== bd) return ad < bd ? -1 : 1;
+                const an = (a.displayName || a.name || '').toLowerCase();
+                const bn = (b.displayName || b.name || '').toLowerCase();
+                return an.localeCompare(bn, 'zh-CN');
+            });
             let changed = false;
-            for (const node of treeNodes) {
-                if (!orderMap.has(node.path)) {
-                    orderMap.set(node.path, orderList.length);
-                    orderList.push(node.path);
-                    changed = true;
-                }
+            for (const node of fresh) {
+                orderList.push(node.path);
+                orderMap.set(pathCacheKey(node.path), orderList.length - 1);
+                changed = true;
             }
             if (changed) {
                 if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails()) {
@@ -782,11 +810,12 @@ const Sidebar = (() => {
             }
 
             treeNodes.sort((a, b) => {
-                const ai = orderMap.get(a.path);
-                const bi = orderMap.get(b.path);
+                const ai = orderMap.get(pathCacheKey(a.path));
+                const bi = orderMap.get(pathCacheKey(b.path));
                 // 两个都应该在 orderMap 中（新节点已自动追加）
                 return (ai ?? orderList.length) - (bi ?? orderList.length);
             });
+            void orderedNodes;
         } catch (err) {
             console.warn('[Sidebar] 加载文件夹排序失败:', err.message);
         }
@@ -1002,7 +1031,14 @@ const Sidebar = (() => {
         }
         _lastTreeCacheSave = now;
         try {
-            const json = JSON.stringify(nodes.map(serializeFolderNode));
+            // ★ v2 格式：{ sig, nodes }。sig 是当前后端导入根列表的签名——
+            //   切换用户数据目录后（同一 WebView origin，localStorage 共享），
+            //   旧目录的树缓存与新目录不匹配，加载时直接作废，杜绝幽灵文件夹。
+            const json = JSON.stringify({
+                v: 2,
+                sig: treeCacheSignature(),
+                nodes: nodes.map(serializeFolderNode)
+            });
             if (json.length > 3500000) {
                 console.log('[删除诊断] saveFolderTreeCache 超 5MB 上限跳过: nodes=', nodes.map(n => n.path));
                 return;
@@ -1012,13 +1048,40 @@ const Sidebar = (() => {
         } catch (e) { /* 静默：缓存失败不影响功能 */ }
     }
 
-    function loadFolderTreeCache() {
+    // treeCacheSignature 当前已导入根列表的规范化签名（切用户目录后必然变化）
+    function treeCacheSignature() {
+        const roots = (typeof Gallery !== 'undefined' && Gallery.getImportedRoots) ? Gallery.getImportedRoots() : [];
+        return roots
+            .map(r => String(r.rootId || r.path || '').replace(/[\\\/]+/g, '/').toLowerCase())
+            .filter(Boolean)
+            .sort()
+            .join('|');
+    }
+
+    function loadFolderTreeCache(allowUnvalidated) {
         try {
+            // ★ 导入根列表已就绪时先验签名：不匹配（切换用户目录/导入列表变化）→ 作废。
+            // ★ 未就绪且 allowUnvalidated 时仍返回缓存：0 秒渲染优先——后端根列表 RPC
+            //   很快但整条启动链（Gallery 初始化等）有先后依赖，等它就 0 秒就没了。
+            //   未验证的缓存只用于首屏铺底，第一次 doRefreshFolderTree 拿到服务器树后
+            //   folderRoots 整体被权威数据替换，幽灵节点即使闪现也只存在到那时。
+            const rootsReady = typeof Gallery !== 'undefined' && Gallery.isImportedRootsLoaded && Gallery.isImportedRootsLoaded();
+            if (!rootsReady && !allowUnvalidated) return null;
             const json = localStorage.getItem(FOLDER_TREE_CACHE_KEY);
             if (!json) return null;
             const data = JSON.parse(json);
-            if (!Array.isArray(data) || data.length === 0) return null;
-            const loaded = data.map(deserializeFolderNode);
+            // 旧版裸数组格式（无签名）：无法判断属于哪个用户目录，直接作废
+            if (Array.isArray(data)) {
+                localStorage.removeItem(FOLDER_TREE_CACHE_KEY);
+                return null;
+            }
+            if (!data || data.v !== 2 || !Array.isArray(data.nodes) || data.nodes.length === 0) return null;
+            if (rootsReady && data.sig !== treeCacheSignature()) {
+                console.log('[删除诊断] loadFolderTreeCache 签名不匹配（用户目录/导入列表已变化），作废旧缓存');
+                localStorage.removeItem(FOLDER_TREE_CACHE_KEY);
+                return null;
+            }
+            const loaded = data.nodes.map(deserializeFolderNode);
             console.log('[删除诊断] loadFolderTreeCache 从 localStorage 加载: paths=', loaded.map(n => n.path));
             return loaded;
         } catch (e) {
@@ -1037,7 +1100,9 @@ const Sidebar = (() => {
         try {
             const json = localStorage.getItem(FOLDER_TREE_CACHE_KEY);
             if (!json) return;
-            const data = JSON.parse(json);
+            const parsed = JSON.parse(json);
+            if (!parsed) return;
+            const data = Array.isArray(parsed) ? parsed : (parsed.v === 2 ? parsed.nodes : null);
             if (!Array.isArray(data)) return;
             const filterRec = (nodes) => {
                 const out = [];
@@ -1053,7 +1118,8 @@ const Sidebar = (() => {
             };
             const cleaned = filterRec(data);
             if (cleaned.length !== data.length) {
-                localStorage.setItem(FOLDER_TREE_CACHE_KEY, JSON.stringify(cleaned));
+                const sig = (!Array.isArray(parsed) && parsed && parsed.sig) ? parsed.sig : treeCacheSignature();
+                localStorage.setItem(FOLDER_TREE_CACHE_KEY, JSON.stringify({ v: 2, sig: sig, nodes: cleaned }));
                 console.log('[删除诊断] purgeFolderFromTreeCache: 已从 localStorage 移除 ', normalizedPath, ' 剩余=', cleaned.map(n => n.p));
             } else {
                 console.log('[删除诊断] purgeFolderFromTreeCache: localStorage 未发现 ', normalizedPath, ' 当前缓存=', data.map(n => n.p));
@@ -1065,7 +1131,9 @@ const Sidebar = (() => {
         // ★ 0 秒渲染：启动时先用本地缓存的树立即渲染（好像一直在那里），
         //   不等待 GetFolders RPC；服务器数据返回后再刷新计数/结构。
         if (folderRoots.length === 0 && !options.sort) {
-            const cachedTree = loadFolderTreeCache();
+            // ★ 0 秒渲染：不等后端导入列表就绪，先用缓存铺底（未验证模式）；
+            //   服务器树返回后整体替换，签名不匹配的旧目录残留随之清除。
+            const cachedTree = loadFolderTreeCache(true);
             if (cachedTree && cachedTree.length > 0) {
                 // ★ 缓存只是"结构快照"，它带的展开标记和顺序是"上次写缓存那一刻"的，
                 //   可能已过期（用户随后又展开/折叠过，或缓存被 3 秒节流跳过没更新）。
@@ -1074,6 +1142,10 @@ const Sidebar = (() => {
                 try {
                     await initExpandedStates();
                     await loadFolderOrder(cachedTree);
+                    // ★ 收纳夹持久化数据也在此一并加载：否则首屏只有文件夹、
+                    //   收纳夹要等 GetFolders RPC 返回后才出现（先后两截）
+                    await loadFolderBins();
+                    syncBinsWithRoots();
                     applyExpandedStates(cachedTree);
                 } catch (e) { /* 读持久化失败则按缓存原样渲染 */ }
                 folderRoots = cachedTree;
@@ -1153,6 +1225,9 @@ const Sidebar = (() => {
 
             // 5. 排序：必须在首次渲染前完成，否则会看到跳动
             await loadFolderOrder(mergedTree);
+            // ★ 收纳夹：首次加载持久化数据，并把新根/消失根同步进序列
+            await loadFolderBins();
+            syncBinsWithRoots();
 
             // ★ 列排序（名称/添加日期）：仅在首次加载（应用保存的排序模式）
             //   或用户显式点击排序表头（options.sort=true）时应用。
@@ -1361,6 +1436,10 @@ const Sidebar = (() => {
 
     function renderFolderTree() {
         if (!folderTree) return;
+        // ★ 拖拽进行中禁止重建 DOM：后台事件（缩略图进度/扫描完成等）触发的重渲染
+        //   会把正在被拖拽的节点从 DOM 剥离 → 拖拽瞬间"无反应"。拖拽结束后
+        //   onFolderPointerUp 自己会刷新。
+        if (folderDrag && folderDrag.active) return;
 
         // ★ 实时筛选：递归匹配根/子文件夹（名称/显示名/路径），命中子文件夹时自动展开分支
         let visibleRoots = folderRoots;
@@ -1379,7 +1458,13 @@ const Sidebar = (() => {
         // ★ 性能修复：结构哈希（不含计数）——结构未变时只原地更新计数，
         //   避免缩略图生成/计数刷新期间整树重建导致的导航栏闪烁。
         //   用扁平字符串代替 JSON.stringify 全对象树（少分配，大目录树 5ms→2ms）。
-        const structureHash = buildFolderTreeHash(visibleRoots);
+        // ★ 收纳夹状态（数量/名称/折叠/成员/顺序）也计入结构哈希：
+        //   否则新建/解散/重排收纳夹后哈希不变 → 走原地更新捷径 → 界面不刷新。
+        const binHash = folderBins.map(b =>
+            b.id + '|' + b.name + '|' + (b.collapsed ? 1 : 0) + '|' + b.paths.map(pp => pathCacheKey(pp)).join(',')
+        ).join(';;') + '##' + navSequence.map(it => it.t === 'b' ? 'b:' + it.id : 'f:' + it.p).join(',')
+            + '##' + folderSortKey + (folderSortDesc ? ':desc' : ''); // ★ 列排序参与哈希：切排序键/方向必须重建
+        const structureHash = buildFolderTreeHash(visibleRoots) + '@@' + binHash;
         if (structureHash === lastFolderTreeHash && lastFolderTreeHash !== '') {
             // 计数可能变化：原地更新 .tree-count 文本与进度条，保留展开/滚动/高亮状态
             updateFolderCountsInPlace(visibleRoots);
@@ -1389,11 +1474,26 @@ const Sidebar = (() => {
 
         const fragment = document.createDocumentFragment();
 
-        for (let i = 0; i < visibleRoots.length; i++) {
-            const root = visibleRoots[i];
-            const rootEl = createFolderNode(root, 0);
-            rootEl.dataset.folderIndex = i;
-            fragment.appendChild(rootEl);
+        if (folderNavFilter) {
+            // ★ 筛选模式：平铺全部匹配项（收纳夹分组对搜索无意义）
+            for (let i = 0; i < visibleRoots.length; i++) {
+                const root = visibleRoots[i];
+                const rootEl = createFolderNode(root, 0);
+                fragment.appendChild(rootEl);
+            }
+        } else {
+            // ★ 收纳夹布局：顶层 = 文件夹与收纳夹按 navSequence 混排
+            const displayList = buildNavDisplayList();
+            for (const item of displayList) {
+                if (item.type === 'folder') {
+                    const rootEl = createFolderNode(item.node, 0);
+                    rootEl.dataset.dragRow = '1';
+                    rootEl.dataset.dndKey = 'f:' + pathCacheKey(item.node.path);
+                    fragment.appendChild(rootEl);
+                } else {
+                    fragment.appendChild(createBinNode(item.bin));
+                }
+            }
         }
 
         folderTree.innerHTML = '';
@@ -1467,6 +1567,16 @@ const Sidebar = (() => {
             header.classList.add('root-header');
         }
         header.dataset.path = node.path;
+
+        // ★ 编辑模式双击根文件夹 → 浮窗重命名（非原生弹窗）
+        if (node.isRoot) {
+            header.addEventListener('dblclick', (e) => {
+                if (!isEditingFolderOrder) return;
+                e.preventDefault();
+                e.stopPropagation();
+                openRenamePopover(node, header);
+            });
+        }
 
         // 展开/折叠按钮
         const toggle = document.createElement('span');
@@ -1897,20 +2007,51 @@ const Sidebar = (() => {
 
     /**
      * 移动文件夹节点（上移/下移）
+     * ★ 收纳夹功能加入后显示顺序由 navSequence / bin.paths 决定：
+     *   袋内文件夹在其收纳夹 paths 内移动；顶层文件夹在 navSequence 中
+     *   与相邻顶层项（文件夹或收纳夹）交换。直接移 folderRoots 无效。
      * @param {string} path - 节点路径
      * @param {number} direction - 移动方向：-1 上移，1 下移
      */
     function moveFolderNode(path, direction) {
-        const index = folderRoots.findIndex(n => n.path === path);
-        if (index === -1) return;
+        const key = pathCacheKey(path);
 
+        // ---- 袋内文件夹：在所属收纳夹内部上下移动 ----
+        const bin = folderBins.find(b => b.paths.some(p => pathCacheKey(p) === key));
+        if (bin) {
+            const idx = bin.paths.findIndex(p => pathCacheKey(p) === key);
+            const ni = idx + direction;
+            if (ni < 0 || ni >= bin.paths.length) return;
+            const [moved] = bin.paths.splice(idx, 1);
+            bin.paths.splice(ni, 0, moved);
+            saveFolderBins();
+            lastFolderTreeHash = '';
+            renderFolderTree();
+            return;
+        }
+
+        // ---- 顶层文件夹：在 navSequence 中与相邻项交换 ----
+        const idx = navSequence.findIndex(it => it.t === 'f' && it.p === key);
+        if (idx !== -1) {
+            const ni = idx + direction;
+            if (ni < 0 || ni >= navSequence.length) return;
+            const [it] = navSequence.splice(idx, 1);
+            navSequence.splice(ni, 0, it);
+            syncFolderRootsOrderToSequence();
+            saveFolderBins();
+            saveFolderOrder();
+            lastFolderTreeHash = '';
+            renderFolderTree();
+            return;
+        }
+
+        // ---- 兜底：序列里没有（极端时序）按旧逻辑移 folderRoots ----
+        const index = folderRoots.findIndex(n => pathCacheKey(n.path) === key);
+        if (index === -1) return;
         const newIndex = index + direction;
         if (newIndex < 0 || newIndex >= folderRoots.length) return;
-
-        // 交换位置
         const [removed] = folderRoots.splice(index, 1);
         folderRoots.splice(newIndex, 0, removed);
-
         renderFolderTree();
         saveFolderOrder();
     }
@@ -2040,7 +2181,7 @@ const Sidebar = (() => {
     function toggleExpand(node, container) {
         node.expanded = !node.expanded;
         // ★ 写内存缓存（即时生效，无 IO）
-        expandedStateCache.set(node.path, node.expanded);
+        expandedStateCache.set(pathCacheKey(node.path), node.expanded);
 
         const toggle = container.querySelector('.tree-toggle');
         const children = container.querySelector('.tree-children');
@@ -2093,7 +2234,7 @@ const Sidebar = (() => {
         // 1. 收缩被点击的文件夹
         if (node.expanded) {
             node.expanded = false;
-            expandedStateCache.set(node.path, false);
+            expandedStateCache.set(pathCacheKey(node.path), false);
             const toggle = container.querySelector(':scope > .tree-node-header > .tree-toggle');
             if (toggle) toggle.classList.remove('expanded');
             const children = container.querySelector(':scope > .tree-children');
@@ -2207,7 +2348,7 @@ const Sidebar = (() => {
         function collapseRecursive(nodes) {
             for (const node of nodes) {
                 node.expanded = false;
-                expandedStateCache.set(node.path, false);
+                expandedStateCache.set(pathCacheKey(node.path), false);
                 if (node.children && node.children.length > 0) {
                     collapseRecursive(node.children);
                 }
@@ -2360,6 +2501,109 @@ const Sidebar = (() => {
         }
     }
 
+    // ==================== 编辑模式：双击浮窗重命名 ====================
+
+    // ★ 工具浮窗重命名（非浏览器原生 prompt）：定位到节点旁边，Enter/确定提交，
+    //   Esc/取消/点击外部关闭。仅编辑模式双击根文件夹触发。
+    let renamePopover = null;
+
+    function closeRenamePopover() {
+        if (renamePopover && renamePopover.parentNode) {
+            renamePopover.parentNode.removeChild(renamePopover);
+        }
+        renamePopover = null;
+        document.removeEventListener('mousedown', renamePopoverOutside, true);
+    }
+
+    function renamePopoverOutside(e) {
+        if (renamePopover && !renamePopover.contains(e.target)) closeRenamePopover();
+    }
+
+    function openRenamePopover(node, anchorEl) {
+        closeRenamePopover();
+        const currentName = node.__isBin ? node.name : (node.displayName || node.name || '');
+
+        const pop = document.createElement('div');
+        pop.className = 'folder-rename-popover';
+
+        const title = document.createElement('div');
+        title.className = 'frp-title';
+        title.textContent = t('sidebar.rename_popover_title');
+
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'tree-rename-input frp-input';
+        input.value = currentName;
+
+        const btnRow = document.createElement('div');
+        btnRow.className = 'frp-btn-row';
+        const ok = document.createElement('button');
+        ok.className = 'frp-btn frp-ok';
+        ok.textContent = t('sidebar.rename_popover_ok');
+        const cancel = document.createElement('button');
+        cancel.className = 'frp-btn frp-cancel';
+        cancel.textContent = t('sidebar.rename_popover_cancel');
+        btnRow.appendChild(ok);
+        btnRow.appendChild(cancel);
+
+        pop.appendChild(title);
+        pop.appendChild(input);
+        pop.appendChild(btnRow);
+        document.body.appendChild(pop);
+
+        // 定位：锚点正下方，越界时翻转到上方并夹在视口内
+        const r = anchorEl.getBoundingClientRect();
+        const pw = Math.max(220, Math.min(320, r.width + 60));
+        pop.style.width = pw + 'px';
+        const ph = pop.offsetHeight || 120;
+        let left = r.left + r.width / 2 - pw / 2;
+        left = Math.max(8, Math.min(window.innerWidth - pw - 8, left));
+        let top = r.bottom + 6;
+        if (top + ph > window.innerHeight - 8) top = r.top - ph - 6;
+        pop.style.left = left + 'px';
+        pop.style.top = Math.max(8, top) + 'px';
+
+        async function submit() {
+            const newName = input.value.trim();
+            closeRenamePopover();
+            if (!newName || newName === currentName) return;
+            // ★ 收纳夹重命名：直接改内存 + 持久化 + 重渲染
+            if (node.__isBin) {
+                const bin = folderBins.find(b => b.id === node.id);
+                if (bin) {
+                    bin.name = newName;
+                    saveFolderBins();
+                    refreshFolderTree();
+                }
+                return;
+            }
+            if (typeof Gallery !== 'undefined' && Gallery.renameImportedRoot) {
+                const success = await Gallery.renameImportedRoot(node.path, newName);
+                if (success) {
+                    App.showToast(t('sidebar.folder_renamed_to', { name: newName }), 'success');
+                } else {
+                    App.showToast(t('sidebar.rename_not_found'), 'error');
+                }
+                refreshFolderTree();
+            } else {
+                App.showToast(t('sidebar.renamed_may_lose', { name: newName }), 'warning');
+            }
+        }
+
+        ok.addEventListener('click', submit);
+        cancel.addEventListener('click', closeRenamePopover);
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); submit(); }
+            else if (e.key === 'Escape') { e.preventDefault(); closeRenamePopover(); }
+        });
+        // 外部点击关闭（捕获阶段，避免输入框外第一次点击被别处消费）
+        document.addEventListener('mousedown', renamePopoverOutside, true);
+
+        renamePopover = pop;
+        input.focus();
+        input.select();
+    }
+
     // ==================== 编辑排序模式 ====================
 
     /**
@@ -2368,14 +2612,25 @@ const Sidebar = (() => {
     function toggleEditFolderOrder() {
         isEditingFolderOrder = !isEditingFolderOrder;
 
+        // ★ 进入编辑模式 = 用户要自定义顺序：若列排序（名称/日期）激活，
+        //   显示顺序会被 buildNavDisplayList 覆盖，拖拽会"拖不动"。
+        //   切回 custom 并持久化，退出编辑时不自动恢复（表头可随时再点）。
+        if (isEditingFolderOrder && folderSortKey !== 'custom') {
+            folderSortKey = 'custom';
+            saveFolderSortSetting();
+            updateFolderSortHeaderUI();
+        }
+
         // 更新按钮文字
         const btn = document.getElementById('btnEditFolderOrder');
         if (btn) {
             btn.innerHTML = isEditingFolderOrder
                 ? '<span class="icon icon-lock"></span> <span data-i18n="panel.done_sort">' + t('panel.done_sort') + '</span>'
-                : '<span class="icon icon-edit"></span> <span data-i18n="panel.sort">' + t('panel.sort') + '</span>';
+                : '<span class="icon icon-edit"></span> <span data-i18n="panel.edit_order">' + t('panel.edit_order') + '</span>';
             btn.classList.toggle('active', isEditingFolderOrder);
         }
+        const btnAddBin = document.getElementById('btnAddFolderBin');
+        if (btnAddBin) btnAddBin.style.display = isEditingFolderOrder ? '' : 'none';
 
         // Cancel active drag when toggling mode
         if (folderDrag && folderDrag.active) {
@@ -2423,7 +2678,7 @@ const Sidebar = (() => {
         if (btn) {
             btn.innerHTML = isEditingFolderOrder
                 ? '<span class="icon icon-lock"></span> <span data-i18n="panel.done_sort">' + t('panel.done_sort') + '</span>'
-                : '<span class="icon icon-edit"></span> <span data-i18n="panel.sort">' + t('panel.sort') + '</span>';
+                : '<span class="icon icon-edit"></span> <span data-i18n="panel.edit_order">' + t('panel.edit_order') + '</span>';
             btn.classList.toggle('active', isEditingFolderOrder);
         }
     }
@@ -2452,7 +2707,7 @@ const Sidebar = (() => {
                 // ★ 乐观插入前同步已有节点的展开状态到缓存，避免后续 DOM 重建时状态丢失
                 for (const node of folderRoots) {
                     if (typeof node.expanded === 'boolean') {
-                        expandedStateCache.set(node.path, node.expanded);
+                        expandedStateCache.set(pathCacheKey(node.path), node.expanded);
                     }
                 }
                 if (typeof Gallery !== 'undefined' && Gallery.addImportedRoot) {
@@ -2466,7 +2721,7 @@ const Sidebar = (() => {
 
                 // ★ 新导入的根默认折叠，不自动展开：用户手动点击才展开子文件夹子树。
                 //   写入展开缓存为 false，避免刷新后 applyExpandedStates 把它当"无状态"误处理。
-                if (expandedStateCache) expandedStateCache.set(folderPath, false);
+                if (expandedStateCache) expandedStateCache.set(pathCacheKey(folderPath), false);
 
                 const normalizedNew = folderPath.replace(/\\/g, '/').toLowerCase();
                 if (!folderRoots.some(r => (r.path || '').replace(/\\/g, '/').toLowerCase() === normalizedNew)) {
@@ -2876,7 +3131,7 @@ const Sidebar = (() => {
     const DRAG = {
         liftScale: 1.08,
         settleMs: 200,
-        hoverDelay: 500,  // ms to hover over a sibling before nesting underneath
+        hoverDelay: 250,  // ms to hover over a sibling before nesting underneath (500ms 原值太钝，占位不动像卡住)
         hitPaddingX: 40,  // extra horizontal hit area for narrow tags
         hitPaddingY: 8   // extra vertical hit area
     };
@@ -3212,13 +3467,8 @@ const Sidebar = (() => {
             TagStyle.apply(item, tag);
         }
 
-        if (isEditingTags) {
-            const handle = document.createElement('span');
-            handle.className = 'tag-drag-handle';
-            handle.textContent = '⠿';
-            handle.title = t('sidebar.drag_sort');
-            item.appendChild(handle);
-        }
+        // ★ 已取消拖拽把手：编辑模式下整标签可拖（见 initTagDrag 的位移阈值），
+        //   删除按钮仍在左侧
 
         const isIconOnly = tag.iconOnly || (!tag.name && tag.icon);
         if (tag.icon && !isAvatar) {
@@ -3276,7 +3526,12 @@ const Sidebar = (() => {
         delBtn.addEventListener('pointerdown', (e) => {
             e.stopPropagation();
         });
-        item.appendChild(delBtn);
+        // ★ 编辑模式：删除按钮放最左（勾选框之前）
+        if (isEditingTags) {
+            item.insertBefore(delBtn, item.firstChild);
+        } else {
+            item.appendChild(delBtn);
+        }
 
         // Restore selection state
         if (selectedTagIds.has(tag.id)) {
@@ -3324,11 +3579,13 @@ const Sidebar = (() => {
     function updateBatchBar() {
         const container = tagTree.querySelector('.tag-tree-container');
         if (!container) return;
-        let bar = container.querySelector('.tag-edit-batch-bar');
+        // ★ 挂在 tagTree（排序容器之外）：挂在 container 里会成为标签流的
+        //   一员，拖拽占位条可以排进它前后，提示条看起来也"参与了排序"
+        let bar = tagTree.querySelector('.tag-edit-batch-bar');
         if (!bar) {
             bar = document.createElement('div');
             bar.className = 'tag-edit-batch-bar';
-            container.appendChild(bar);
+            tagTree.appendChild(bar);
         }
         const count = selectedTagIds.size;
         if (isEditingTags) {
@@ -3427,13 +3684,29 @@ const Sidebar = (() => {
     function initTagDrag(container) {
         container.addEventListener('pointerdown', (e) => {
             if (!isEditingTags) return;
-            // Only drag via the drag handle, not the whole tag
-            if (!e.target.closest('.tag-drag-handle')) return;
             const item = e.target.closest('.tag-item');
             if (!item) return;
-
+            // 删除按钮有独立语义，不触发拖拽
+            if (e.target.closest('.tag-delete-btn')) return;
             e.preventDefault();
-            startTagDrag(e, container, item);
+            // ★ 无把手：整标签可拖。加 4px 位移阈值再正式启动拖拽，
+            //   轻点/双击（选中、编辑对话框）不受影响
+            const sx = e.clientX, sy = e.clientY;
+            const cleanup = () => {
+                document.removeEventListener('pointermove', onMove);
+                document.removeEventListener('pointerup', onUp);
+                document.removeEventListener('pointercancel', onUp);
+            };
+            const onMove = (me) => {
+                if (Math.abs(me.clientX - sx) + Math.abs(me.clientY - sy) > 4) {
+                    cleanup();
+                    startTagDrag(me, container, item);
+                }
+            };
+            const onUp = () => cleanup();
+            document.addEventListener('pointermove', onMove);
+            document.addEventListener('pointerup', onUp);
+            document.addEventListener('pointercancel', onUp);
         });
     }
 
@@ -3500,8 +3773,10 @@ const Sidebar = (() => {
         dragEl.style.transition = 'none';
         dragEl.style.boxShadow = '0 6px 20px rgba(0,0,0,0.35)';
         dragEl.style.scale = String(DRAG.liftScale);
-        dragEl.style.left = (e.clientX - groupRect.left - grabOffsetX) + 'px';
-        dragEl.style.top = (e.clientY - groupRect.top - grabOffsetY) + 'px';
+        // ★ 与 dragLoop 同基准（offsetParent = 真实包含块），按下瞬间不跳
+        var obRect = (dragEl.offsetParent || groupEl).getBoundingClientRect();
+        dragEl.style.left = (e.clientX - obRect.left - grabOffsetX) + 'px';
+        dragEl.style.top = (e.clientY - obRect.top - grabOffsetY) + 'px';
 
         // Fix tree line └ turn: dragEl stays in DOM but is now absolute.
         dragEl.classList.remove('tag-last-child');
@@ -3592,9 +3867,15 @@ const Sidebar = (() => {
     function dragLoop() {
         if (!tagDrag || !tagDrag.active) return;
         var drag = tagDrag;
-        var gr = drag.groupEl.getBoundingClientRect();
-        drag.dragEl.style.left = (drag.pointerX - gr.left - drag.grabOffsetX) + 'px';
-        drag.dragEl.style.top = (drag.pointerY - gr.top - drag.grabOffsetY) + 'px';
+        // ★ 相对被拖项的真实包含块（offsetParent）定位：占位条移动会让 group
+        //   重排、getBoundingClientRect 变化，用 group 做基准会让标签在指针
+        //   静止时也跳；offsetParent 在拖拽期间不变（dragEl 不跨组移动），
+        //   位置严格跟随指针。
+        var or = drag.dragEl.offsetParent
+            ? drag.dragEl.offsetParent.getBoundingClientRect()
+            : drag.groupEl.getBoundingClientRect();
+        drag.dragEl.style.left = (drag.pointerX - or.left - drag.grabOffsetX) + 'px';
+        drag.dragEl.style.top = (drag.pointerY - or.top - drag.grabOffsetY) + 'px';
         if (drag.didMove) {
             var t = computeDropTarget(drag);
             drag._logFrame++;
@@ -3764,8 +4045,13 @@ const Sidebar = (() => {
         } else if (siblingTargetEl) {
             // Left half — become sibling of target (move to its group, right after it)
             var sibGroup = siblingTargetEl.parentNode;
+            // ★ 必须跳过占位条和子组：预览时占位条恰好常插在目标标签之后，
+            //   若 sibNext 拿到 ghost（无 tagId），放手映射回数据数组会找不到
+            //   参照 → 追加到末尾 → 底部标签表现为"松手弹回原位"
             var sibNext = siblingTargetEl.nextElementSibling;
-            if (sibNext && sibNext.classList.contains('tag-children')) sibNext = sibNext.nextElementSibling;
+            while (sibNext && (sibNext.classList.contains('tag-children') || sibNext.classList.contains('tag-ghost-placeholder'))) {
+                sibNext = sibNext.nextElementSibling;
+            }
             return { type: 'sibling', beforeEl: sibNext || null, targetGroupEl: sibGroup, targetDepth: parseInt(siblingTargetEl.dataset.tagDepth) || 0, siblingTargetEl: siblingTargetEl };
         } else if (drag._nestHoverTarget) {
             // Pointer left — 200ms grace period before unsnapping
@@ -6087,66 +6373,338 @@ const Sidebar = (() => {
         settleMs: 200
     };
 
+    // ==================== 收纳夹：数据模型 ====================
+    // 收纳夹 = 顶层已导入根的横向分组条。数据持久化在 sidebar_settings 的
+    // 'sidebar_folder_bins'：{ bins:[{id,name,collapsed,paths:[原始路径]}], seq:[{t:'f',p:norm}|{t:'b',id}] }
+    // seq 是"顶层显示顺序"（文件夹与收纳夹混排）；folderRoots 顺序仅作回退。
+    let folderBins = [];
+    let navSequence = [];
+    let folderBinsLoaded = false;
+
+    function saveFolderBins() {
+        const payload = JSON.stringify({ bins: folderBins, seq: navSequence });
+        if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails()) {
+            WailsBridge.setSidebarSetting('sidebar_folder_bins', payload).catch(() => {});
+        } else if (typeof Storage !== 'undefined' && Storage.setSetting) {
+            Storage.setSetting('sidebar_folder_bins', payload);
+        }
+    }
+
+    async function loadFolderBins() {
+        if (folderBinsLoaded) return;
+        folderBinsLoaded = true;
+        try {
+            let raw = null;
+            if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails()) {
+                const r = await WailsBridge.getSidebarSetting('sidebar_folder_bins');
+                if (r && r.success && r.value) raw = r.value;
+            }
+            if (!raw && typeof Storage !== 'undefined' && Storage.getSetting) {
+                raw = await Storage.getSetting('sidebar_folder_bins', null);
+            }
+            if (raw) {
+                const parsed = JSON.parse(raw);
+                if (parsed && Array.isArray(parsed.bins)) {
+                    folderBins = parsed.bins;
+                    navSequence = Array.isArray(parsed.seq) ? parsed.seq : [];
+                }
+            }
+        } catch (e) {
+            console.warn('[Sidebar] 收纳夹数据加载失败:', e);
+        }
+    }
+
+    // 每次拿到新 folderRoots 后同步：剔除消失的根/收纳夹，新根追加到顶层末尾
+    function syncBinsWithRoots() {
+        const rootKeys = new Set(folderRoots.map(n => pathCacheKey(n.path)));
+        let changed = false;
+        for (const b of folderBins) {
+            const before = b.paths.length;
+            b.paths = b.paths.filter(p => rootKeys.has(pathCacheKey(p)));
+            if (b.paths.length !== before) changed = true;
+        }
+        folderBins = folderBins.filter(b => {
+            if (b.paths.length > 0) return true;
+            const stillListed = navSequence.some(it => it.t === 'b' && it.id === b.id);
+            if (stillListed) return true;
+            changed = true;
+            return false;
+        });
+        const validKeys = new Set([
+            ...folderRoots.map(n => 'f:' + pathCacheKey(n.path)),
+            ...folderBins.map(b => 'b:' + b.id)
+        ]);
+        const beforeSeq = navSequence.length;
+        navSequence = navSequence.filter(it => {
+            const k = it.t === 'b' ? 'b:' + it.id : 'f:' + it.p;
+            return validKeys.has(k);
+        });
+        if (navSequence.length !== beforeSeq) changed = true;
+        // 新根追加到顶层末尾（不在任何收纳夹、也不在序列里）
+        const binned = new Set();
+        for (const b of folderBins) b.paths.forEach(p => binned.add(pathCacheKey(p)));
+        for (const node of folderRoots) {
+            const k = pathCacheKey(node.path);
+            if (binned.has(k)) continue;
+            if (navSequence.some(it => it.t === 'f' && it.p === k)) continue;
+            navSequence.push({ t: 'f', p: k });
+            changed = true;
+        }
+        // 收纳夹不在序列里（新建时未走 sync）→ 追加到末尾
+        for (const b of folderBins) {
+            if (!navSequence.some(it => it.t === 'b' && it.id === b.id)) {
+                navSequence.push({ t: 'b', id: b.id });
+                changed = true;
+            }
+        }
+        if (changed) saveFolderBins();
+        return changed;
+    }
+
+    function buildNavDisplayList() {
+        const binOfPath = new Map();
+        for (const b of folderBins) b.paths.forEach(p => binOfPath.set(pathCacheKey(p), b));
+        const nodeByKey = new Map(folderRoots.map(n => [pathCacheKey(n.path), n]));
+        const binById = new Map(folderBins.map(b => [b.id, b]));
+        const out = [];
+        const used = new Set();
+        for (const it of navSequence) {
+            if (it.t === 'b') {
+                const b = binById.get(it.id);
+                if (b) { out.push({ type: 'bin', bin: b }); used.add('b:' + b.id); }
+            } else {
+                const node = nodeByKey.get(it.p);
+                if (node && !binOfPath.has(it.p)) { out.push({ type: 'folder', node }); used.add('f:' + it.p); }
+            }
+        }
+        // 序列外的新根 / 新收纳夹 → 末尾
+        for (const b of folderBins) {
+            if (!used.has('b:' + b.id)) out.push({ type: 'bin', bin: b });
+        }
+        for (const node of folderRoots) {
+            const k = pathCacheKey(node.path);
+            if (used.has('f:' + k) || binOfPath.has(k)) continue;
+            out.push({ type: 'folder', node });
+        }
+        // ★ 列排序（名称/添加日期）：激活时顶层文件夹按所选列排序，
+        //   收纳夹保持原有相对位置，排序后的文件夹填入非收纳夹槽位。
+        //   （收纳夹功能加入后顶层顺序由 navSequence 决定，列排序若不在此
+        //   处生效就会完全失效）
+        if (folderSortKey === 'name' || folderSortKey === 'date') {
+            const desc = folderSortDesc;
+            const folderItems = out.filter(it => it.type === 'folder');
+            folderItems.sort((a, b) => {
+                let r;
+                if (folderSortKey === 'name') {
+                    const an = (a.node.displayName || a.node.name || '').toLowerCase();
+                    const bn = (b.node.displayName || b.node.name || '').toLowerCase();
+                    r = an.localeCompare(bn, 'zh-CN');
+                } else {
+                    const ad = a.node.addedAt || '';
+                    const bd = b.node.addedAt || '';
+                    r = ad.localeCompare(bd);
+                }
+                return desc ? -r : r;
+            });
+            let fi = 0;
+            for (let i = 0; i < out.length; i++) {
+                if (out[i].type === 'folder') out[i] = folderItems[fi++];
+            }
+        }
+        return out;
+    }
+
+    // ==================== 收纳夹：渲染 ====================
+
+    function createBinNode(bin) {
+        const el = document.createElement('div');
+        el.className = 'folder-bin';
+        el.dataset.binId = bin.id;
+        el.dataset.dragRow = '1';
+        el.dataset.dndKey = 'b:' + bin.id;
+
+        const bar = document.createElement('div');
+        bar.className = 'folder-bin-bar';
+
+        const handle = document.createElement('span');
+        handle.className = 'tree-drag-handle bin-handle';
+        handle.textContent = '⠿';
+        handle.title = t('sidebar.drag_sort');
+        // ★ 与文件夹把手一致：仅编辑模式显示
+        if (!isEditingFolderOrder) handle.style.display = 'none';
+
+        const toggle = document.createElement('span');
+        toggle.className = 'bin-toggle';
+        toggle.textContent = bin.collapsed ? '▶' : '▼';
+
+        const icon = document.createElement('span');
+        icon.className = 'bin-icon';
+        icon.innerHTML = '<span class="icon icon-folder"></span>';
+
+        const name = document.createElement('span');
+        name.className = 'bin-name';
+        name.textContent = bin.name;
+
+        const count = document.createElement('span');
+        count.className = 'bin-count';
+        count.textContent = '(' + bin.paths.length + ')';
+
+        const actions = document.createElement('span');
+        actions.className = 'bin-actions';
+        const dissolveBtn = document.createElement('button');
+        dissolveBtn.className = 'bin-dissolve-btn';
+        dissolveBtn.textContent = t('sidebar.bin_dissolve');
+        dissolveBtn.title = t('sidebar.bin_dissolve');
+        actions.appendChild(dissolveBtn);
+
+        bar.appendChild(toggle);
+        bar.appendChild(icon);
+        bar.appendChild(name);
+        bar.appendChild(count);
+        bar.appendChild(actions);
+        // ★ 拖拽把手放最右：marginLeft:auto 推到条末端
+        handle.style.marginLeft = 'auto';
+        bar.appendChild(handle);
+
+        bar.addEventListener('click', (e) => {
+            if (e.target.closest('.tree-drag-handle') || e.target.closest('.bin-dissolve-btn')) return;
+            bin.collapsed = !bin.collapsed;
+            children.style.display = bin.collapsed ? 'none' : '';
+            toggle.textContent = bin.collapsed ? '▶' : '▼';
+            saveFolderBins();
+        });
+        // ★ 编辑模式双击收纳夹标题 → 浮窗重命名（与文件夹一致）
+        bar.addEventListener('dblclick', (e) => {
+            if (!isEditingFolderOrder) return;
+            e.preventDefault();
+            e.stopPropagation();
+            openRenamePopover({ __isBin: true, id: bin.id, name: bin.name }, bar);
+        });
+        dissolveBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            dissolveBin(bin);
+        });
+
+        const children = document.createElement('div');
+        children.className = 'folder-bin-children';
+        if (bin.collapsed) children.style.display = 'none';
+        for (const p of bin.paths) {
+            const node = folderRoots.find(n => pathCacheKey(n.path) === pathCacheKey(p));
+            if (!node) continue;
+            const child = createFolderNode(node, 1);
+            child.dataset.dragRow = '1';
+            child.dataset.dndKey = 'fb:' + bin.id + ':' + pathCacheKey(node.path);
+            children.appendChild(child);
+        }
+
+        el.appendChild(bar);
+        el.appendChild(children);
+        return el;
+    }
+
+    // 解散：内部文件夹按原顺序放回顶层原位置（原位替换收纳夹）
+    function dissolveBin(bin) {
+        const idx = navSequence.findIndex(it => it.t === 'b' && it.id === bin.id);
+        const replacements = bin.paths.map(p => ({ t: 'f', p: pathCacheKey(p) }));
+        if (idx >= 0) navSequence.splice(idx, 1, ...replacements);
+        else navSequence.push(...replacements);
+        folderBins = folderBins.filter(b => b.id !== bin.id);
+        syncFolderRootsOrderToSequence();
+        saveFolderBins();
+        saveFolderOrder();
+        renderFolderTree(); // 同步渲染：解散立即生效
+    }
+
+    // 新建收纳夹（编辑模式按钮）
+    function addFolderBin() {
+        let n = folderBins.length + 1;
+        let name = t('sidebar.bin_default_name') + ' ' + n;
+        while (folderBins.some(b => b.name === name)) { n++; name = t('sidebar.bin_default_name') + ' ' + n; }
+        const bin = { id: 'bin_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6), name: name, collapsed: false, paths: [] };
+        folderBins.push(bin);
+        navSequence.push({ t: 'b', id: bin.id });
+        saveFolderBins();
+        renderFolderTree(); // 同步渲染：新建立即出现
+    }
+
+    // 把 folderRoots 数组顺序调整为与 navSequence 一致（供 saveFolderOrder 持久化）
+    function syncFolderRootsOrderToSequence() {
+        const order = new Map();
+        let i = 0;
+        for (const it of navSequence) {
+            if (it.t !== 'f') continue;
+            order.set(it.p, i++);
+        }
+        folderRoots.sort((a, b) => {
+            const ai = order.has(pathCacheKey(a.path)) ? order.get(pathCacheKey(a.path)) : 999999;
+            const bi = order.has(pathCacheKey(b.path)) ? order.get(pathCacheKey(b.path)) : 999999;
+            return ai - bi;
+        });
+    }
+
+    function getDragRows(container) {
+        return Array.from(container.querySelectorAll('[data-drag-row="1"]'));
+    }
+
     function initFolderDrag(container) {
         container.addEventListener('pointerdown', (e) => {
             if (!isEditingFolderOrder) return;
             const handle = e.target.closest('.tree-drag-handle');
             if (!handle) return;
-            const folderEl = handle.closest('.tree-node[data-is-root="true"]');
-            if (!folderEl) return;
-
+            const rowEl = handle.closest('[data-drag-row="1"]');
+            if (!rowEl) return;
             e.preventDefault();
-            startFolderDrag(e, container, folderEl);
+            startFolderDrag(e, container, rowEl);
         });
     }
 
-    function startFolderDrag(e, container, folderEl) {
+    function startFolderDrag(e, container, rowEl) {
         if (folderDrag && folderDrag.active) return;
 
-        const rootNodes = Array.from(container.querySelectorAll('.tree-node[data-is-root="true"]'));
-        if (rootNodes.length < 2) return;
+        const dndKey = rowEl.dataset.dndKey || '';
+        const rows = getDragRows(container);
+        if (rows.length < 2) return;
 
-        const containerRect = container.getBoundingClientRect();
-        const fromIndex = parseInt(folderEl.dataset.folderIndex);
-
-        // Snapshot all root node positions
-        const positions = new Array(rootNodes.length);
-        for (let i = 0; i < rootNodes.length; i++) {
-            const r = rootNodes[i].getBoundingClientRect();
-            positions[i] = {
-                el: rootNodes[i],
-                restX: r.left - containerRect.left,
-                restY: r.top - containerRect.top,
-                width: r.width,
-                height: r.height
-            };
+        // ★ 拖收纳夹时自动收起内部列表：展开状态下整个收纳夹很高，拖着既遮挡
+        //   又无法看清插入位置。先收起再测量行高（占位条/抓取偏移用收起后的尺寸）。
+        let savedBinChildren = null;
+        if (dndKey.startsWith('b:')) {
+            const ch = rowEl.querySelector('.folder-bin-children');
+            if (ch && ch.style.display !== 'none') {
+                savedBinChildren = ch;
+                ch.style.display = 'none';
+            }
         }
 
-        // Create ghost placeholder bar (full width, fixed height)
+        const containerRect = container.getBoundingClientRect();
+        const rowRect = rowEl.getBoundingClientRect();
+        const offsetX = e.clientX - rowRect.left;
+        // ★ 文件夹行：拖拽时行垂直中心对齐鼠标水平线（用户预期"和鼠标同一水平位置"）；
+        //   收纳夹行较扁，保持原抓取偏移（已验证手感正确）。
+        const offsetY = dndKey.startsWith('b:') ? (e.clientY - rowRect.top) : (rowRect.height / 2);
+
+        // 幽灵占位：与被拖行同宽高（避免插入后整列跳动）
         const ghost = document.createElement('div');
         ghost.className = 'folder-ghost-placeholder';
-        ghost.style.width = positions[fromIndex].width + 'px';
-        container.insertBefore(ghost, folderEl);
+        ghost.style.width = rowRect.width + 'px';
+        ghost.style.height = Math.max(28, rowRect.height - 2) + 'px';
+        // ★ 占位条必须插到被拖行的实际父节点里：袋内文件夹行嵌在
+        //   .folder-bin-children 中，若插到顶层 container 会因 rowEl 非直接子节点
+        //   抛 NotFoundError，导致收纳夹内文件夹"拖拽不动"。
+        (rowEl.parentNode || container).insertBefore(ghost, rowEl);
 
-        // Pull folder out of flow
-        const folderRect = folderEl.getBoundingClientRect();
-        const offsetX = e.clientX - folderRect.left;
-        const offsetY = e.clientY - folderRect.top;
-
-        // Ensure container is the positioning anchor
         container.style.position = 'relative';
+        rowEl.style.position = 'absolute';
+        rowEl.style.zIndex = '30';
+        rowEl.style.pointerEvents = 'none';
+        rowEl.style.transition = 'none';
+        rowEl.style.boxShadow = '0 6px 20px rgba(0,0,0,0.35)';
+        rowEl.style.width = rowRect.width + 'px';
+        rowEl.style.height = rowRect.height + 'px';
+        rowEl.style.left = (rowRect.left - containerRect.left) + 'px';
+        rowEl.style.top = (rowRect.top - containerRect.top) + 'px';
+        rowEl.classList.add('is-folder-dragging');
 
-        folderEl.style.position = 'absolute';
-        folderEl.style.zIndex = '20';
-        folderEl.style.pointerEvents = 'none';
-        folderEl.style.transition = 'none';
-        folderEl.style.boxShadow = '0 6px 20px rgba(0,0,0,0.35)';
-        folderEl.style.width = folderRect.width + 'px';
-        // Place at natural position, then dragLoop will move it to follow the pointer
-        folderEl.style.left = (folderRect.left - containerRect.left) + 'px';
-        folderEl.style.top = (folderRect.top - containerRect.top) + 'px';
-
-        // Lift overflow clipping so the dragged folder can move above the container's top edge
         const savedOverflow = container.style.overflow;
         container.style.overflow = 'visible';
 
@@ -6154,19 +6712,20 @@ const Sidebar = (() => {
             active: true,
             didMove: false,
             container,
-            items: positions,
-            fromIndex,
-            dragEl: folderEl,
-            dragWidth: folderRect.width,
-            dragHeight: folderRect.height,
+            rows,
+            dragEl: rowEl,
+            dndKey,
+            dragType: dndKey.startsWith('b:') ? 'bin' : (dndKey.startsWith('fb:') ? 'binned' : 'folder'),
+            sourceBinId: dndKey.startsWith('fb:') ? dndKey.slice(3, dndKey.indexOf(':', 3)) : null,
+            ghost,
             offsetX,
             offsetY,
-            ghost,
             pointerX: e.clientX,
             pointerY: e.clientY,
             raf: null,
-            lastInsertBefore: folderEl,
-            savedOverflow
+            lastInsertBefore: rowEl,
+            savedOverflow,
+            savedBinChildren
         };
 
         document.addEventListener('pointermove', onFolderPointerMove, { passive: false });
@@ -6175,7 +6734,6 @@ const Sidebar = (() => {
 
         container.style.touchAction = 'none';
         container.classList.add('is-dragging');
-
         folderDrag.raf = requestAnimationFrame(dragFolderLoop);
     }
 
@@ -6193,56 +6751,185 @@ const Sidebar = (() => {
         folderDrag.pointerY = e.clientY;
     }
 
-    // Returns the first folder node that the ghost should be inserted before,
-    // or null meaning "append ghost at end of container".
-    // Uses sorted visual positions so logic matches onFolderPointerUp exactly.
-    function computeFolderInsertBefore(drag) {
-        const cr = drag.container.getBoundingClientRect();
-        const dr = drag.dragEl.getBoundingClientRect();
-        const dcy = dr.top + dr.height * 0.5 - cr.top;
+    // 指针正下方的收纳夹容器（拖普通/袋内文件夹时作为"放入"目标）
+    // ★ 用 offsetTop（布局位置）判定，不用 getBoundingClientRect：FLIP 动画期间
+    //   行带 translateY 变换，rect 测到的是动画中间值 → 高亮区随之漂移闪烁
+    function findBinUnderPointer(drag) {
+        const py = drag.pointerY - drag.container.getBoundingClientRect().top;
+        for (const b of drag.container.querySelectorAll('.folder-bin')) {
+            if (b === drag.dragEl) continue;
+            if (py >= b.offsetTop && py <= b.offsetTop + b.offsetHeight) {
+                return b;
+            }
+        }
+        return null;
+    }
 
-        const nodes = Array.from(drag.container.querySelectorAll('.tree-node[data-is-root="true"]'));
-        const others = [];
-        for (const node of nodes) {
-            if (node === drag.dragEl) continue;
-            const r = node.getBoundingClientRect();
-            others.push({
-                el: node,
-                cy: r.top + r.height * 0.5 - cr.top
+    // FLIP：占位条换位时，其余行从旧位置平滑滑到新位置
+    function moveGhostWithFlip(drag, beforeEl) {
+        // ★ 必须排除被拖项自身的所有祖先（如源收纳夹容器）：祖先带 transform 会
+        //   成为 absolute 子项的包含块，导致被拖项坐标系错乱、"拖拽不动"。
+        const rows = getDragRows(drag.container)
+            .filter(el => el !== drag.dragEl && !drag.dragEl.contains(el));
+        const prev = new Map();
+        for (const el of rows) {
+            el.style.transition = 'none';
+            el.style.transform = '';
+            prev.set(el, el.getBoundingClientRect().top);
+        }
+        if (beforeEl) {
+            // ★ beforeEl 可能是袋内行（位于 .folder-bin-children 中），
+            //   必须插到它自己的父节点里，否则抛 NotFoundError 中断拖拽
+            (beforeEl.parentNode || drag.container).insertBefore(drag.ghost, beforeEl);
+        } else if (drag.dragType === 'binned' && drag.sourceBinId && drag.overSrcBin) {
+            // ★ beforeEl=null 且指针仍在源收纳夹上 → "排到袋底"：
+            //   占位条追加到源收纳夹的 children 末尾（若追加到顶层 container，
+            //   落点判定会变成"移出收纳夹"，导致袋内排不到底）。
+            //   指针在袋外时走下面 else 分支追加到顶层 —— 允许继续下拖拖出收纳夹。
+            const sel = '.folder-bin[data-bin-id="' + (window.CSS && CSS.escape ? CSS.escape(drag.sourceBinId) : drag.sourceBinId) + '"] > .folder-bin-children';
+            const ch = drag.container.querySelector(sel);
+            if (ch) ch.appendChild(drag.ghost);
+            else drag.container.appendChild(drag.ghost);
+        } else {
+            drag.container.appendChild(drag.ghost);
+        }
+        drag.container.offsetHeight; // 强制回流
+        for (const el of rows) {
+            const dy = prev.get(el) - el.getBoundingClientRect().top;
+            if (Math.abs(dy) < 1) continue;
+            el.style.transform = 'translateY(' + dy + 'px)';
+        }
+        requestAnimationFrame(() => {
+            for (const el of rows) {
+                el.style.transition = 'transform 160ms cubic-bezier(.2,.7,.3,1)';
+                el.style.transform = '';
+                el.addEventListener('transitionend', function clear() {
+                    el.style.transition = '';
+                    el.removeEventListener('transitionend', clear);
+                });
+            }
+        });
+    }
+
+    // 返回占位条应插入到哪一行之前；null = 追加到末尾（纯视觉预览）
+    // ★ 候选行按拖拽模式限定，否则占位条会"钻进"收纳夹内部行并与 FLIP
+    //   动画互相追逐（每帧强制重排 → 卡死；落点判定也随之失效）：
+    //   - 拖顶层文件夹：只在顶层行（文件夹+收纳夹条）之间预览，入袋由高亮提示
+    //   - 拖袋内文件夹：指针在源袋内 → 只在源袋内部行之间预览；在袋外 → 只在顶层行
+    function computeFolderInsertBefore(drag) {
+        const allRows = getDragRows(drag.container).filter(el => el !== drag.dragEl);
+        let candidates;
+        if (drag.dragType === 'binned') {
+            const srcSel = '.folder-bin[data-bin-id="' + (window.CSS && CSS.escape ? CSS.escape(drag.sourceBinId) : drag.sourceBinId) + '"]';
+            const srcBinEl = drag.container.querySelector(srcSel);
+            let overSrc = false;
+            if (srcBinEl) {
+                // ★ offsetTop 判定（与 FLIP 动画解耦）：±40px 容差保证预览与落点一致
+                const py = drag.pointerY - drag.container.getBoundingClientRect().top;
+                overSrc = py >= srcBinEl.offsetTop - 40 && py <= srcBinEl.offsetTop + srcBinEl.offsetHeight + 40;
+            }
+            // ★ 记录"指针是否在源收纳夹上"，供 moveGhostWithFlip 区分
+            //   beforeEl=null 的两种语义：袋内排到底 vs 拖出收纳夹插到顶层末尾
+            drag.overSrcBin = overSrc;
+            if (overSrc) {
+                const prefix = 'fb:' + drag.sourceBinId + ':';
+                candidates = allRows.filter(el => (el.dataset.dndKey || '').startsWith(prefix));
+            } else {
+                candidates = allRows.filter(el => {
+                    const k = el.dataset.dndKey || '';
+                    return k.startsWith('f:') || k.startsWith('b:');
+                });
+            }
+        } else {
+            candidates = allRows.filter(el => {
+                const k = el.dataset.dndKey || '';
+                return k.startsWith('f:') || k.startsWith('b:');
             });
         }
-        others.sort((a, b) => a.cy - b.cy);
-
-        for (let i = 0; i < others.length; i++) {
-            if (dcy < others[i].cy) return others[i].el;
+        // ★ 全部用 offsetTop 比较：所有行（含被拖项、袋内行）的 offsetParent 都是
+        //   拖拽期设为 relative 的 container，同一坐标系可直接比大小；
+        //   且 offsetTop 不受 FLIP 的 translateY 变换影响，动画中测量结果稳定，
+        //   不会出现"占位条 ↔ 行动画"互相追逐导致的迟钝与顶部反复跳动。
+        const dcy = drag.dragEl.offsetTop + drag.dragEl.offsetHeight * 0.5;
+        const others = candidates.map(el => ({ el, cy: el.offsetTop + el.offsetHeight * 0.5 }))
+            .sort((a, b) => a.cy - b.cy);
+        for (const o of others) {
+            if (dcy < o.cy) return o.el;
         }
-        return null; // append at end
+        return null;
     }
 
     function dragFolderLoop() {
         if (!folderDrag || !folderDrag.active) return;
 
         const drag = folderDrag;
+        try {
         const cr = drag.container.getBoundingClientRect();
-
-        // Move dragged folder (position:absolute) to follow pointer, preserving grab offset
         drag.dragEl.style.left = (drag.pointerX - cr.left - drag.offsetX) + 'px';
         drag.dragEl.style.top = (drag.pointerY - cr.top - drag.offsetY) + 'px';
 
-        // Move ghost to current insertion point
         if (drag.didMove) {
-            const beforeEl = computeFolderInsertBefore(drag);
-            if (beforeEl !== drag.lastInsertBefore) {
-                drag.lastInsertBefore = beforeEl;
-                if (beforeEl) {
-                    drag.container.insertBefore(drag.ghost, beforeEl);
-                } else {
-                    drag.container.appendChild(drag.ghost);
+            // 可接收的收纳夹高亮（拖文件夹时；拖收纳夹自身不高亮）
+            drag.container.querySelectorAll('.folder-bin-bar').forEach(b => b.classList.remove('drag-over-bin'));
+            drag.overBinId = null;
+            if (drag.dragType !== 'bin') {
+                const overBin = findBinUnderPointer(drag);
+                if (overBin) {
+                    const bar = overBin.querySelector('.folder-bin-bar');
+                    if (bar && overBin.dataset.binId !== drag.sourceBinId) {
+                        bar.classList.add('drag-over-bin');
+                        drag.overBinId = overBin.dataset.binId;
+                    }
                 }
+            }
+            const beforeEl = computeFolderInsertBefore(drag);
+            // ★ beforeEl 与 overSrcBin 必须一起比较："袋内排到底"和"拖出到
+            //   顶层末尾"的 beforeEl 都是 null，只比 beforeEl 会漏掉
+            //   "从袋底继续下拖拖出收纳夹"这次占位条迁移，占位条卡死在袋内
+            if (beforeEl !== drag.lastInsertBefore || drag.overSrcBin !== drag.lastOverSrcBin) {
+                moveGhostWithFlip(drag, beforeEl);
+                drag.lastInsertBefore = beforeEl;
+                drag.lastOverSrcBin = drag.overSrcBin;
             }
         }
 
         drag.raf = requestAnimationFrame(dragFolderLoop);
+        } catch (err) {
+            // ★ 异常兜底：不让拖拽进入"active 残留"状态锁死后续所有拖拽
+            console.error('[Sidebar] 拖拽循环异常，终止本次拖拽:', err);
+            drag.active = false;
+            folderDrag = null;
+        }
+    }
+
+    // ★ 落点 = 占位条当前位置（所见即所得）：
+    //   占位条在 folderTree 顶层 → { zone:'top', index }（index = 前面的顶层行数）
+    //   占位条在某收纳夹的 children 里 → { zone:'bin', binId, index }
+    //   index 计数排除被拖项自身（它虽脱离文档流但仍是 DOM 子节点）
+    function captureDropZone(drag) {
+        const parent = drag.ghost.parentNode;
+        if (!parent) return null;
+        const isBinChildren = parent.classList && parent.classList.contains('folder-bin-children');
+        if (isBinChildren) {
+            const binEl = parent.closest ? parent.closest('.folder-bin') : null;
+            let idx = 0;
+            for (const child of parent.children) {
+                if (child === drag.ghost) break;
+                if (child === drag.dragEl) continue;
+                idx++;
+            }
+            return { zone: 'bin', binId: binEl ? binEl.dataset.binId : null, index: idx };
+        }
+        if (parent === drag.container) {
+            let idx = 0;
+            for (const child of drag.container.children) {
+                if (child === drag.ghost) break;
+                if (child === drag.dragEl) continue;
+                idx++;
+            }
+            return { zone: 'top', index: idx };
+        }
+        return null;
     }
 
     function onFolderPointerUp(e) {
@@ -6256,130 +6943,131 @@ const Sidebar = (() => {
         cancelAnimationFrame(drag.raf);
         drag.active = false;
 
-        if (drag.container) {
-            drag.container.style.touchAction = '';
-        }
+        // ★ 必须在移除占位条之前捕获落点
+        drag.drop = captureDropZone(drag);
 
-        // Compute new index from Y position using origIdx pattern (same as tag drag)
-        const cr = drag.container.getBoundingClientRect();
-        const dr = drag.dragEl.getBoundingClientRect();
-        const dcy = dr.top + dr.height * 0.5 - cr.top;
-
-        const nodes = Array.from(drag.container.querySelectorAll('.tree-node[data-is-root="true"]'));
-        const others = [];
-        for (const node of nodes) {
-            if (node === drag.dragEl) continue;
-            const r = node.getBoundingClientRect();
-            others.push({
-                origIdx: parseInt(node.dataset.folderIndex),
-                cy: r.top + r.height * 0.5 - cr.top
-            });
-        }
-        others.sort((a, b) => a.cy - b.cy);
-
-        let insertPos = others.length;
-        for (let i = 0; i < others.length; i++) {
-            if (dcy < others[i].cy) { insertPos = i; break; }
-        }
-
-        let newIndex;
-        if (insertPos >= others.length) {
-            newIndex = nodes.length - 1; // dragged node is still in nodes, so length is N
-        } else {
-            newIndex = others[insertPos].origIdx;
-            if (newIndex > drag.fromIndex) newIndex--;
-        }
-        newIndex = Math.max(0, Math.min(nodes.length - 1, newIndex));
-
-        if (newIndex !== drag.fromIndex) {
-            const [moved] = folderRoots.splice(drag.fromIndex, 1);
-            folderRoots.splice(newIndex, 0, moved);
-            saveFolderOrder();
-        }
-
-        animateFolderSettle(drag);
-    }
-
-    function animateFolderSettle(drag) {
-        // 1. Record live visual positions
-        const cr = drag.container.getBoundingClientRect();
-        const entries = [];
-        const allNodes = Array.from(drag.container.querySelectorAll('.tree-node[data-is-root="true"]'));
-        for (const el of allNodes) {
-            const r = el.getBoundingClientRect();
-            entries.push({ el, prevX: r.left - cr.left, prevY: r.top - cr.top });
-        }
-
-        // 2. Remove ghost
-        if (drag.ghost && drag.ghost.parentNode) {
-            drag.ghost.parentNode.removeChild(drag.ghost);
-            drag.ghost = null;
-        }
-
-        // 2b. Restore overflow and hover
+        drag.container.style.touchAction = '';
         drag.container.style.overflow = drag.savedOverflow || '';
         drag.container.classList.remove('is-dragging');
+        drag.container.querySelectorAll('.folder-bin-bar').forEach(b => b.classList.remove('drag-over-bin'));
+        if (drag.ghost && drag.ghost.parentNode) drag.ghost.parentNode.removeChild(drag.ghost);
+        // 恢复被拖项样式
+        const de = drag.dragEl;
+        de.style.position = ''; de.style.left = ''; de.style.top = '';
+        de.style.zIndex = ''; de.style.pointerEvents = ''; de.style.boxShadow = '';
+        de.style.width = ''; de.style.height = ''; de.style.transition = ''; de.style.transform = '';
+        de.classList.remove('is-folder-dragging');
 
-        // 3. Restore dragged folder to normal flow
-        drag.dragEl.style.position = '';
-        drag.dragEl.style.left = '';
-        drag.dragEl.style.top = '';
-        drag.dragEl.style.zIndex = '';
-        drag.dragEl.style.pointerEvents = '';
-        drag.dragEl.style.boxShadow = '';
-        drag.dragEl.style.width = '';
-        drag.dragEl.style.transition = 'none';
-        drag.dragEl.style.transform = '';
+        // 恢复拖拽期间被临时收起的收纳夹内部列表（renderFolderTree 会按模型重渲染）
+        if (drag.savedBinChildren) drag.savedBinChildren.style.display = '';
 
-        // 4. Reorder DOM to match final folderRoots order
-        const pathToEl = {};
-        for (const item of drag.items) {
-            pathToEl[item.el.dataset.path] = item.el;
+        let changed = false;
+        try {
+            changed = applyFolderDrop(drag);
+        } catch (err) {
+            console.error('[Sidebar] 拖拽落点处理失败:', err);
         }
-        const frag = document.createDocumentFragment();
-        for (const root of folderRoots) {
-            const el = pathToEl[root.path];
-            if (el) frag.appendChild(el);
+        folderDrag = null;
+
+        if (changed) {
+            syncFolderRootsOrderToSequence();
+            saveFolderBins();
+            saveFolderOrder();
+            // ★ 放手即定：同步重渲染到最终位置，不做落位 FLIP 动画。
+            //   拖拽中占位条已实时预览最终位置（所见即所得），松手再播一段
+            //   "行跳跃交换"动画反而多余且打扰。
+            renderFolderTree();
+            // 数据一致性兜底：服务器数据回来后哈希一致 → 原地更新，不会闪
+            refreshFolderTree();
         }
-        drag.container.appendChild(frag);
+    }
 
-        // Update dataset.folderIndex so consecutive drags see correct positions
-        const reorderedNodes = Array.from(drag.container.querySelectorAll('.tree-node[data-is-root="true"]'));
-        for (let i = 0; i < reorderedNodes.length; i++) {
-            reorderedNodes[i].dataset.folderIndex = i;
+    // ★ 拖拽落点 → 数据模型变更。语义：
+    //   拖收纳夹            → 顶层序列重排（与文件夹混排）
+    //   拖顶层文件夹 → 悬停在收纳夹条上 → 放入该收纳夹（追加到末尾）
+    //                        → 否则 → 顶层重排
+    //   拖袋内文件夹 → 仍在原收纳夹内 → 袋内重排
+    //                        → 悬停其它收纳夹 → 移入该收纳夹
+    //                        → 在收纳夹之外 → 移出，按位置插回顶层
+    // ★ 落点 → 数据模型（完全由 captureDropZone 捕获的占位条位置驱动，所见即所得）
+    function applyFolderDrop(drag) {
+        const drop = drag.drop;
+        if (!drop) return false;
+        const seqKeyOf = it => (it.t === 'b' ? 'b:' + it.id : 'f:' + it.p);
+
+        // ---------- 拖收纳夹：顶层序列重排 ----------
+        if (drag.dragType === 'bin') {
+            if (drop.zone !== 'top') return false;
+            const without = navSequence.filter(it => seqKeyOf(it) !== drag.dndKey);
+            without.splice(Math.min(drop.index, without.length), 0, { t: 'b', id: drag.dndKey.slice(2) });
+            navSequence = without;
+            return true;
         }
 
-        drag.container.offsetHeight; // force layout
-
-        // 5. Measure new positions & invert
-        for (const entry of entries) {
-            const r = entry.el.getBoundingClientRect();
-            const newX = r.left - cr.left;
-            const newY = r.top - cr.top;
-            const dx = entry.prevX - newX;
-            const dy = entry.prevY - newY;
-
-            if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) {
-                entry.el.style.transition = 'none';
-                entry.el.style.transform = `translate(${dx}px,${dy}px)`;
+        // ---------- 悬停在其它收纳夹长条上 → 移入该收纳夹（追加到末尾） ----------
+        if (drag.overBinId) {
+            const normP = drag.dragType === 'binned'
+                ? drag.dndKey.slice(('fb:' + drag.sourceBinId + ':').length)
+                : drag.dndKey.slice(2);
+            const tb = folderBins.find(b => b.id === drag.overBinId);
+            const node = folderRoots.find(n => pathCacheKey(n.path) === normP);
+            if (!tb || !node) return false;
+            if (drag.dragType === 'binned') {
+                const srcBin = folderBins.find(b => b.id === drag.sourceBinId);
+                if (!srcBin) return false;
+                const oldIdx = srcBin.paths.findIndex(p => pathCacheKey(p) === normP);
+                if (oldIdx >= 0) srcBin.paths.splice(oldIdx, 1);
+            } else {
+                navSequence = navSequence.filter(it => !(it.t === 'f' && it.p === normP));
             }
+            tb.paths.push(node.path);
+            return true;
         }
 
-        // 6. Play
-        requestAnimationFrame(() => {
-            for (const entry of entries) {
-                entry.el.style.transition = `transform ${FOLDER_DRAG.settleMs}ms ease-out`;
-                entry.el.style.transform = '';
-            }
-
-            setTimeout(() => {
-                for (const entry of entries) {
-                    entry.el.style.transition = '';
-                    entry.el.style.transform = '';
+        // ---------- 拖袋内文件夹 ----------
+        if (drag.dragType === 'binned') {
+            const srcBin = folderBins.find(b => b.id === drag.sourceBinId);
+            const normP = drag.dndKey.slice(('fb:' + drag.sourceBinId + ':').length);
+            if (!srcBin) return false;
+            const oldIdx = srcBin.paths.findIndex(p => pathCacheKey(p) === normP);
+            if (drop.zone === 'bin') {
+                if (drop.binId === srcBin.id) {
+                    // 袋内重排
+                    if (oldIdx < 0) return false;
+                    const [moved] = srcBin.paths.splice(oldIdx, 1);
+                    srcBin.paths.splice(Math.min(drop.index, srcBin.paths.length), 0, moved);
+                    return true;
                 }
-                folderDrag = null;
-            }, FOLDER_DRAG.settleMs + 50);
-        });
+                // 移入另一个收纳夹
+                const tb = folderBins.find(b => b.id === drop.binId);
+                const node = folderRoots.find(n => pathCacheKey(n.path) === normP);
+                if (!tb || !node) return false;
+                if (oldIdx >= 0) srcBin.paths.splice(oldIdx, 1);
+                tb.paths.splice(Math.min(drop.index, tb.paths.length), 0, node.path);
+                return true;
+            }
+            // 拖出：放回顶层落点位置
+            if (oldIdx < 0) return false;
+            srcBin.paths.splice(oldIdx, 1);
+            navSequence.splice(Math.min(drop.index, navSequence.length), 0, { t: 'f', p: normP });
+            return true;
+        }
+
+        // ---------- 拖顶层文件夹 ----------
+        const normP = drag.dndKey.slice(2);
+        if (drop.zone === 'bin') {
+            const tb = folderBins.find(b => b.id === drop.binId);
+            const node = folderRoots.find(n => pathCacheKey(n.path) === normP);
+            if (!tb || !node) return false;
+            tb.paths.splice(Math.min(drop.index, tb.paths.length), 0, node.path);
+            navSequence = navSequence.filter(it => !(it.t === 'f' && it.p === normP));
+            return true;
+        }
+        if (drop.zone !== 'top') return false;
+        const without = navSequence.filter(it => seqKeyOf(it) !== drag.dndKey);
+        without.splice(Math.min(drop.index, without.length), 0, { t: 'f', p: normP });
+        navSequence = without;
+        return true;
     }
 
     // ==================== API 配置 ====================
