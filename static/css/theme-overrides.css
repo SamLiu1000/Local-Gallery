@@ -1,0 +1,539 @@
+/* ============================================================
+   五套新主题各自的「设计语言」差异化覆盖层
+   每套主题有自己的按钮形态 / 圆角 / 边框 / 阴影 / 卡片质感。
+   纯视觉层，不改布局结构与任何交互逻辑；单色主题不受影响。
+   本文件在 style.css 之后加载，同特异性规则自然覆盖。
+   ============================================================ */
+
+/* 1) 鎏金暗厅 gallery-dark：锐利小圆角、发丝金线、衬线按钮、悬停金环 */
+:root[data-theme="gallery-dark"] {
+    --radius: 6px;
+    --radius-lg: 8px;
+    --radius-sm: 4px;
+    --gold-hairline: rgba(200, 162, 74, 0.28);
+}
+:root[data-theme="gallery-dark"] #topBar,
+:root[data-theme="gallery-dark"] #leftPanel,
+:root[data-theme="gallery-dark"] #rightPanel {
+    border-radius: 0;
+    border-color: rgba(200, 162, 74, 0.14);
+}
+:root[data-theme="gallery-dark"] #topBar button {
+    border-radius: 3px;
+    font-family: var(--font-serif);
+    letter-spacing: 1.5px;
+}
+:root[data-theme="gallery-dark"] #topBar button:hover {
+    background: var(--tint-08);
+    border-color: var(--gold-hairline);
+    box-shadow: inset 0 -2px 0 var(--accent);
+}
+:root[data-theme="gallery-dark"] .btn-primary {
+    border-radius: 3px;
+    font-family: var(--font-serif);
+    letter-spacing: 2px;
+    box-shadow: 0 4px 14px rgba(200, 162, 74, 0.22);
+}
+:root[data-theme="gallery-dark"] .btn-primary:hover {
+    box-shadow: 0 6px 18px rgba(200, 162, 74, 0.32);
+}
+:root[data-theme="gallery-dark"] .btn-secondary,
+:root[data-theme="gallery-dark"] .btn-small,
+:root[data-theme="gallery-dark"] .search-action-btn,
+:root[data-theme="gallery-dark"] .search-btn {
+    border-radius: 3px;
+    font-family: var(--font-serif);
+    letter-spacing: 1px;
+}
+:root[data-theme="gallery-dark"] .btn-secondary:hover {
+    border-color: var(--gold-hairline);
+    color: var(--accent);
+    background: var(--tint-06);
+}
+:root[data-theme="gallery-dark"] input:not([type="checkbox"]):not([type="radio"]):not([type="color"]):not([type="range"]),
+:root[data-theme="gallery-dark"] select:not(.lang-select),
+:root[data-theme="gallery-dark"] textarea {
+    border-radius: 4px;
+}
+:root[data-theme="gallery-dark"] input:focus,
+:root[data-theme="gallery-dark"] textarea:focus {
+    border-color: var(--gold-hairline);
+    box-shadow: 0 0 0 3px var(--tint-12);
+}
+:root[data-theme="gallery-dark"] .image-card:hover {
+    box-shadow: inset 0 0 0 1px var(--gold-hairline), 0 14px 30px rgba(0, 0, 0, 0.55);
+}
+:root[data-theme="gallery-dark"] .modal-content,
+:root[data-theme="gallery-dark"] .modal-dialog,
+:root[data-theme="gallery-dark"] .layout-dropdown-menu,
+:root[data-theme="gallery-dark"] .advanced-search-panel,
+:root[data-theme="gallery-dark"] .image-context-menu {
+    border-radius: 4px;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.6), inset 0 1px 0 rgba(200, 162, 74, 0.12);
+}
+:root[data-theme="gallery-dark"] .tree-node-header {
+    border-radius: 3px;
+}
+:root[data-theme="gallery-dark"] .tree-count,
+:root[data-theme="gallery-dark"] .app-version {
+    border-radius: 3px;
+}
+:root[data-theme="gallery-dark"] .preview-container img,
+:root[data-theme="gallery-dark"] .detail-thumbnail img,
+:root[data-theme="gallery-dark"] .thumbnail-strip img {
+    border-radius: 2px;
+    box-shadow: 0 0 0 1px var(--gold-hairline);
+}
+
+/* 2) 画廊白 gallery-light：瑞士编辑排印风，近直角、硬边印刷阴影、墨色实心按钮 */
+:root[data-theme="gallery-light"] {
+    --radius: 4px;
+    --radius-lg: 6px;
+    --radius-sm: 3px;
+}
+:root[data-theme="gallery-light"] #topBar,
+:root[data-theme="gallery-light"] #leftPanel,
+:root[data-theme="gallery-light"] #rightPanel {
+    border-radius: 0;
+}
+:root[data-theme="gallery-light"] #topBar button {
+    border-radius: 3px;
+    letter-spacing: 0.6px;
+    font-weight: 500;
+}
+:root[data-theme="gallery-light"] #topBar button:hover {
+    background: #1F1F1F;
+    color: #FBFBFC;
+    border-color: #1F1F1F;
+}
+:root[data-theme="gallery-light"] .btn-primary {
+    border-radius: 3px;
+    background: #1F1F1F;
+    color: #FBFBFC;
+    letter-spacing: 0.6px;
+    box-shadow: none;
+    transition: transform 0.12s ease, box-shadow 0.12s ease;
+}
+:root[data-theme="gallery-light"] .btn-primary:hover {
+    background: #000;
+    color: #fff;
+    transform: translate(-1px, -1px);
+    box-shadow: 3px 3px 0 rgba(47, 79, 79, 0.85);
+}
+:root[data-theme="gallery-light"] .btn-secondary,
+:root[data-theme="gallery-light"] .btn-small,
+:root[data-theme="gallery-light"] .search-btn,
+:root[data-theme="gallery-light"] .search-action-btn {
+    border-radius: 3px;
+    letter-spacing: 0.4px;
+}
+:root[data-theme="gallery-light"] .btn-secondary:hover,
+:root[data-theme="gallery-light"] .btn-small:hover {
+    background: #fff;
+    border-color: #1F1F1F;
+    color: #1F1F1F;
+    box-shadow: 2px 2px 0 rgba(31, 31, 31, 0.8);
+}
+:root[data-theme="gallery-light"] input:not([type="checkbox"]):not([type="radio"]):not([type="color"]):not([type="range"]),
+:root[data-theme="gallery-light"] select:not(.lang-select),
+:root[data-theme="gallery-light"] textarea {
+    border-radius: 3px;
+}
+:root[data-theme="gallery-light"] input:focus,
+:root[data-theme="gallery-light"] textarea:focus {
+    border-color: #2F4F4F;
+    box-shadow: 2px 2px 0 rgba(47, 79, 79, 0.25);
+}
+:root[data-theme="gallery-light"] .image-card {
+    border-radius: 2px;
+    transition: transform 0.14s ease, box-shadow 0.14s ease;
+}
+:root[data-theme="gallery-light"] .image-card:hover {
+    transform: translate(-2px, -2px);
+    box-shadow: 4px 4px 0 rgba(47, 79, 79, 0.3), 0 10px 24px rgba(31, 31, 31, 0.08);
+}
+:root[data-theme="gallery-light"] .modal-content,
+:root[data-theme="gallery-light"] .modal-dialog,
+:root[data-theme="gallery-light"] .layout-dropdown-menu,
+:root[data-theme="gallery-light"] .advanced-search-panel,
+:root[data-theme="gallery-light"] .image-context-menu {
+    border-radius: 4px;
+    box-shadow: 6px 6px 0 rgba(31, 31, 31, 0.1), 0 14px 34px rgba(31, 31, 31, 0.12);
+}
+:root[data-theme="gallery-light"] .tree-node-header {
+    border-radius: 3px;
+}
+:root[data-theme="gallery-light"] .tree-count,
+:root[data-theme="gallery-light"] .app-version {
+    border-radius: 2px;
+}
+:root[data-theme="gallery-light"] .preview-container img,
+:root[data-theme="gallery-light"] .detail-thumbnail img,
+:root[data-theme="gallery-light"] .thumbnail-strip img {
+    border-radius: 2px;
+    box-shadow: 0 0 0 1px rgba(31, 31, 31, 0.12);
+}
+
+/* 3) 北极极光 arctic-aurora：柔光玻璃风，大圆角、极光渐变主按钮、辉光阴影 */
+:root[data-theme="arctic-aurora"] {
+    --radius: 14px;
+    --radius-lg: 18px;
+    --radius-sm: 10px;
+}
+:root[data-theme="arctic-aurora"] #topBar button {
+    border-radius: 999px;
+}
+:root[data-theme="arctic-aurora"] #topBar button:hover {
+    background: rgba(70, 199, 160, 0.1);
+    border-color: rgba(70, 199, 160, 0.35);
+    color: var(--accent);
+    box-shadow: 0 0 14px rgba(70, 199, 160, 0.2);
+}
+:root[data-theme="arctic-aurora"] .btn-primary {
+    border-radius: 999px;
+    background: linear-gradient(120deg, #46C7A0, #5e96e6);
+    color: #06120E;
+    font-weight: 700;
+    box-shadow: 0 4px 18px rgba(70, 199, 160, 0.3);
+    transition: box-shadow 0.15s ease, filter 0.15s ease;
+}
+:root[data-theme="arctic-aurora"] .btn-primary:hover {
+    background: linear-gradient(120deg, #63E0B8, #7aaef2);
+    box-shadow: 0 6px 24px rgba(70, 199, 160, 0.45);
+    filter: brightness(1.04);
+}
+:root[data-theme="arctic-aurora"] .btn-secondary,
+:root[data-theme="arctic-aurora"] .btn-small,
+:root[data-theme="arctic-aurora"] .search-btn,
+:root[data-theme="arctic-aurora"] .search-action-btn,
+:root[data-theme="arctic-aurora"] .lang-select {
+    border-radius: 999px;
+}
+:root[data-theme="arctic-aurora"] .btn-secondary:hover,
+:root[data-theme="arctic-aurora"] .btn-small:hover {
+    border-color: rgba(70, 199, 160, 0.4);
+    color: var(--accent);
+    box-shadow: 0 0 12px rgba(70, 199, 160, 0.15);
+}
+:root[data-theme="arctic-aurora"] input:not([type="checkbox"]):not([type="radio"]):not([type="color"]):not([type="range"]),
+:root[data-theme="arctic-aurora"] select:not(.lang-select),
+:root[data-theme="arctic-aurora"] textarea {
+    border-radius: 12px;
+}
+:root[data-theme="arctic-aurora"] input:focus,
+:root[data-theme="arctic-aurora"] textarea:focus {
+    border-color: rgba(70, 199, 160, 0.5);
+    box-shadow: 0 0 0 3px rgba(70, 199, 160, 0.15);
+}
+:root[data-theme="arctic-aurora"] .image-card {
+    border-radius: 14px;
+    transition: transform 0.16s ease, box-shadow 0.16s ease;
+}
+:root[data-theme="arctic-aurora"] .image-card:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 14px 34px rgba(0, 0, 0, 0.5), 0 0 22px rgba(70, 199, 160, 0.16);
+}
+:root[data-theme="arctic-aurora"] .modal-content,
+:root[data-theme="arctic-aurora"] .modal-dialog,
+:root[data-theme="arctic-aurora"] .layout-dropdown-menu,
+:root[data-theme="arctic-aurora"] .advanced-search-panel,
+:root[data-theme="arctic-aurora"] .image-context-menu {
+    border-radius: 16px;
+    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.55), 0 0 30px rgba(70, 199, 160, 0.08);
+}
+:root[data-theme="arctic-aurora"] .tree-node-header {
+    border-radius: 10px;
+}
+:root[data-theme="arctic-aurora"] .tree-count,
+:root[data-theme="arctic-aurora"] .app-version {
+    border-radius: 999px;
+}
+:root[data-theme="arctic-aurora"] .preview-container img,
+:root[data-theme="arctic-aurora"] .detail-thumbnail img,
+:root[data-theme="arctic-aurora"] .thumbnail-strip img {
+    border-radius: 12px;
+}
+
+/* 4) 埃及博物馆 egyptian-museum：纪念碑风，近直角、金色顶饰线、宽字距大写 */
+:root[data-theme="egyptian-museum"] {
+    --radius: 3px;
+    --radius-lg: 4px;
+    --radius-sm: 2px;
+}
+:root[data-theme="egyptian-museum"] #topBar,
+:root[data-theme="egyptian-museum"] #leftPanel,
+:root[data-theme="egyptian-museum"] #rightPanel {
+    border-radius: 0;
+    border-color: rgba(201, 162, 39, 0.18);
+}
+:root[data-theme="egyptian-museum"] #topBar button {
+    border-radius: 2px;
+    letter-spacing: 2.5px;
+    text-transform: uppercase;
+    font-size: 11.5px;
+}
+:root[data-theme="egyptian-museum"] #topBar button:hover {
+    background: var(--tint-08);
+    border-color: rgba(201, 162, 39, 0.4);
+    box-shadow: inset 0 2px 0 var(--accent);
+}
+:root[data-theme="egyptian-museum"] .btn-primary {
+    border-radius: 2px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    font-size: 11.5px;
+    box-shadow: inset 0 0 0 1px rgba(232, 223, 200, 0.25), 0 4px 16px rgba(201, 162, 39, 0.25);
+}
+:root[data-theme="egyptian-museum"] .btn-primary:hover {
+    box-shadow: inset 0 0 0 1px rgba(232, 223, 200, 0.4), 0 6px 20px rgba(201, 162, 39, 0.4);
+}
+:root[data-theme="egyptian-museum"] .btn-secondary,
+:root[data-theme="egyptian-museum"] .btn-small,
+:root[data-theme="egyptian-museum"] .search-btn,
+:root[data-theme="egyptian-museum"] .search-action-btn {
+    border-radius: 2px;
+    letter-spacing: 1.5px;
+}
+:root[data-theme="egyptian-museum"] .btn-secondary:hover {
+    border-color: rgba(201, 162, 39, 0.45);
+    color: var(--accent);
+    background: var(--tint-06);
+}
+:root[data-theme="egyptian-museum"] input:not([type="checkbox"]):not([type="radio"]):not([type="color"]):not([type="range"]),
+:root[data-theme="egyptian-museum"] select:not(.lang-select),
+:root[data-theme="egyptian-museum"] textarea {
+    border-radius: 2px;
+}
+:root[data-theme="egyptian-museum"] input:focus,
+:root[data-theme="egyptian-museum"] textarea:focus {
+    border-color: rgba(201, 162, 39, 0.5);
+    box-shadow: 0 0 0 3px var(--tint-12);
+}
+:root[data-theme="egyptian-museum"] .image-card {
+    border-radius: 0;
+    transition: box-shadow 0.16s ease;
+}
+:root[data-theme="egyptian-museum"] .image-card:hover {
+    box-shadow: inset 0 3px 0 var(--accent), inset 0 0 0 1px rgba(201, 162, 39, 0.3), 0 14px 30px rgba(0, 0, 0, 0.55);
+}
+:root[data-theme="egyptian-museum"] .modal-content,
+:root[data-theme="egyptian-museum"] .modal-dialog,
+:root[data-theme="egyptian-museum"] .layout-dropdown-menu,
+:root[data-theme="egyptian-museum"] .advanced-search-panel,
+:root[data-theme="egyptian-museum"] .image-context-menu {
+    border-radius: 2px;
+    box-shadow: 0 0 0 1px rgba(201, 162, 39, 0.2), 0 0 0 5px rgba(201, 162, 39, 0.05), 0 18px 48px rgba(0, 0, 0, 0.6);
+}
+:root[data-theme="egyptian-museum"] .tree-node-header {
+    border-radius: 2px;
+}
+:root[data-theme="egyptian-museum"] .tree-count,
+:root[data-theme="egyptian-museum"] .app-version {
+    border-radius: 2px;
+    letter-spacing: 1px;
+}
+:root[data-theme="egyptian-museum"] .preview-container img,
+:root[data-theme="egyptian-museum"] .detail-thumbnail img,
+:root[data-theme="egyptian-museum"] .thumbnail-strip img {
+    border-radius: 0;
+    box-shadow: 0 0 0 1px rgba(201, 162, 39, 0.35);
+}
+
+/* 5) 水彩涂鸦 watercolor-doodle：手账画本风，大圆角、粉彩渐变、虚线描边、贴纸阴影 */
+:root[data-theme="watercolor-doodle"] {
+    --radius: 18px;
+    --radius-lg: 22px;
+    --radius-sm: 12px;
+}
+:root[data-theme="watercolor-doodle"] #topBar button {
+    border-radius: 999px;
+}
+:root[data-theme="watercolor-doodle"] #topBar button:hover {
+    background: rgba(242, 125, 157, 0.12);
+    border-color: rgba(242, 125, 157, 0.4);
+    color: var(--accent);
+    transform: rotate(-1deg);
+}
+:root[data-theme="watercolor-doodle"] .btn-primary {
+    border-radius: 999px;
+    background: linear-gradient(120deg, #F27D9D, #A78BFA);
+    color: #fff;
+    font-weight: 700;
+    box-shadow: 3px 4px 0 rgba(167, 139, 250, 0.35);
+    transition: transform 0.14s ease, box-shadow 0.14s ease;
+}
+:root[data-theme="watercolor-doodle"] .btn-primary:hover {
+    background: linear-gradient(120deg, #FF9BB6, #BCA3FF);
+    transform: translate(-1px, -2px) rotate(-1deg);
+    box-shadow: 5px 7px 0 rgba(167, 139, 250, 0.4);
+}
+:root[data-theme="watercolor-doodle"] .btn-secondary,
+:root[data-theme="watercolor-doodle"] .btn-small,
+:root[data-theme="watercolor-doodle"] .search-btn,
+:root[data-theme="watercolor-doodle"] .search-action-btn {
+    border-radius: 999px;
+    border-style: dashed;
+    border-color: rgba(240, 237, 245, 0.25);
+}
+:root[data-theme="watercolor-doodle"] .btn-secondary:hover,
+:root[data-theme="watercolor-doodle"] .btn-small:hover {
+    border-style: solid;
+    border-color: rgba(242, 125, 157, 0.55);
+    color: var(--accent);
+    background: rgba(242, 125, 157, 0.08);
+    transform: rotate(-0.5deg);
+}
+:root[data-theme="watercolor-doodle"] input:not([type="checkbox"]):not([type="radio"]):not([type="color"]):not([type="range"]),
+:root[data-theme="watercolor-doodle"] select:not(.lang-select),
+:root[data-theme="watercolor-doodle"] textarea {
+    border-radius: 14px;
+}
+:root[data-theme="watercolor-doodle"] input:focus,
+:root[data-theme="watercolor-doodle"] textarea:focus {
+    border-color: rgba(242, 125, 157, 0.55);
+    box-shadow: 0 0 0 3px rgba(242, 125, 157, 0.14);
+}
+:root[data-theme="watercolor-doodle"] .image-card {
+    border-radius: 18px;
+    transition: transform 0.16s ease, box-shadow 0.16s ease;
+}
+:root[data-theme="watercolor-doodle"] .image-card:hover {
+    transform: translateY(-3px) rotate(-1deg);
+    box-shadow: 6px 8px 0 rgba(167, 139, 250, 0.22), 0 16px 32px rgba(0, 0, 0, 0.45);
+}
+:root[data-theme="watercolor-doodle"] .modal-content,
+:root[data-theme="watercolor-doodle"] .modal-dialog,
+:root[data-theme="watercolor-doodle"] .layout-dropdown-menu,
+:root[data-theme="watercolor-doodle"] .advanced-search-panel,
+:root[data-theme="watercolor-doodle"] .image-context-menu {
+    border-radius: 20px;
+    box-shadow: 8px 10px 0 rgba(167, 139, 250, 0.16), 0 20px 44px rgba(0, 0, 0, 0.5);
+}
+:root[data-theme="watercolor-doodle"] .tree-node-header {
+    border-radius: 12px;
+}
+:root[data-theme="watercolor-doodle"] .tree-count,
+:root[data-theme="watercolor-doodle"] .app-version {
+    border-radius: 999px;
+}
+:root[data-theme="watercolor-doodle"] .preview-container img,
+:root[data-theme="watercolor-doodle"] .detail-thumbnail img,
+:root[data-theme="watercolor-doodle"] .thumbnail-strip img {
+    border-radius: 14px;
+    box-shadow: 4px 5px 0 rgba(242, 193, 78, 0.2);
+}
+
+/* ============================================================
+   布局架构改造（第二层）
+   - 三套装饰主题（极光/埃及/水彩）：悬浮式面板 —— 左右面板与
+     画廊脱开屏幕边缘，成为独立的圆角卡片，透出背景装饰层。
+   - 两套画廊主题（鎏金暗厅/画廊白）：保持通栏结构，但标签页
+     改为分段控件、搜索条放大、画廊与面板增加呼吸留白。
+   全部为 CSS 几何与间距调整，拖拽分割/折叠/移动端断点逻辑不变。
+   ============================================================ */
+
+/* --- 共用：左侧标签页从"下划线页签"改为"分段控件" --- */
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .panel-tabs {
+    margin: 10px 10px 0;
+    border: 1px solid var(--border-color);
+    border-bottom: 1px solid var(--border-color);
+    border-radius: 999px;
+    background: var(--bg-input);
+    padding: 3px;
+    gap: 4px;
+    height: 40px;
+    box-sizing: border-box;
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .panel-tab {
+    flex: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    height: 32px;
+    padding: 0 8px;
+    border-bottom: none;
+    border-radius: 999px;
+    font-size: 12.5px;
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .panel-tab:hover {
+    background: var(--bg-hover);
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .panel-tab.active {
+    background: var(--tint-16);
+    color: var(--accent);
+    font-weight: 600;
+}
+/* 标签页高度变化后，内容区起点同步下移 */
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .panel-content {
+    top: 56px;
+}
+/* 面板内容左右留白 */
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .panel-toolbar {
+    padding: 10px 12px 6px;
+}
+
+/* --- 共用：搜索条放大为真正的居中主控件 --- */
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) #searchBar {
+    border-radius: 999px;
+    min-width: 0;
+    flex: 1;
+    max-width: 520px;
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .search-input {
+    border-radius: 999px;
+    height: 34px;
+}
+
+/* --- 悬浮面板架构：极光 / 埃及 / 水彩 --- */
+:root:is([data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) #mainContainer {
+    padding: 0 12px 12px;
+    gap: 12px;
+}
+:root:is([data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) #leftPanel,
+:root:is([data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) #rightPanel {
+    border-radius: var(--radius-lg);
+    border: 1px solid var(--border-color);
+    box-shadow: var(--shadow);
+}
+:root:is([data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) #galleryContainer {
+    border-radius: var(--radius-lg);
+    border: 1px solid var(--border-color);
+}
+/* 悬浮架构下面板折叠时不再残留边框阴影 */
+:root:is([data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) #leftPanel.collapsed,
+:root:is([data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) #rightPanel.collapsed {
+    border: none;
+    box-shadow: none;
+}
+
+/* --- 鎏金暗厅：通栏 + 画廊内部金色细框展柜感 --- */
+:root[data-theme="gallery-dark"] #galleryContainer {
+    box-shadow: inset 0 0 0 1px rgba(200, 162, 74, 0.1);
+}
+:root[data-theme="gallery-dark"] .gallery-toolbar {
+    border-bottom-color: rgba(200, 162, 74, 0.14);
+}
+:root[data-theme="gallery-dark"] .panel-tabs {
+    background: transparent;
+}
+:root[data-theme="gallery-dark"] .panel-tab.active {
+    background: var(--tint-12);
+    box-shadow: inset 0 0 0 1px var(--gold-hairline);
+}
+
+/* --- 画廊白：通栏 + 大留白编辑感，分段控件用白底浮起 --- */
+:root[data-theme="gallery-light"] .panel-tabs {
+    background: var(--bg-secondary);
+    box-shadow: 0 1px 2px rgba(31, 31, 31, 0.06);
+}
+:root[data-theme="gallery-light"] .panel-tab.active {
+    background: #FFFFFF;
+    color: #1F1F1F;
+    box-shadow: 0 1px 3px rgba(31, 31, 31, 0.14);
+}
+:root[data-theme="gallery-light"] #galleryContainer {
+    background: #FFFFFF;
+}
+:root[data-theme="gallery-light"] .gallery-toolbar {
+    padding: 0 18px;
+}
