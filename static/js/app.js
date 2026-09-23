@@ -11,6 +11,7 @@ const App = (() => {
 
     // 状态
     let isInitialized = false;
+    const ASSET_VER = 'u13'; // 前端资源版本（与 index.html ?v= 同步更新）
 
     // ==================== 编辑模式 UI 更新 ====================
 
@@ -112,8 +113,13 @@ const App = (() => {
                 }
             });
 
-            // 移动端底部导航初始化
+            console.log('[App] 前端资源版本: ' + ASSET_VER + ' (css/js ?v=2.15)');
+// 移动端底部导航初始化
             initMobileNav();
+            // 移动端画廊工具栏下拉初始化
+            initMobileToolbar();
+            // 移动端顶栏下拉初始化（设置/刷新/主题/高级搜索/生成参数收进菜单）
+            initMobileTopbar();
 
             // 绑定全局事件（锁按钮、刷新、编辑模式等）
             bindGlobalEvents();
@@ -166,6 +172,19 @@ const App = (() => {
 
             // 等待所有并行任务完成
             await Promise.all([settingsSync, importedRootsReady, sidebarReady, accentReady]);
+
+            // ★ 恢复上次浏览的文件夹（手机端重开页面直接回到原位置）
+            try {
+                if (typeof Gallery !== 'undefined' && Gallery.filterByFolder && typeof Storage !== 'undefined' && Storage.getSetting) {
+                    const lastFolder = await Storage.getSetting('lastFolder', null);
+                    if (lastFolder) {
+                        console.log('[App] 恢复上次浏览的文件夹:', lastFolder);
+                        Gallery.filterByFolder(lastFolder, '', {}).catch(err => {
+                            console.warn('[App] 恢复上次文件夹失败:', err.message);
+                        });
+                    }
+                }
+            } catch (e) { /* 静默，不影响启动 */ }
 
             console.log('[App] 等待用户选择本地文件夹...');
 
@@ -315,15 +334,45 @@ const App = (() => {
 
     // ==================== 主题管理 ====================
 
+    // 主题注册表：dark/light 为「单色模式」，其余为扩展主题
+    const THEMES = [
+        { id: 'dark', nameKey: 'theme.mono_dark', dark: true },
+        { id: 'light', nameKey: 'theme.mono_light', dark: false },
+        { id: 'gallery-dark', nameKey: 'theme.gallery_dark', dark: true },
+        { id: 'gallery-light', nameKey: 'theme.gallery_light', dark: false },
+        { id: 'arctic-aurora', nameKey: 'theme.arctic_aurora', dark: true, decor: true },
+        { id: 'egyptian-museum', nameKey: 'theme.egyptian_museum', dark: true, decor: true },
+        { id: 'watercolor-doodle', nameKey: 'theme.watercolor_doodle', dark: true, decor: true }
+    ];
+
+    const THEME_COLORS = {
+        'dark': '#1a1a1a',
+        'light': '#fafbfc',
+        'gallery-dark': '#101014',
+        'gallery-light': '#FBFBFC',
+        'arctic-aurora': '#0A0E14',
+        'egyptian-museum': '#0E0C09',
+        'watercolor-doodle': '#171522'
+    };
+
+    function isKnownTheme(id) {
+        return THEMES.some(t => t.id === id);
+    }
+
+    function isDarkTheme(id) {
+        const t = THEMES.find(t => t.id === id);
+        return t ? t.dark : true;
+    }
+
     function initTheme() {
         const saved = localStorage.getItem('theme');
         const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-        const theme = saved || (prefersDark ? 'dark' : 'light');
+        const theme = isKnownTheme(saved) ? saved : (prefersDark ? 'dark' : 'light');
         applyTheme(theme);
 
         const btn = document.getElementById('btnToggleTheme');
         if (btn) {
-            btn.addEventListener('click', toggleTheme);
+            btn.addEventListener('click', cycleTheme);
         }
 
         // 语言切换：不依赖 location.reload()（Wails WebView 中可能不可靠），
@@ -345,10 +394,38 @@ const App = (() => {
     }
 
     function applyTheme(theme) {
+        if (!isKnownTheme(theme)) theme = 'dark';
         document.documentElement.setAttribute('data-theme', theme);
+
+        // 新主题隐藏带文字按钮上的图标（纯图标按钮保留）
+        const isMono = theme === 'dark' || theme === 'light';
+        document.body.classList.toggle('theme-no-btn-icons', !isMono);
+
+        // 装饰层：仅装饰主题显示，极光主题需要极光带子元素
+        const decor = document.getElementById('themeDecor');
+        if (decor) {
+            decor.innerHTML = theme === 'arctic-aurora'
+                ? '<i class="aur a1"></i><i class="aur a2"></i>'
+                : '';
+        }
+
+        // 浏览器/窗口边框配色
+        let meta = document.querySelector('meta[name="theme-color"]');
+        if (!meta) {
+            meta = document.createElement('meta');
+            meta.name = 'theme-color';
+            document.head.appendChild(meta);
+        }
+        meta.content = THEME_COLORS[theme] || '#1a1a1a';
+
         const btn = document.getElementById('btnToggleTheme');
         if (btn) {
-            btn.innerHTML = theme === 'dark' ? '<span class="icon icon-theme-dark"></span>' : '<span class="icon icon-theme-light"></span>';
+            btn.innerHTML = isDarkTheme(theme)
+                ? '<span class="icon icon-theme-dark"></span>'
+                : '<span class="icon icon-theme-light"></span>';
+            if (typeof I18n !== 'undefined' && I18n.t) {
+                btn.title = I18n.t('settings.theme') + ' · ' + I18n.t(THEMES.find(t => t.id === theme).nameKey);
+            }
         }
     }
 
@@ -419,7 +496,7 @@ const App = (() => {
         const [r, g, b] = rgb;
 
         // 根据当前主题计算 hover 和 glow
-        const isDark = (document.documentElement.getAttribute('data-theme') || 'dark') === 'dark';
+        const isDark = isDarkTheme(document.documentElement.getAttribute('data-theme') || 'dark');
         // HSL 亮度调整
         const factor = isDark ? 1.15 : 0.85;
         const hr = Math.min(255, Math.round(r * factor + (isDark ? 40 : -30)));
@@ -452,14 +529,40 @@ const App = (() => {
         }
     }
 
-    function toggleTheme() {
-        const current = document.documentElement.getAttribute('data-theme') || 'dark';
-        const next = current === 'dark' ? 'light' : 'dark';
-        localStorage.setItem('theme', next);
+    // 清除自定义强调色,恢复主题自带配色
+    function resetAccentColor() {
+        localStorage.removeItem('accentColor');
         if (typeof Storage !== 'undefined' && Storage.setSetting) {
-            Storage.setSetting('theme', next);
+            Storage.setSetting('accentColor', null);
         }
-        applyTheme(next);
+        const rootStyle = document.documentElement.style;
+        rootStyle.removeProperty('--accent');
+        rootStyle.removeProperty('--accent-hover');
+        rootStyle.removeProperty('--accent-glow');
+    }
+
+    function applyThemeById(theme) {
+        localStorage.setItem('theme', theme);
+        if (typeof Storage !== 'undefined' && Storage.setSetting) {
+            Storage.setSetting('theme', theme);
+        }
+        // 切换主题时清除自定义强调色,使用新主题的设计配色
+        resetAccentColor();
+        applyTheme(theme);
+    }
+
+    function cycleTheme() {
+        const current = document.documentElement.getAttribute('data-theme') || 'dark';
+        const idx = THEMES.findIndex(t => t.id === current);
+        applyThemeById(THEMES[(idx + 1) % THEMES.length].id);
+    }
+
+    function getThemeInfo() {
+        const current = document.documentElement.getAttribute('data-theme') || 'dark';
+        return {
+            current,
+            themes: THEMES.map(t => ({ id: t.id, nameKey: t.nameKey, dark: t.dark }))
+        };
     }
 
     // ==================== 窗口状态保存 ====================
@@ -594,7 +697,156 @@ const App = (() => {
         }
     }
 
-    // ==================== 面板分割条拖拽 ====================
+    // ==================== 移动端画廊工具栏下拉 ====================
+
+    function initMobileToolbar() {
+        if (!document.body.classList.contains('mobile')) return;
+        if (document.getElementById('mobileToolbarToggle')) return; // 已初始化
+
+        const toolbarLeft = document.querySelector('.gallery-toolbar .toolbar-left');
+        const toolbarRight = document.querySelector('.gallery-toolbar .toolbar-right');
+        const gallery = document.getElementById('galleryContainer');
+        if (!toolbarLeft || !toolbarRight || !gallery) return;
+
+        // 下拉开关按钮（放在排序下拉左侧）
+        const toggle = document.createElement('button');
+        toggle.id = 'mobileToolbarToggle';
+        toggle.className = 'edit-mode-btn';
+        toggle.title = t('toolbar.more_tools') || '更多工具';
+        toggle.innerHTML = '<span class="icon icon-sliders"></span><span class="dropdown-arrow">&#9662;</span>';
+        toolbarRight.insertBefore(toggle, toolbarRight.firstChild);
+
+        // 下拉菜单容器
+        const menu = document.createElement('div');
+        menu.id = 'mobileToolbarMenu';
+        menu.className = 'mobile-toolbar-menu';
+        menu.style.display = 'none';
+
+        // 把次要控件搬进下拉菜单（DOM 节点移动保留事件绑定）；
+        // 工具栏上只留布局切换、工具入口与排序下拉
+        const movers = [
+            toolbarLeft.querySelector('.thumbnail-slider'),
+            document.getElementById('btnEditMode'),
+            document.getElementById('btnInertiaToggle'),
+            document.getElementById('btnInertiaSettings'),
+            document.getElementById('imageCount'),
+            document.getElementById('btnShowPromptCount'),
+            document.getElementById('lockRightPanel'),
+        ];
+        movers.forEach(el => { if (el) menu.appendChild(el); });
+        gallery.appendChild(menu);
+
+        // 纯图标按钮在菜单里补文字标签（保留 data-i18n 以便切换语言时更新）
+        const menuLabels = {
+            btnInertiaSettings: 'inertia.title',
+            btnShowPromptCount: 'toolbar.show_prompt_count',
+            lockRightPanel: 'mobile.lock',
+        };
+        Object.entries(menuLabels).forEach(([id, key]) => {
+            const btn = document.getElementById(id);
+            if (!btn || btn.querySelector('.menu-label')) return;
+            const span = document.createElement('span');
+            span.className = 'menu-label';
+            span.setAttribute('data-i18n', key);
+            // i18n 字典可能被缓存而缺少新键，用按钮 title 的首段做兜底
+            const translated = t(key);
+            span.textContent = translated !== key ? translated
+                : (key === 'mobile.lock' ? '锁定' : (btn.title || key).split(/[：:]/)[0]);
+            btn.appendChild(span);
+        });
+
+        const close = () => { menu.style.display = 'none'; toggle.classList.remove('active'); };
+        toggle.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (menu.style.display === 'none') {
+                menu.style.display = 'flex';
+                toggle.classList.add('active');
+            } else {
+                close();
+            }
+        });
+        // 点击菜单外区域关闭
+        document.addEventListener('click', (e) => {
+            if (menu.style.display !== 'none' && !menu.contains(e.target)) close();
+        });
+        // 打开抽屉时也关闭
+        const overlay = document.getElementById('panelOverlay');
+        if (overlay) overlay.addEventListener('click', close);
+    }
+    // 供测试/调试在 mobile 类后挂时手动触发
+    window.__initMobileToolbar = initMobileToolbar;
+
+    // ==================== 移动端顶栏下拉 ====================
+    // 顶栏右侧按钮（设置/刷新/主题）与搜索区动作按钮（高级搜索/生成参数）
+    // 收进一个"更多"下拉菜单，避免窄屏上互相挤压遮挡。
+    function initMobileTopbar() {
+        if (!document.body.classList.contains('mobile')) return;
+        if (document.getElementById('mobileTopbarToggle')) return; // 已初始化
+
+        const topbarRight = document.querySelector('#topBar .topbar-right');
+        const searchGroup = document.querySelector('#topBar .search-group');
+        const header = document.getElementById('topBar');
+        if (!topbarRight || !header) return;
+
+        // 下拉开关按钮（放在顶栏最右侧）
+        const toggle = document.createElement('button');
+        toggle.id = 'mobileTopbarToggle';
+        toggle.title = t('toolbar.more_tools') || '更多';
+        toggle.innerHTML = '<span class="icon icon-menu"></span><span class="dropdown-arrow">&#9662;</span>';
+        topbarRight.appendChild(toggle);
+
+        // 下拉菜单容器（顶部带版本信息行，用于确认手机实际加载的前端版本）
+        const menu = document.createElement('div');
+        menu.id = 'mobileTopbarMenu';
+        const verRow = document.createElement('div');
+        verRow.className = 'mobile-topbar-menu-version';
+        verRow.textContent = '前端版本 ' + ASSET_VER;
+        menu.appendChild(verRow);
+        menu.className = 'mobile-topbar-menu';
+        menu.style.display = 'none';
+
+        // 搬移的控件（DOM 移动保留事件绑定）
+        const movers = [
+            searchGroup ? searchGroup.querySelector('#advancedSearchToggle') : null,
+            searchGroup ? searchGroup.querySelector('#paramTagsToggle') : null,
+            document.getElementById('btnThumbSettings'),
+            document.getElementById('btnRefresh'),
+            document.getElementById('btnToggleTheme'),
+        ];
+        movers.forEach(el => { if (el) menu.appendChild(el); });
+        header.appendChild(menu);
+
+        // 纯图标按钮在菜单里补文字标签
+        const menuLabels = {
+            btnToggleTheme: 'settings.theme',
+        };
+        Object.entries(menuLabels).forEach(([id, key]) => {
+            const btn = document.getElementById(id);
+            if (!btn || btn.querySelector('.menu-label')) return;
+            const span = document.createElement('span');
+            span.className = 'menu-label';
+            span.setAttribute('data-i18n', key);
+            const translated = t(key);
+            span.textContent = translated !== key ? translated : (btn.title || key);
+            btn.appendChild(span);
+        });
+
+        const close = () => { menu.style.display = 'none'; toggle.classList.remove('active'); };
+        toggle.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (menu.style.display === 'none') {
+                menu.style.display = 'flex';
+                toggle.classList.add('active');
+            } else {
+                close();
+            }
+        });
+        // 点击菜单外区域关闭
+        document.addEventListener('click', (e) => {
+            if (menu.style.display !== 'none' && !menu.contains(e.target) && !toggle.contains(e.target)) close();
+        });
+    }
+    window.__initMobileTopbar = initMobileTopbar;
 
     function initPanelResizer() {
         const resizer = document.getElementById('leftResizer');
@@ -848,7 +1100,11 @@ const App = (() => {
     return {
         init,
         showToast,
-        applyAccentColor
+        applyAccentColor,
+        resetAccentColor,
+        applyTheme,
+        applyThemeById,
+        getThemeInfo
     };
 })();
 

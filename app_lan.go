@@ -52,6 +52,11 @@ func (a *App) startLANServerWithPort(port int) {
 	//   Go 端本地读文件头部，不需要下载整图
 	mux.HandleFunc("/api/metadata", a.handleLANMetadata)
 
+	// ★ 搜索（手机端搜索框/高级搜索）：此前缺失导致 POST 落到 SPA 兜底路由
+	//   返回 HTML，前端 JSON 解析报 "Unexpected token"（表现为"未知tokens"）
+	mux.HandleFunc("/api/search", a.handleLANSearch)
+	mux.HandleFunc("/api/search/advanced", a.handleLANAdvancedSearch)
+
 	// 缩略图
 	mux.HandleFunc("/thumb/", func(w http.ResponseWriter, r *http.Request) {
 		imageID := strings.TrimPrefix(r.URL.Path, "/thumb/")
@@ -142,7 +147,13 @@ func (a *App) startLANServerWithPort(port int) {
 		}
 		contentType := getContentType(cleanPath)
 		w.Header().Set("Content-Type", contentType)
-		w.Header().Set("Cache-Control", "public, max-age=3600")
+		// ★ HTML 入口永不缓存：保证前端更新能立刻到达手机/浏览器；
+		//   其余静态资源靠 index.html 里的 ?v= 版本号失效，可长缓存。
+		if cleanPath == "index.html" {
+			w.Header().Set("Cache-Control", "no-cache")
+		} else {
+			w.Header().Set("Cache-Control", "public, max-age=3600")
+		}
 		w.Write(data)
 	})
 
@@ -338,6 +349,51 @@ func (a *App) handleLANMetadata(w http.ResponseWriter, r *http.Request) {
 		meta = map[string]interface{}{"success": false, "error": "no metadata"}
 	}
 	json.NewEncoder(w).Encode(meta)
+}
+
+// handleLANSearch 简单搜索（POST JSON: query/folder/offset/limit）
+func (a *App) handleLANSearch(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != "POST" {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Query  string `json:"query"`
+		Folder string `json:"folder"`
+		Offset int    `json:"offset"`
+		Limit  int    `json:"limit"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		json.NewEncoder(w).Encode(&SearchResponse{Success: false, Message: "无效请求体", Code: "bad_request"})
+		return
+	}
+	json.NewEncoder(w).Encode(a.SearchImages(body.Query, body.Folder, body.Offset, body.Limit))
+}
+
+// handleLANAdvancedSearch 高级搜索（POST JSON: AdvancedSearchRequest）
+func (a *App) handleLANAdvancedSearch(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != "POST" {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req AdvancedSearchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		json.NewEncoder(w).Encode(&AdvancedSearchResponse{Success: false, Message: "无效请求体", Code: "bad_request"})
+		return
+	}
+	json.NewEncoder(w).Encode(a.AdvancedSearch(&req))
 }
 
 // handleLANUserData 处理 /api/user-data/* 请求，代理到 App 的用户数据方法

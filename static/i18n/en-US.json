@@ -670,5 +670,17 @@
   "settings.media_tools_path_ph": "Directory containing ffmpeg (optional, auto-detected if empty)",
   "settings.redetect": "Re-detect",
   "detail.audio_unsupported": "This audio format cannot be played in the current environment",
-  "detail.media_info": "Media Info"
+  "detail.media_info": "Media Info",
+  "theme.mono_dark": "Monochrome · Dark",
+  "theme.mono_light": "Monochrome · Light",
+  "theme.gallery_dark": "Gallery Noir",
+  "theme.gallery_light": "White Gallery",
+  "theme.arctic_aurora": "Arctic Aurora",
+  "theme.egyptian_museum": "Egyptian Museum",
+  "theme.watercolor_doodle": "Watercolor Doodle",
+  "settings.concurrency_desc": "Number of thumbnails generated in parallel. Higher values make background pre-generation faster but use more CPU and memory. \"Restore Default\" sets it to your CPU logical core count (min 2). Changes take effect immediately, no restart needed.",
+  "gallery.end_of_gallery": "All {n} images loaded",
+  "gallery.loading_more_progress": "Loading more images",
+  "mobile.lock": "Lock",
+  "toolbar.more_tools": "More tools"
 }

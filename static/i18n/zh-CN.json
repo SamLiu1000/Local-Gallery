@@ -670,5 +670,17 @@
   "settings.media_tools_path_ph": "ffmpeg 所在目录（可选，留空自动探测）",
   "settings.redetect": "重新检测",
   "detail.audio_unsupported": "当前环境不支持播放该音频格式",
-  "detail.media_info": "媒体信息"
+  "detail.media_info": "媒体信息",
+  "theme.mono_dark": "单色 · 深色",
+  "theme.mono_light": "单色 · 浅色",
+  "theme.gallery_dark": "美术馆暗金",
+  "theme.gallery_light": "画廊白",
+  "theme.arctic_aurora": "北极极光",
+  "theme.egyptian_museum": "埃及博物馆",
+  "theme.watercolor_doodle": "水彩涂鸦",
+  "settings.concurrency_desc": "同时生成缩略图的并行任务数量。数值越大，后台预生成缩略图越快，但占用更多 CPU 与内存；点击「恢复默认」将设为 CPU 逻辑核心数（最少 2）。修改后立即生效，无需重启。",
+  "gallery.end_of_gallery": "已加载全部 {n} 张图片",
+  "gallery.loading_more_progress": "正在加载更多图片",
+  "mobile.lock": "锁定",
+  "toolbar.more_tools": "更多工具"
 }

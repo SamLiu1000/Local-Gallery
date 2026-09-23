@@ -667,5 +667,17 @@
   "settings.media_tools_path_ph": "Ordner mit ffmpeg (optional, leer = automatisch suchen)",
   "settings.redetect": "Neu suchen",
   "detail.audio_unsupported": "Dieses Audioformat kann in der aktuellen Umgebung nicht wiedergegeben werden",
-  "detail.media_info": "Medieninformationen"
+  "detail.media_info": "Medieninformationen",
+  "theme.mono_dark": "Monochrom · Dunkel",
+  "theme.mono_light": "Monochrom · Hell",
+  "theme.gallery_dark": "Galerie Dunkelgold",
+  "theme.gallery_light": "Weiße Galerie",
+  "theme.arctic_aurora": "Arktis-Aurora",
+  "theme.egyptian_museum": "Ägyptisches Museum",
+  "theme.watercolor_doodle": "Aquarell-Kritzelei",
+  "settings.concurrency_desc": "Anzahl der parallel erzeugten Vorschaubilder. Höhere Werte beschleunigen die Vorgenerierung im Hintergrund, verbrauchen aber mehr CPU und RAM. \"Standard wiederherstellen\" setzt die CPU-Logikprozessoranzahl (mind. 2). Änderungen wirken sofort, kein Neustart nötig.",
+  "gallery.end_of_gallery": "Alle {n} Bilder geladen",
+  "gallery.loading_more_progress": "Loading more images",
+  "mobile.lock": "Sperren",
+  "toolbar.more_tools": "Weitere Werkzeuge"
 }

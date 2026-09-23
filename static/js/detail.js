@@ -442,7 +442,7 @@ const DetailPanel = (() => {
         isExpanded = !isExpanded;
         rightPanel.classList.toggle('collapsed', !isExpanded);
         _savePanelState();
-        document.documentElement.style.setProperty('--right-panel-width', isExpanded ? '420px' : '0px');
+        document.documentElement.style.setProperty('--right-panel-width', isExpanded ? '336px' : '0px');
     }
 
     function expand() {
@@ -460,7 +460,7 @@ const DetailPanel = (() => {
             }
             rightPanel.classList.remove('collapsed');
             _savePanelState();
-            document.documentElement.style.setProperty('--right-panel-width', '420px');
+            document.documentElement.style.setProperty('--right-panel-width', '336px');
         }
     }
 
@@ -1715,7 +1715,8 @@ const DetailPanel = (() => {
                 badge.style.lineHeight = '24px';
 
                 // 浅色主题下纯图标标签文字改为深色
-                if (tag.iconOnly && document.documentElement.getAttribute('data-theme') === 'light') {
+                const _curTheme = document.documentElement.getAttribute('data-theme');
+                if (tag.iconOnly && (_curTheme === 'light' || _curTheme === 'gallery-light')) {
                     badge.style.color = '#1a1a2e';
                 }
 

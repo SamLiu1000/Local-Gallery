@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Theme Icon Test</title>
+<link rel="stylesheet" href="../static/css/style.css">
+<style>
+  body { padding: 20px; font-size: 14px; }
+  .row { display:flex; align-items:center; gap:8px; padding:6px 10px; border:1px dashed var(--border-color); margin-bottom:6px; }
+  h3 { margin: 14px 0 6px; }
+</style>
+</head>
+<body>
+<div id="case">
+  <h3>索引按钮（文件夹树）</h3>
+  <div class="row">
+    <span>📁 我的文件夹</span>
+    <button class="tree-index-btn"><span class="index-icon icon icon-index"></span></button>
+    <button class="tree-index-btn indexing"><span class="index-icon icon icon-indexing"></span></button>
+    <button class="tree-index-btn done"><span class="index-icon icon icon-index-done"></span></button>
+  </div>
+  <h3>设置页按钮</h3>
+  <div class="row">
+    <button class="btn-small"><span class="icon icon-refresh"></span> 刷新统计</button>
+    <button class="btn-small"><span class="icon icon-play"></span> 开启访问</button>
+    <button class="btn-small"><span class="icon icon-hammer"></span></button>
+    <button class="btn-small"><span class="icon icon-pause"></span></button>
+    <button class="btn-small"><span class="icon icon-sort"></span> 排序</button>
+    <button class="btn-small"><span class="icon icon-sliders"></span> 生成参数</button>
+    <button class="btn-small"><span class="icon icon-fullscreen"></span> 全屏</button>
+  </div>
+  <h3>常规按钮（对照）</h3>
+  <div class="row">
+    <button class="btn-small"><span class="icon icon-search"></span> 搜索</button>
+    <button class="btn-small"><span class="icon icon-settings"></span> 设置</button>
+    <button class="btn-small"><span class="icon icon-edit"></span> 编辑</button>
+    <button class="btn-small"><span class="icon icon-folder"></span> 文件夹</button>
+    <button class="btn-small"><span class="icon icon-tag"></span> 标签</button>
+    <button class="btn-small"><span class="icon icon-favorite-on"></span> 收藏</button>
+  </div>
+</div>
+</body>
+</html>

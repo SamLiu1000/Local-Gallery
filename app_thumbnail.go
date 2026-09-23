@@ -2298,6 +2298,28 @@ func (a *App) RestartWithNewPaths() map[string]interface{} {
 		}
 	}
 
+	// 3.5 打开新目录的 user-data.db：★ 必须成功才允许切换。
+	//   旧代码 `a.userDataDB, _ = ...` 忽略错误——快速反复切换时新库可能因
+	//   旧句柄未释放/锁冲突打开失败，userDataDB 变成 nil 后 GetSidebarSetting
+	//   返回"成功但空值"，前端会把空收纳夹写回目标目录（收纳夹被清空/丢失），
+	//   且此期间所有用户写入静默丢失。这里带重试地打开，失败即回滚整个切换。
+	var newUserDB *database.UserDataDB
+	var userDataDBErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		newUserDB, userDataDBErr = database.NewUserDataDB(filepath.Join(newUserDir, "user-data.db"))
+		if userDataDBErr == nil {
+			break
+		}
+		fmt.Printf("[热切换] 打开 user-data.db 失败(第 %d 次): %v\n", attempt+1, userDataDBErr)
+		time.Sleep(300 * time.Millisecond)
+	}
+	if userDataDBErr != nil {
+		a.thumbDBMu.Unlock()
+		r.db.Close()
+		restoreUserDirFile()
+		return map[string]interface{}{"success": false, "error": fmt.Sprintf("无法打开用户数据数据库 %s: %v", filepath.Join(newUserDir, "user-data.db"), userDataDBErr)}
+	}
+
 	if err := os.MkdirAll(filepath.Dir(newThumbDBPath), 0755); err != nil {
 		a.thumbDBMu.Unlock()
 		restoreUserDirFile()
@@ -2332,7 +2354,7 @@ func (a *App) RestartWithNewPaths() map[string]interface{} {
 	a.windowStateFile = filepath.Join(newUserDir, "window-state.json")
 
 	a.imageDB = r.db
-	a.userDataDB, _ = database.NewUserDataDB(filepath.Join(newUserDir, "user-data.db"))
+	a.userDataDB = newUserDB
 	a.thumbDB = newThumb
 
 	a.registeredRoots = newRegisteredRoots

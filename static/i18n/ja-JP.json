@@ -667,5 +667,17 @@
   "settings.media_tools_path_ph": "ffmpeg のあるフォルダー（空欄で自動検出）",
   "settings.redetect": "再検出",
   "detail.audio_unsupported": "この環境ではこの音声形式を再生できません",
-  "detail.media_info": "メディア情報"
+  "detail.media_info": "メディア情報",
+  "theme.mono_dark": "モノクロ・ダーク",
+  "theme.mono_light": "モノクロ・ライト",
+  "theme.gallery_dark": "美術館ダークゴールド",
+  "theme.gallery_light": "ギャラリーホワイト",
+  "theme.arctic_aurora": "北極のオーロラ",
+  "theme.egyptian_museum": "エジプト博物館",
+  "theme.watercolor_doodle": "水彩落書き",
+  "settings.concurrency_desc": "サムネイルを同時に生成する並列タスク数です。数値が大きいほどバックグラウンドの事前生成は速くなりますが、CPU とメモリを多く消費します。「デフォルトに戻す」で CPU 論理コア数（最小 2）に設定されます。変更は即時反映され、再起動は不要です。",
+  "gallery.end_of_gallery": "すべての {n} 枚の画像を読み込みました",
+  "gallery.loading_more_progress": "Loading more images",
+  "mobile.lock": "ロック",
+  "toolbar.more_tools": "その他のツール"
 }

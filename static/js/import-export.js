@@ -23,9 +23,12 @@ const ImportExport = (() => {
         btnExport = document.getElementById('btnExport');
         hiddenImportInput = document.getElementById('hiddenImportInput');
 
-        if (btnExport && !bound) {
+        // ★ 设置对话框每次打开都会重建 DOM（content.innerHTML = ...），
+        //   按钮是新元素，必须用元素级标志逐个绑定；模块级 bound 标志会导致
+        //   第二次打开设置后导出按钮永远不再绑定（点击无反应）。
+        if (btnExport && !btnExport._listenerBound) {
             btnExport.addEventListener('click', exportData);
-            bound = true;
+            btnExport._listenerBound = true;
         }
         if (btnImport && !btnImport._listenerBound) {
             btnImport.addEventListener('click', () => hiddenImportInput && hiddenImportInput.click());

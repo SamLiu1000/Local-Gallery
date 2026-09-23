@@ -2149,7 +2149,8 @@ func (a *App) SaveRootsWithMeta(roots []database.ImportedRoot) map[string]interf
 // GetSidebarSetting 读取侧边栏设置（key: sidebar_expanded, sidebar_folder_order）
 func (a *App) GetSidebarSetting(key string) map[string]interface{} {
 	if a.userDataDB == nil {
-		return map[string]interface{}{"success": true, "value": ""}
+		// ★ 区分"数据库未就绪"与"确实没有该设置"：前者让前端不落盘空数据
+		return map[string]interface{}{"success": false, "error": "数据库未初始化"}
 	}
 	value, err := a.userDataDB.GetSidebarSetting(key)
 	if err != nil {

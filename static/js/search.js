@@ -1498,6 +1498,10 @@ const SearchModule = (() => {
     function convertResultsToGallery(results) {
         if (!results || results.length === 0) return [];
 
+        // ★ 手机/浏览器端：搜索结果此前 url/thumbnailUrl 为 null，桌面端由 Go 惰性加载，
+        //   浏览器端无人填充 → 渲染成黑图。此处直接用 LAN 服务的 /thumb/{id} 构造。
+        const isBrowser = !(typeof WailsBridge !== 'undefined' && WailsBridge.isWails());
+
         return results.map(item => ({
             id: item.id,
             path: item.path,
@@ -1507,12 +1511,12 @@ const SearchModule = (() => {
             createdAt: item.createdAt || 0,
             folder: item.folder,
             rootPath: item.rootPath,
-            url: null,
-            thumbnailUrl: null,
+            url: (isBrowser && item.id) ? '/image/' + item.id : null,
+            thumbnailUrl: (isBrowser && item.id) ? '/thumb/' + item.id + '?t=' + (item.lastModified || 0) : null,
             displayName: item.rootPath ? item.rootPath.split(/[\\/]/).pop() : '',
             metadata: null,
             file: null,
-            _loaded: false,
+            _loaded: isBrowser,
             _fromServer: true,
             _searchResult: true,
             prompt: item.prompt,

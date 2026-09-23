@@ -19,6 +19,23 @@
     --accent: #e94560;
     --accent-hover: #ff6b81;
     --accent-glow: rgba(233, 69, 96, 0.25);
+    --tint-06: rgba(233, 69, 96, 0.06);
+    --tint-08: rgba(233, 69, 96, 0.08);
+    --tint-10: rgba(233, 69, 96, 0.10);
+    --tint-12: rgba(233, 69, 96, 0.12);
+    --tint-16: rgba(233, 69, 96, 0.16);
+    --tint-20: rgba(233, 69, 96, 0.20);
+    --tint-25: rgba(233, 69, 96, 0.25);
+    --tint-28: rgba(233, 69, 96, 0.28);
+    --tint-35: rgba(242, 125, 157, 0.35);
+    --tint-35: rgba(201, 162, 39, 0.35);
+    --tint-35: rgba(70, 199, 160, 0.35);
+    --tint-35: rgba(47, 79, 79, 0.35);
+    --tint-35: rgba(200, 162, 74, 0.35);
+    --tint-35: rgba(233, 69, 96, 0.35);
+    --tint-35: rgba(233, 69, 96, 0.35);
+    --tint-40: rgba(233, 69, 96, 0.40);
+    --tint-55: rgba(233, 69, 96, 0.55);
     --blue-glow: rgba(74, 158, 255, 0.2);
     --blue: #4a9eff;
     --blue-hover: #6ab4ff;
@@ -38,7 +55,7 @@
     --font-mono: 'Consolas', 'Monaco', 'Courier New', monospace;
     --font-sans: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
     --left-panel-width: 300px;
-    --right-panel-width: 420px;
+    --right-panel-width: 336px;
     --topbar-height: 48px;
     --tag-size: 12px;
     --avatar-tag-size: 12px;
@@ -68,6 +85,16 @@
     --accent: #e94560;
     --accent-hover: #d63850;
     --accent-glow: rgba(233, 69, 96, 0.15);
+    --tint-06: rgba(233, 69, 96, 0.06);
+    --tint-08: rgba(233, 69, 96, 0.08);
+    --tint-10: rgba(233, 69, 96, 0.10);
+    --tint-12: rgba(233, 69, 96, 0.12);
+    --tint-16: rgba(233, 69, 96, 0.16);
+    --tint-20: rgba(233, 69, 96, 0.20);
+    --tint-25: rgba(233, 69, 96, 0.25);
+    --tint-28: rgba(233, 69, 96, 0.28);
+    --tint-40: rgba(233, 69, 96, 0.40);
+    --tint-55: rgba(233, 69, 96, 0.55);
     --blue-glow: rgba(9, 105, 218, 0.15);
     --blue: #0969da;
     --blue-hover: #0550ae;
@@ -1401,7 +1428,7 @@ body.is-resizing .panel-resizer {
 .folder-ghost-placeholder {
     height: 36px;
     border: 2px dashed var(--accent);
-    background: rgba(233, 69, 96, 0.06);
+    background: var(--tint-06);
     border-radius: var(--radius-sm);
     pointer-events: none;
     margin: 1px 0;
@@ -1866,7 +1893,7 @@ button {
 }
 .layout-option.active {
     color: var(--accent);
-    background: rgba(233, 69, 96, 0.08);
+    background: var(--tint-08);
 }
 .thumbnail-slider {
     display: flex;
@@ -1938,7 +1965,7 @@ button {
     justify-content: center;
     gap: 8px;
     padding: 6px 12px;
-    background: rgba(233, 69, 96, 0.1);
+    background: var(--tint-10);
     border-bottom: 1px solid var(--accent);
     font-size: 12px;
     color: var(--accent);
@@ -1961,7 +1988,7 @@ button {
     transition: var(--transition);
 }
 .edit-mode-banner .edit-mode-close:hover {
-    background: rgba(233, 69, 96, 0.2);
+    background: var(--tint-20);
 }
 
 /* 编辑模式下图片卡片的选中效果增强 */
@@ -3463,8 +3490,8 @@ button {
 .tag-tree .tag-tree-container.edit-tags .tag-item .tag-delete-btn:hover {
     transform: translateY(-50%) scale(1.1);
     color: #e94560;
-    border-color: rgba(233, 69, 96, 0.55);
-    background: rgba(233, 69, 96, 0.12);
+    border-color: var(--tint-55);
+    background: var(--tint-12);
 }
 .tag-tree .tag-tree-container.edit-tags .tag-item .tag-drag-handle:active {
     cursor: grabbing;
@@ -4278,7 +4305,7 @@ button {
 @media (max-width: 1200px) {
     :root {
         --left-panel-width: 260px;
-        --right-panel-width: 360px;
+        --right-panel-width: 288px;
     }
     /* ★ 窄窗口：顶栏按钮退化为纯图标，避免与搜索组互相挤压遮挡 */
     .topbar-right button span[data-i18n] { display: none; }
@@ -4298,7 +4325,7 @@ button {
 @media (max-width: 900px) {
     :root {
         --left-panel-width: 240px;
-        --right-panel-width: 320px;
+        --right-panel-width: 256px;
     }
     #rightPanel.collapsed {
         width: 0;
@@ -4314,6 +4341,22 @@ button {
    ============================================================ */
 body.mobile #mainContainer {
     position: relative;
+}
+
+/* ★ 手机版：顶栏固定定位——真机触摸设备上 body overflow:hidden 锁不住滚动，
+   在查看器里拖动会把文档流中的顶栏滚出屏幕（表现为"点大图后顶栏消失"）。
+   固定定位使其不可滚动；主容器用 padding-top 补偿并撑满视口。 */
+body.mobile #topBar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 10012;
+}
+body.mobile #mainContainer {
+    padding-top: var(--topbar-height);
+    height: 100vh;
+    box-sizing: border-box;
 }
 
 /* 隐藏 D 形按钮和拖拽手柄 */
@@ -4463,6 +4506,229 @@ body.mobile .mobile-sort-option:active {
 /* 画廊容器为底部导航栏腾空间 */
 body.mobile #galleryContainer {
     padding-bottom: 48px;
+}
+
+/* ============================================================
+   手机版体验优化（按钮拥挤遮挡 / 缩略图大小调节 / 导航栏溢出）
+   ============================================================ */
+
+/* --- 顶栏：压缩搜索区与右侧按钮，避免互相遮挡 --- */
+body.mobile #topBar {
+    padding: 0 8px;
+    gap: 8px;
+}
+body.mobile .topbar-left .app-title { font-size: 16px; }
+/* 手机顶栏空间宝贵：版本徽章收进"更多"菜单，避免与搜索框互相遮挡 */
+body.mobile .topbar-left .app-version { display: none; }
+/* ★ 手机版：顶栏保持在大图查看器(z-index:10000)之上，点击大图后顶栏不消失 */
+body.mobile #topBar { z-index: 10012; }
+/* ★ 手机版：信息/详情滚动容器触摸滚动优化，避免"卡住不能上下滚动" */
+body.mobile .detail-content,
+body.mobile .raw-metadata-sidebar,
+body.mobile .image-viewer-params-panel {
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+    touch-action: pan-y;
+}
+body.mobile .search-group { flex-wrap: nowrap; min-width: 0; }
+body.mobile .search-bar { flex: 1 1 auto; min-width: 120px; }
+body.mobile .search-input { width: 100%; min-width: 0; }
+/* 高级搜索/生成参数按钮退化为纯图标 */
+body.mobile .search-action-btn span[data-i18n] { display: none; }
+body.mobile .search-action-btn { padding: 6px 8px; }
+/* 语言切换在手机顶栏放不下（设置页仍可切换），直接隐藏 */
+body.mobile .lang-select { display: none; }
+
+/* ★ 手机版顶栏"更多"下拉：设置/刷新/主题/高级搜索/生成参数收进菜单，
+   顶栏只留 标题 + 搜索框 + 搜索按钮 + 更多按钮 */
+#mobileTopbarToggle { display: none; }
+body.mobile #mobileTopbarToggle {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    background: var(--bg-input);
+    color: var(--text-secondary);
+    border: 1px solid var(--border-color);
+}
+body.mobile #mobileTopbarToggle.active {
+    background: var(--tint-25);
+    color: var(--accent);
+}
+body.mobile .mobile-topbar-menu {
+    position: fixed;
+    top: calc(var(--topbar-height) + 4px);
+    right: 8px;
+    min-width: 200px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    z-index: 10020; /* 高于顶栏(z-index:100)与抽屉(10010) */
+    padding: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+/* 菜单里的按钮恢复带文字的完整形态 */
+body.mobile .mobile-topbar-menu button {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    border-radius: 8px;
+    color: var(--text-primary);
+    font-size: 14px;
+    padding: 11px 12px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+body.mobile .mobile-topbar-menu button:active {
+    background: rgba(255, 255, 255, 0.08);
+}
+body.mobile .mobile-topbar-menu .mobile-topbar-menu-version {
+    padding: 8px 12px 4px;
+    font-size: 11px;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border-color);
+    margin-bottom: 4px;
+}
+body.mobile .mobile-topbar-menu button span[data-i18n],
+body.mobile .mobile-topbar-menu button .menu-label { display: inline !important; }
+
+/* --- 画廊工具栏：收紧间距与排序下拉，避免右侧被裁切 --- */
+body.mobile .gallery-toolbar {
+    gap: 6px;
+    padding: 0 8px;
+}
+body.mobile .toolbar-left,
+body.mobile .toolbar-right { gap: 4px; }
+body.mobile .toolbar-left button { padding: 6px 7px; }
+body.mobile .sort-select {
+    max-width: 92px;
+    font-size: 12px;
+    padding: 4px 2px;
+}
+body.mobile .toolbar-divider { display: none; }
+
+/* ★ 手机版隐藏冗余/重复按钮（用户指定）：
+   编辑模式、惯性（含参数）、工具栏排序下拉（排序走底部导航）、
+   锁定信息栏按钮（工具栏 + 底部导航两处） */
+body.mobile #btnEditMode,
+body.mobile #btnInertiaToggle,
+body.mobile #btnInertiaSettings,
+body.mobile #lockRightPanel,
+body.mobile #sortOrder,
+body.mobile #mobileNavLock { display: none !important; }
+
+/* --- 恢复缩略图大小调节（桌面窄屏隐藏，手机端以紧凑形式保留） --- */
+body.mobile .thumbnail-slider {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+}
+body.mobile .thumbnail-slider label,
+body.mobile #thumbnailSizeValue { display: none; }
+body.mobile .thumbnail-slider input[type="range"] { width: 72px; }
+
+/* --- 底部导航栏：等分按钮、单行文案，避免换行/溢出遮挡 --- */
+body.mobile .mobile-navbar { gap: 8px; padding: 0 4px; }
+body.mobile .mobile-navbar button {
+    flex: 1 1 0;
+    min-width: 0;
+    padding: 4px 6px;
+}
+body.mobile .mobile-navbar button > span:last-child {
+    max-width: 100%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* --- 画廊工具栏下拉菜单：次要工具收进"更多工具"，工具栏只留布局/工具/排序 --- */
+#mobileToolbarToggle { display: none; }
+body.mobile #mobileToolbarToggle {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    background: var(--bg-input);
+    color: var(--text-secondary);
+    border: 1px solid var(--border-color);
+}
+body.mobile #mobileToolbarToggle.active {
+    background: var(--tint-25);
+    color: var(--accent);
+}
+body.mobile .mobile-toolbar-menu {
+    position: fixed;
+    top: calc(var(--topbar-height) + 46px);
+    left: 8px;
+    right: 8px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    z-index: 10006;
+    padding: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+/* 菜单里的按钮恢复带文字的完整形态（窄屏收纳规则不适用于菜单内） */
+body.mobile .mobile-toolbar-menu button,
+body.mobile .mobile-toolbar-menu .edit-mode-btn {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    border-radius: 8px;
+    color: var(--text-primary);
+    font-size: 14px;
+    padding: 11px 12px;
+    cursor: pointer;
+}
+body.mobile .mobile-toolbar-menu button:active {
+    background: rgba(255, 255, 255, 0.08);
+}
+body.mobile .mobile-toolbar-menu button span[data-i18n] { display: inline !important; }
+body.mobile .mobile-toolbar-menu .image-count {
+    display: inline-flex;
+    padding: 8px 12px;
+    font-size: 12px;
+    color: var(--text-muted);
+}
+/* 缩略图大小滑条行：标签 + 全宽滑条 + 数值 */
+body.mobile .mobile-toolbar-menu .thumbnail-slider {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    overflow: visible;
+}
+body.mobile .mobile-toolbar-menu .thumbnail-slider label {
+    display: inline;
+    flex-shrink: 0;
+    font-size: 13px;
+    color: var(--text-secondary);
+}
+body.mobile .mobile-toolbar-menu .thumbnail-slider input[type="range"] {
+    flex: 1;
+    width: auto;
+    min-width: 0;
+}
+body.mobile .mobile-toolbar-menu #thumbnailSizeValue {
+    display: inline;
+    flex-shrink: 0;
+    width: 46px;
+    text-align: right;
+    font-size: 12px;
+    color: var(--text-muted);
 }
 
 /* 移动端查看器控件始终可见（没有 hover 状态） */
@@ -4693,7 +4959,7 @@ body.mobile .panel-overlay.show {
     background: var(--accent);
     transform: scale(1.15);
 }
-    background: color-mix(in srgb, var(--accent) 25%, transparent);
+    background: var(--tint-25);
     color: var(--accent);
 }
 
@@ -5137,8 +5403,8 @@ body.mobile .image-viewer-container.fullscreen .image-viewer-shortcuts {
 #imageViewerSlideshowShortcut.playing kbd,
 #shortcutFullscreen.active kbd,
 #shortcutOriginal.active kbd {
-    background: color-mix(in srgb, var(--accent) 20%, transparent);
-    border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+    background: var(--tint-20);
+    border-color: var(--tint-35);
     color: var(--accent);
 }
 
@@ -5584,18 +5850,18 @@ body.mobile .image-viewer-container.fullscreen .image-viewer-shortcuts {
     min-height: 34px;
     padding: 4px 10px;
     border-radius: var(--radius-md, 8px);
-    background: rgba(233, 69, 96, 0.10);
-    border: 1px solid rgba(233, 69, 96, 0.25);
+    background: var(--tint-10);
+    border: 1px solid var(--tint-25);
     backdrop-filter: blur(2px);
     cursor: pointer;
     transition: background 150ms ease, border-color 150ms ease;
 }
 .folder-bin-bar:hover {
-    background: rgba(233, 69, 96, 0.16);
-    border-color: rgba(233, 69, 96, 0.4);
+    background: var(--tint-16);
+    border-color: var(--tint-40);
 }
 .folder-bin-bar.drag-over-bin {
-    background: rgba(233, 69, 96, 0.28);
+    background: var(--tint-28);
     border-color: var(--accent, #e94560);
     box-shadow: 0 0 0 1px var(--accent, #e94560) inset;
 }
@@ -5654,7 +5920,7 @@ body.mobile .image-viewer-container.fullscreen .image-viewer-shortcuts {
 .folder-bin-children {
     margin: 2px 0 6px 14px;
     padding-left: 6px;
-    border-left: 2px solid rgba(233, 69, 96, 0.25);
+    border-left: 2px solid var(--tint-25);
 }
 
 /* ★ 后台操作状态徽标（图廊工具栏）：扫描/导入、自动预生成缩略图期间显示 */
@@ -5686,4 +5952,941 @@ body.mobile .image-viewer-container.fullscreen .image-viewer-shortcuts {
 @keyframes bgop-pulse {
     0%, 100% { opacity: 0.3; }
     50% { opacity: 1; }
+}
+
+/* ============================================================
+   扩展主题：单色模式之外的新主题
+   美术馆暗金 gallery-dark / 画廊白 gallery-light /
+   北极极光 arctic-aurora / 埃及博物馆 egyptian-museum / 水彩涂鸦 watercolor-doodle
+   仅覆盖设计令牌与外观，不改变布局结构
+   ============================================================ */
+
+/* --- 美术馆暗金（redesign v3） --- */
+:root[data-theme="gallery-dark"] {
+    --bg-primary: #101014;
+    --bg-secondary: #16161c;
+    --bg-tertiary: #1c1c24;
+    --bg-card: #1c1c24;
+    --bg-hover: rgba(255, 255, 255, 0.05);
+    --bg-input: #1a1a21;
+    --border-color: rgba(255, 255, 255, 0.08);
+    --border-light: rgba(255, 255, 255, 0.16);
+    --tree-line-color: #68656f;
+    --text-primary: #eceaf0;
+    --text-secondary: #9a97a3;
+    --text-muted: #68656f;
+    --accent: #c8a24a;
+    --accent-hover: #dcc06a;
+    --accent-glow: rgba(200, 162, 74, 0.13);
+    --tint-06: rgba(200, 162, 74, 0.06);
+    --tint-08: rgba(200, 162, 74, 0.08);
+    --tint-10: rgba(200, 162, 74, 0.10);
+    --tint-12: rgba(200, 162, 74, 0.12);
+    --tint-16: rgba(200, 162, 74, 0.16);
+    --tint-20: rgba(200, 162, 74, 0.20);
+    --tint-25: rgba(200, 162, 74, 0.25);
+    --tint-28: rgba(200, 162, 74, 0.28);
+    --tint-40: rgba(200, 162, 74, 0.40);
+    --tint-55: rgba(200, 162, 74, 0.55);
+    --shadow: 0 10px 28px rgba(0, 0, 0, 0.4);
+    --shadow-lg: 0 12px 36px rgba(0, 0, 0, 0.5);
+    --radius: 12px;
+    --radius-lg: 14px;
+    --radius-sm: 8px;
+    --scrollbar-thumb: rgba(255, 255, 255, 0.16);
+    --scrollbar-thumb-hover: rgba(255, 255, 255, 0.3);
+    --scrollbar-gripper: rgba(255, 255, 255, 0.1);
+    --on-accent: #151310;
+}
+
+/* --- 画廊白（redesign v4） --- */
+:root[data-theme="gallery-light"] {
+    --bg-primary: #FBFBFC;
+    --bg-secondary: #F3F4F5;
+    --bg-tertiary: #FFFFFF;
+    --bg-card: #FFFFFF;
+    --bg-hover: rgba(31, 31, 31, 0.05);
+    --bg-input: #FFFFFF;
+    --border-color: rgba(31, 31, 31, 0.09);
+    --border-light: rgba(31, 31, 31, 0.2);
+    --tree-line-color: #9C9A92;
+    --text-primary: #1F1F1F;
+    --text-secondary: #6B6B6B;
+    --text-muted: #9C9A92;
+    --accent: #2F4F4F;
+    --accent-hover: #3D6565;
+    --accent-glow: rgba(47, 79, 79, 0.1);
+    --tint-06: rgba(47, 79, 79, 0.06);
+    --tint-08: rgba(47, 79, 79, 0.08);
+    --tint-10: rgba(47, 79, 79, 0.10);
+    --tint-12: rgba(47, 79, 79, 0.12);
+    --tint-16: rgba(47, 79, 79, 0.16);
+    --tint-20: rgba(47, 79, 79, 0.20);
+    --tint-25: rgba(47, 79, 79, 0.25);
+    --tint-28: rgba(47, 79, 79, 0.28);
+    --tint-40: rgba(47, 79, 79, 0.40);
+    --tint-55: rgba(47, 79, 79, 0.55);
+    --blue: #0969da;
+    --blue-hover: #0550ae;
+    --green: #1a7f37;
+    --green-hover: #116329;
+    --orange: #bf8700;
+    --orange-hover: #9a6b00;
+    --red: #b0524a;
+    --red-hover: #96423b;
+    --purple: #8250df;
+    --shadow: 0 4px 14px rgba(31, 31, 31, 0.08);
+    --shadow-lg: 0 10px 28px rgba(31, 31, 31, 0.12);
+    --radius: 12px;
+    --radius-lg: 14px;
+    --radius-sm: 8px;
+    --scrollbar-thumb: rgba(0, 0, 0, 0.15);
+    --scrollbar-thumb-hover: rgba(0, 0, 0, 0.25);
+    --scrollbar-gripper: rgba(0, 0, 0, 0.08);
+    --on-accent: #ffffff;
+}
+
+/* --- 北极极光 --- */
+:root[data-theme="arctic-aurora"] {
+    --bg-primary: #0A0E14;
+    --bg-secondary: rgba(15, 20, 28, 0.82);
+    --bg-tertiary: #151C26;
+    --bg-card: #151C26;
+    --bg-hover: rgba(220, 231, 238, 0.06);
+    --bg-input: #111822;
+    --border-color: rgba(220, 231, 238, 0.08);
+    --border-light: rgba(220, 231, 238, 0.2);
+    --tree-line-color: #586978;
+    --text-primary: #DCE7EE;
+    --text-secondary: #8496A5;
+    --text-muted: #586978;
+    --accent: #46C7A0;
+    --accent-hover: #63E0B8;
+    --accent-glow: rgba(70, 199, 160, 0.14);
+    --tint-06: rgba(70, 199, 160, 0.06);
+    --tint-08: rgba(70, 199, 160, 0.08);
+    --tint-10: rgba(70, 199, 160, 0.10);
+    --tint-12: rgba(70, 199, 160, 0.12);
+    --tint-16: rgba(70, 199, 160, 0.16);
+    --tint-20: rgba(70, 199, 160, 0.20);
+    --tint-25: rgba(70, 199, 160, 0.25);
+    --tint-28: rgba(70, 199, 160, 0.28);
+    --tint-40: rgba(70, 199, 160, 0.40);
+    --tint-55: rgba(70, 199, 160, 0.55);
+    --shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+    --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.55);
+    --radius: 12px;
+    --radius-lg: 14px;
+    --radius-sm: 8px;
+    --scrollbar-thumb: rgba(220, 231, 238, 0.16);
+    --scrollbar-thumb-hover: rgba(220, 231, 238, 0.3);
+    --scrollbar-gripper: rgba(220, 231, 238, 0.1);
+    --on-accent: #0d1512;
+}
+
+/* --- 埃及博物馆 · 夜间特展 --- */
+:root[data-theme="egyptian-museum"] {
+    --bg-primary: #0E0C09;
+    --bg-secondary: rgba(22, 19, 16, 0.84);
+    --bg-tertiary: #1E1A13;
+    --bg-card: #1E1A13;
+    --bg-hover: rgba(232, 223, 200, 0.06);
+    --bg-input: #191510;
+    --border-color: rgba(232, 223, 200, 0.08);
+    --border-light: rgba(232, 223, 200, 0.2);
+    --tree-line-color: #6B6250;
+    --text-primary: #E8DFC8;
+    --text-secondary: #9C9078;
+    --text-muted: #6B6250;
+    --accent: #C9A227;
+    --accent-hover: #E0BC3D;
+    --accent-glow: rgba(201, 162, 39, 0.15);
+    --tint-06: rgba(201, 162, 39, 0.06);
+    --tint-08: rgba(201, 162, 39, 0.08);
+    --tint-10: rgba(201, 162, 39, 0.10);
+    --tint-12: rgba(201, 162, 39, 0.12);
+    --tint-16: rgba(201, 162, 39, 0.16);
+    --tint-20: rgba(201, 162, 39, 0.20);
+    --tint-25: rgba(201, 162, 39, 0.25);
+    --tint-28: rgba(201, 162, 39, 0.28);
+    --tint-40: rgba(201, 162, 39, 0.40);
+    --tint-55: rgba(201, 162, 39, 0.55);
+    --shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+    --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.55);
+    --radius: 12px;
+    --radius-lg: 14px;
+    --radius-sm: 8px;
+    --scrollbar-thumb: rgba(232, 223, 200, 0.16);
+    --scrollbar-thumb-hover: rgba(232, 223, 200, 0.3);
+    --scrollbar-gripper: rgba(232, 223, 200, 0.1);
+    --on-accent: #1c1608;
+}
+
+/* --- 水彩涂鸦 · 夜间画本 --- */
+:root[data-theme="watercolor-doodle"] {
+    --bg-primary: #171522;
+    --bg-secondary: rgba(31, 28, 46, 0.8);
+    --bg-tertiary: #282441;
+    --bg-card: #282441;
+    --bg-hover: rgba(240, 237, 245, 0.07);
+    --bg-input: #211D33;
+    --border-color: rgba(240, 237, 245, 0.09);
+    --border-light: rgba(240, 237, 245, 0.22);
+    --tree-line-color: #736B8A;
+    --text-primary: #F0EDF5;
+    --text-secondary: #A79FBC;
+    --text-muted: #736B8A;
+    --accent: #F27D9D;
+    --accent-hover: #FF9BB6;
+    --accent-glow: rgba(242, 125, 157, 0.15);
+    --tint-06: rgba(242, 125, 157, 0.06);
+    --tint-08: rgba(242, 125, 157, 0.08);
+    --tint-10: rgba(242, 125, 157, 0.10);
+    --tint-12: rgba(242, 125, 157, 0.12);
+    --tint-16: rgba(242, 125, 157, 0.16);
+    --tint-20: rgba(242, 125, 157, 0.20);
+    --tint-25: rgba(242, 125, 157, 0.25);
+    --tint-28: rgba(242, 125, 157, 0.28);
+    --tint-40: rgba(242, 125, 157, 0.40);
+    --tint-55: rgba(242, 125, 157, 0.55);
+    --shadow: 0 10px 26px rgba(0, 0, 0, 0.4);
+    --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.5);
+    --radius: 12px;
+    --radius-lg: 14px;
+    --radius-sm: 8px;
+    --scrollbar-thumb: rgba(240, 237, 245, 0.18);
+    --scrollbar-thumb-hover: rgba(240, 237, 245, 0.32);
+    --scrollbar-gripper: rgba(240, 237, 245, 0.1);
+    --on-accent: #2a1520;
+}
+
+/* ============================================================
+   新主题共用的设计语言（药丸按钮、毛玻璃面板、悬浮阴影）
+   仅作用于以上 5 个主题，单色模式不受影响
+   ============================================================ */
+:root[data-theme="gallery-dark"], :root[data-theme="gallery-light"],
+:root[data-theme="arctic-aurora"], :root[data-theme="egyptian-museum"],
+:root[data-theme="watercolor-doodle"] {
+    --font-serif: "Songti SC", "Noto Serif SC", Georgia, serif;
+}
+
+:root[data-theme="gallery-dark"] .app-title, :root[data-theme="gallery-light"] .app-title,
+:root[data-theme="arctic-aurora"] .app-title, :root[data-theme="egyptian-museum"] .app-title,
+:root[data-theme="watercolor-doodle"] .app-title {
+    font-family: var(--font-serif);
+    font-weight: 600;
+    letter-spacing: 0.4px;
+}
+
+/* 顶栏与操作按钮：药丸形 */
+:root[data-theme="gallery-dark"] #topBar button, :root[data-theme="gallery-light"] #topBar button,
+:root[data-theme="arctic-aurora"] #topBar button, :root[data-theme="egyptian-museum"] #topBar button,
+:root[data-theme="watercolor-doodle"] #topBar button {
+    height: 32px;
+    padding: 0 13px;
+    border-radius: 16px;
+    color: var(--text-secondary);
+    transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+:root[data-theme="gallery-dark"] #topBar button:hover, :root[data-theme="gallery-light"] #topBar button:hover,
+:root[data-theme="arctic-aurora"] #topBar button:hover, :root[data-theme="egyptian-museum"] #topBar button:hover,
+:root[data-theme="watercolor-doodle"] #topBar button:hover {
+    border-color: var(--border-light);
+    color: var(--text-primary);
+    background: var(--bg-hover);
+}
+:root[data-theme="gallery-dark"] .search-btn, :root[data-theme="gallery-light"] .search-btn,
+:root[data-theme="arctic-aurora"] .search-btn, :root[data-theme="egyptian-museum"] .search-btn,
+:root[data-theme="watercolor-doodle"] .search-btn {
+    border-radius: 999px;
+    padding: 5px 12px;
+}
+:root[data-theme="gallery-dark"] .search-action-btn, :root[data-theme="gallery-light"] .search-action-btn,
+:root[data-theme="arctic-aurora"] .search-action-btn, :root[data-theme="egyptian-museum"] .search-action-btn,
+:root[data-theme="watercolor-doodle"] .search-action-btn {
+    height: 30px;
+    background: transparent;
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary);
+    border-radius: 15px;
+    padding: 0 13px;
+}
+:root[data-theme="gallery-dark"] .search-action-btn:hover, :root[data-theme="gallery-light"] .search-action-btn:hover,
+:root[data-theme="arctic-aurora"] .search-action-btn:hover, :root[data-theme="egyptian-museum"] .search-action-btn:hover,
+:root[data-theme="watercolor-doodle"] .search-action-btn:hover {
+    background: var(--bg-hover);
+    border-color: var(--border-light);
+    color: var(--text-primary);
+    transform: none;
+}
+:root[data-theme="gallery-dark"] .search-action-btn.load-more-btn,
+:root[data-theme="gallery-light"] .search-action-btn.load-more-btn,
+:root[data-theme="arctic-aurora"] .search-action-btn.load-more-btn,
+:root[data-theme="egyptian-museum"] .search-action-btn.load-more-btn,
+:root[data-theme="watercolor-doodle"] .search-action-btn.load-more-btn {
+    background: var(--bg-hover);
+    color: var(--accent);
+}
+:root[data-theme="gallery-dark"] .btn-small, :root[data-theme="gallery-light"] .btn-small,
+:root[data-theme="arctic-aurora"] .btn-small, :root[data-theme="egyptian-museum"] .btn-small,
+:root[data-theme="watercolor-doodle"] .btn-small {
+    border-radius: 999px;
+}
+:root[data-theme="gallery-dark"] .lang-select, :root[data-theme="gallery-light"] .lang-select,
+:root[data-theme="arctic-aurora"] .lang-select, :root[data-theme="egyptian-museum"] .lang-select,
+:root[data-theme="watercolor-doodle"] .lang-select {
+    border-radius: 15px;
+}
+
+/* 毛玻璃面板（三个半透明背景的主题） */
+:root[data-theme="arctic-aurora"] #topBar, :root[data-theme="arctic-aurora"] #leftPanel,
+:root[data-theme="arctic-aurora"] #rightPanel,
+:root[data-theme="egyptian-museum"] #topBar, :root[data-theme="egyptian-museum"] #leftPanel,
+:root[data-theme="egyptian-museum"] #rightPanel,
+:root[data-theme="watercolor-doodle"] #topBar, :root[data-theme="watercolor-doodle"] #leftPanel,
+:root[data-theme="watercolor-doodle"] #rightPanel {
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+}
+
+/* 卡片悬浮阴影 */
+:root[data-theme="gallery-dark"] .image-card:hover, :root[data-theme="gallery-light"] .image-card:hover,
+:root[data-theme="arctic-aurora"] .image-card:hover, :root[data-theme="egyptian-museum"] .image-card:hover,
+:root[data-theme="watercolor-doodle"] .image-card:hover {
+    box-shadow: var(--shadow-lg);
+}
+
+/* 右键菜单等硬编码深灰改为令牌色 */
+:root[data-theme="gallery-dark"] .image-context-menu, :root[data-theme="gallery-light"] .image-context-menu,
+:root[data-theme="arctic-aurora"] .image-context-menu, :root[data-theme="egyptian-museum"] .image-context-menu,
+:root[data-theme="watercolor-doodle"] .image-context-menu {
+    background: var(--bg-tertiary);
+    border-color: var(--border-color);
+}
+
+/* ============================================================
+   主题装饰层 #themeDecor（纯装饰，不响应鼠标）
+   ============================================================ */
+#themeDecor {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    overflow: hidden;
+}
+
+/* --- 北极极光：极光带 + 星点 + 天空辉光 --- */
+:root[data-theme="arctic-aurora"] #themeDecor {
+    display: block;
+    background:
+        radial-gradient(1.5px 1.5px at 12% 22%, rgba(255,255,255,.55) 50%, transparent 51%),
+        radial-gradient(1px 1px at 34% 9%, rgba(255,255,255,.4) 50%, transparent 51%),
+        radial-gradient(1.5px 1.5px at 57% 17%, rgba(220,231,238,.5) 50%, transparent 51%),
+        radial-gradient(1px 1px at 73% 6%, rgba(255,255,255,.45) 50%, transparent 51%),
+        radial-gradient(1.5px 1.5px at 88% 26%, rgba(220,231,238,.4) 50%, transparent 51%),
+        radial-gradient(1px 1px at 45% 33%, rgba(255,255,255,.35) 50%, transparent 51%),
+        radial-gradient(1px 1px at 8% 44%, rgba(255,255,255,.3) 50%, transparent 51%),
+        radial-gradient(1px 1px at 66% 40%, rgba(255,255,255,.3) 50%, transparent 51%),
+        radial-gradient(120% 60% at 50% -20%, rgba(46,86,120,.22), transparent 60%);
+}
+:root[data-theme="arctic-aurora"] #themeDecor .aur {
+    position: absolute;
+    left: -12%;
+    right: -12%;
+    top: -130px;
+    height: 330px;
+    filter: blur(48px);
+    mix-blend-mode: screen;
+}
+:root[data-theme="arctic-aurora"] #themeDecor .aur.a1 {
+    opacity: .5;
+    transform: rotate(-7deg);
+    background: linear-gradient(100deg, transparent 4%, rgba(70,199,160,.5) 26%, rgba(94,150,230,.32) 48%, rgba(158,120,230,.3) 64%, transparent 88%);
+    animation: theme-aur 16s ease-in-out infinite alternate;
+}
+:root[data-theme="arctic-aurora"] #themeDecor .aur.a2 {
+    opacity: .32;
+    top: -40px;
+    height: 260px;
+    transform: rotate(5deg);
+    background: linear-gradient(80deg, transparent 8%, rgba(46,140,190,.4) 30%, rgba(70,199,160,.38) 55%, transparent 86%);
+    animation: theme-aur2 21s ease-in-out infinite alternate;
+}
+@keyframes theme-aur { to { transform: rotate(-3deg) translateX(5%); } }
+@keyframes theme-aur2 { to { transform: rotate(2deg) translateX(-4%); } }
+
+/* --- 埃及博物馆：金色辉光 + 埃及纹样平铺 --- */
+:root[data-theme="egyptian-museum"] #themeDecor {
+    display: block;
+    background:
+        radial-gradient(70% 46% at 50% -12%, rgba(201,162,39,.13), transparent 62%),
+        radial-gradient(40% 30% at 88% 108%, rgba(201,162,39,.07), transparent 60%),
+        url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='132' height='132' viewBox='0 0 132 132'%3E%3Cg fill='none' stroke='%23C9A227' stroke-opacity='.055' stroke-width='1.4'%3E%3Ccircle cx='30' cy='22' r='7'/%3E%3Cpath d='M30 29v34M18 41h24'/%3E%3Cpath d='M78 10l10 18H68zM78 44v34M66 58h24'/%3E%3Ccircle cx='30' cy='90' r='7'/%3E%3Cpath d='M30 97v26'/%3E%3Cpath d='M84 96q16 12 32 0M100 88v32'/%3E%3C/g%3E%3C/svg%3E");
+}
+
+/* --- 水彩涂鸦：涂鸦纹样平铺 + 双层水彩晕染 --- */
+:root[data-theme="watercolor-doodle"] #themeDecor {
+    display: block;
+    background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160' viewBox='0 0 160 160'%3E%3Cg fill='none' stroke-linecap='round'%3E%3Cpath d='M12 30q14-16 28 0t28 0' stroke='%23F27D9D' stroke-opacity='.07' stroke-width='2'/%3E%3Ccircle cx='116' cy='26' r='9' stroke='%237FD8C8' stroke-opacity='.07' stroke-width='2'/%3E%3Cpath d='M24 84l18 18M42 84L24 102' stroke='%23F2C14E' stroke-opacity='.06' stroke-width='2'/%3E%3Cpath d='M84 96q10-18 24-6t26-10' stroke='%23A78BFA' stroke-opacity='.07' stroke-width='2'/%3E%3Ccircle cx='52' cy='140' r='7' stroke='%23F27D9D' stroke-opacity='.05' stroke-width='2'/%3E%3Cpath d='M108 138q12 10 24 0' stroke='%237FD8C8' stroke-opacity='.06' stroke-width='2'/%3E%3C/g%3E%3C/svg%3E");
+}
+:root[data-theme="watercolor-doodle"] #themeDecor::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    filter: blur(70px);
+    opacity: .5;
+    background:
+        radial-gradient(30% 24% at 12% 8%, rgba(242,125,157,.4), transparent 70%),
+        radial-gradient(26% 22% at 88% 4%, rgba(167,139,250,.4), transparent 70%),
+        radial-gradient(30% 26% at 80% 90%, rgba(127,216,200,.35), transparent 70%),
+        radial-gradient(26% 22% at 6% 82%, rgba(242,193,78,.3), transparent 70%),
+        radial-gradient(24% 20% at 48% 50%, rgba(167,139,250,.22), transparent 70%);
+}
+:root[data-theme="watercolor-doodle"] #themeDecor::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    filter: blur(90px);
+    opacity: .35;
+    background:
+        radial-gradient(20% 18% at 30% 30%, rgba(242,125,157,.35), transparent 70%),
+        radial-gradient(22% 18% at 70% 68%, rgba(242,193,78,.28), transparent 70%);
+}
+
+/* 装饰主题下：主容器透出装饰层并置于其上 */
+:root[data-theme="arctic-aurora"] body, :root[data-theme="egyptian-museum"] body,
+:root[data-theme="watercolor-doodle"] body {
+    background: transparent;
+}
+:root[data-theme="arctic-aurora"] #mainContainer, :root[data-theme="egyptian-museum"] #mainContainer,
+:root[data-theme="watercolor-doodle"] #mainContainer {
+    background: transparent;
+    z-index: 1;
+}
+
+/* ============================================================
+   设置面板 · 主题选择卡
+   ============================================================ */
+.theme-presets {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+    gap: 8px;
+}
+.theme-swatch {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 5px;
+    padding: 7px 5px 6px;
+    background: var(--bg-input);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius);
+    cursor: pointer;
+    transition: border-color var(--transition), background var(--transition);
+}
+.theme-swatch:hover {
+    border-color: var(--border-light);
+    background: var(--bg-hover);
+}
+.theme-swatch.active {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent) inset;
+}
+.theme-swatch-preview {
+    width: 100%;
+    height: 34px;
+    border-radius: 6px;
+    border: 1px solid var(--border-color);
+}
+.theme-swatch-name {
+    font-size: 11px;
+    color: var(--text-secondary);
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.theme-swatch.active .theme-swatch-name {
+    color: var(--text-primary);
+}
+.theme-preview-dark { background: linear-gradient(135deg, #1a1a1a 55%, #e94560 55%); }
+.theme-preview-light { background: linear-gradient(135deg, #fafbfc 55%, #e94560 55%); }
+.theme-preview-gallery-dark { background: linear-gradient(135deg, #101014 55%, #c8a24a 55%); }
+.theme-preview-gallery-light { background: linear-gradient(135deg, #FBFBFC 55%, #2F4F4F 55%); }
+.theme-preview-arctic-aurora { background: linear-gradient(135deg, #0A0E14 40%, #46C7A0 70%, #5e96e6 100%); }
+.theme-preview-egyptian-museum { background: linear-gradient(135deg, #0E0C09 55%, #C9A227 55%); }
+.theme-preview-watercolor-doodle { background: linear-gradient(135deg, #171522 45%, #A78BFA 70%, #F27D9D 100%); }
+
+/* ============================================================
+   新主题设计语言补全（第二批）：输入框、弹窗、下拉菜单、树形列表
+   仅作用于 5 个新主题；不改滚动条与卡片悬停缩放
+   ============================================================ */
+
+/* 输入控件统一圆角 */
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) input:not([type="checkbox"]):not([type="radio"]):not([type="color"]):not([type="range"]),
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) select:not(.lang-select),
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) textarea {
+    border-radius: 10px;
+}
+
+/* 弹窗遮罩毛玻璃 */
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .modal-overlay,
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) #modalOverlay {
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+}
+
+/* 下拉菜单 / 高级搜索面板 / 右键菜单：同一种浮层质感 */
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .layout-dropdown-menu,
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .advanced-search-panel,
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .image-context-menu {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    box-shadow: var(--shadow-lg);
+}
+
+/* 树形节点：圆角悬停 */
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .tree-node-header {
+    border-radius: 8px;
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .tree-node-header:hover {
+    background: var(--bg-hover);
+}
+
+/* 树数量徽章 / 版本徽章等小胶囊 */
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .tree-count,
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .app-version {
+    border-radius: 9px;
+}
+
+/* 详情面板预览图与缩略图条统一圆角 */
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .preview-container img,
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .detail-thumbnail img,
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .thumbnail-strip img {
+    border-radius: 10px;
+}
+
+/* 装饰主题下：画廊区域透出装饰层 */
+:root:is([data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) #galleryContainer {
+    background: transparent;
+}
+
+/* ============================================================
+   新主题按钮再设计：隐藏带文字按钮上的图标，统一药丸按钮语言
+   纯图标按钮（.btn-icon / 图标为唯一子元素）保留图标
+   ============================================================ */
+
+/* 隐藏带文字按钮的图标；.btn-icon 及图标独占的按钮不受影响 */
+body.theme-no-btn-icons button .icon {
+    display: none;
+}
+body.theme-no-btn-icons button .icon:only-child,
+body.theme-no-btn-icons button.btn-icon .icon {
+    display: inline-block;
+}
+
+/* 主按钮：实心药丸，深色文字（mockup 风格） */
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .btn-primary {
+    height: 30px;
+    padding: 0 14px;
+    border-radius: 15px;
+    color: var(--on-accent);
+    font-weight: 600;
+    font-size: 12.5px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .btn-primary:hover {
+    background: var(--accent-hover);
+    box-shadow: none;
+}
+
+/* 次按钮：幽灵药丸（描边 + 文字） */
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .btn-secondary {
+    height: 30px;
+    padding: 0 14px;
+    border-radius: 15px;
+    background: transparent;
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary);
+    font-size: 12.5px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .btn-secondary:hover {
+    background: var(--bg-hover);
+    border-color: var(--border-light);
+    color: var(--text-primary);
+}
+
+/* 小按钮：同幽灵药丸语言 */
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .btn-small {
+    height: 26px;
+    padding: 0 12px;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 11.5px;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .btn-small:hover {
+    border-color: var(--border-light);
+    color: var(--text-primary);
+    background: var(--bg-hover);
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .btn-small.btn-danger,
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .btn-danger {
+    color: var(--red);
+}
+
+/* 强调小按钮（如批量反推）：accent 软底 + accent 文字 */
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .btn-accent {
+    background: var(--accent-glow);
+    border-color: transparent;
+    color: var(--accent);
+}
+
+/* 布局下拉按钮：幽灵药丸 */
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .layout-dropdown-btn {
+    border-radius: 999px;
+}
+
+/* 顶栏普通按钮统一为文字幽灵药丸（无图标后稍微加高） */
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) #topBar button {
+    height: 32px;
+    padding: 0 15px;
+    background: transparent;
+    letter-spacing: 0.2px;
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) #topBar button:hover {
+    background: var(--bg-hover);
+
+}
+/* ============================================================
+   新主题 · 图标再设计：按钮内图标统一为极简线性风格
+   （mask + currentColor，颜色随文字/悬停状态变化）
+   仅作用于 5 个新主题的按钮内图标
+   ============================================================ */
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon {
+    background-image: none !important;
+    background-color: currentColor;
+    -webkit-mask-position: center;
+    -webkit-mask-size: contain;
+    -webkit-mask-repeat: no-repeat;
+    mask-position: center;
+    mask-size: contain;
+    mask-repeat: no-repeat;
+    opacity: 0.9;
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) button:hover .icon {
+    opacity: 1;
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-search {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='11' cy='11' r='6'/%3E%3Cpath d='M15.5 15.5L20 20'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='11' cy='11' r='6'/%3E%3Cpath d='M15.5 15.5L20 20'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-close {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M6 6l12 12M18 6L6 18'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M6 6l12 12M18 6L6 18'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-theme-dark {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Cpath d='M20 13.5A8 8 0 1 1 10.5 4a6.5 6.5 0 0 0 9.5 9.5z'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Cpath d='M20 13.5A8 8 0 1 1 10.5 4a6.5 6.5 0 0 0 9.5 9.5z'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-theme-light {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='12' cy='12' r='4'/%3E%3Cpath d='M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M18.4 5.6L17 7M7 17l-1.4 1.4'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='12' cy='12' r='4'/%3E%3Cpath d='M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M18.4 5.6L17 7M7 17l-1.4 1.4'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-delete {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 7h16M9 7V5h6v2M6.5 7l1 13h9l1-13'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 7h16M9 7V5h6v2M6.5 7l1 13h9l1-13'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-add {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M12 5v14M5 12h14'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M12 5v14M5 12h14'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-edit {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Cpath d='M4 20l4.5-1L20 7.5 16.5 4 5 15.5 4 20z'/%3E%3Cpath d='M14 6.5l3.5 3.5'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Cpath d='M4 20l4.5-1L20 7.5 16.5 4 5 15.5 4 20z'/%3E%3Cpath d='M14 6.5l3.5 3.5'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-copy {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Crect x='9' y='9' width='11' height='11' rx='2'/%3E%3Cpath d='M5 15V6a2 2 0 0 1 2-2h9'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Crect x='9' y='9' width='11' height='11' rx='2'/%3E%3Cpath d='M5 15V6a2 2 0 0 1 2-2h9'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-save {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Cpath d='M5 5h11l3 3v11H5z'/%3E%3Cpath d='M8 5v4h7V5M8 19v-6h8v6'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Cpath d='M5 5h11l3 3v11H5z'/%3E%3Cpath d='M8 5v4h7V5M8 19v-6h8v6'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-browse {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Cpath d='M3 8a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Cpath d='M3 8a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-reload {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M20 12a8 8 0 1 1-2.5-5.8'/%3E%3Cpath d='M20 3v5h-5'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M20 12a8 8 0 1 1-2.5-5.8'/%3E%3Cpath d='M20 3v5h-5'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-settings {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='12' cy='12' r='3'/%3E%3Cpath d='M6 4v5M6 13v7M12 4v2M12 10v10M18 4v8M18 16v4M6 9a2 2 0 1 0 0 4 2 2 0 0 0 0-4zM12 6a2 2 0 1 0 0 4 2 2 0 0 0 0-4zM18 12a2 2 0 1 0 0 4 2 2 0 0 0 0-4z'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='12' cy='12' r='3'/%3E%3Cpath d='M6 4v5M6 13v7M12 4v2M12 10v10M18 4v8M18 16v4M6 9a2 2 0 1 0 0 4 2 2 0 0 0 0-4zM12 6a2 2 0 1 0 0 4 2 2 0 0 0 0-4zM18 12a2 2 0 1 0 0 4 2 2 0 0 0 0-4z'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-check {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5 13l4 4L19 7'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5 13l4 4L19 7'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-warning {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 4l9 16H3z'/%3E%3Cpath d='M12 10.5V14M12 16.8v.4'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 4l9 16H3z'/%3E%3Cpath d='M12 10.5V14M12 16.8v.4'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-image {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Crect x='4' y='5' width='16' height='14' rx='2'/%3E%3Ccircle cx='9' cy='10' r='1.4'/%3E%3Cpath d='M4 16.5l4.5-4.5 4 4 3-3L20 16'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Crect x='4' y='5' width='16' height='14' rx='2'/%3E%3Ccircle cx='9' cy='10' r='1.4'/%3E%3Cpath d='M4 16.5l4.5-4.5 4 4 3-3L20 16'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-lock {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Crect x='5' y='11' width='14' height='9' rx='2'/%3E%3Cpath d='M8 11V8a4 4 0 0 1 8 0v3'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Crect x='5' y='11' width='14' height='9' rx='2'/%3E%3Cpath d='M8 11V8a4 4 0 0 1 8 0v3'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-unlock {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Crect x='5' y='11' width='14' height='9' rx='2'/%3E%3Cpath d='M8 11V8a4 4 0 0 1 7.6-1.7'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Crect x='5' y='11' width='14' height='9' rx='2'/%3E%3Cpath d='M8 11V8a4 4 0 0 1 7.6-1.7'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-plug {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M9 3v5M15 3v5M6.5 8h11v3a5.5 5.5 0 0 1-11 0zM12 16.5V21'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M9 3v5M15 3v5M6.5 8h11v3a5.5 5.5 0 0 1-11 0zM12 16.5V21'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-expand {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5 15l7-7 7 7'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5 15l7-7 7 7'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-collapse {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5 9l7 7 7-7'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5 9l7 7 7-7'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-columns {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M6 5v14M12 5v14M18 5v14'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M6 5v14M12 5v14M18 5v14'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-grid {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Crect x='4' y='4' width='7' height='7' rx='1.5'/%3E%3Crect x='13' y='4' width='7' height='7' rx='1.5'/%3E%3Crect x='4' y='13' width='7' height='7' rx='1.5'/%3E%3Crect x='13' y='13' width='7' height='7' rx='1.5'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Crect x='4' y='4' width='7' height='7' rx='1.5'/%3E%3Crect x='13' y='4' width='7' height='7' rx='1.5'/%3E%3Crect x='4' y='13' width='7' height='7' rx='1.5'/%3E%3Crect x='13' y='13' width='7' height='7' rx='1.5'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-masonry {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Crect x='4' y='4' width='7' height='9' rx='1.5'/%3E%3Crect x='13' y='4' width='7' height='6' rx='1.5'/%3E%3Crect x='4' y='15' width='7' height='5' rx='1.5'/%3E%3Crect x='13' y='12' width='7' height='8' rx='1.5'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Crect x='4' y='4' width='7' height='9' rx='1.5'/%3E%3Crect x='13' y='4' width='7' height='6' rx='1.5'/%3E%3Crect x='4' y='15' width='7' height='5' rx='1.5'/%3E%3Crect x='13' y='12' width='7' height='8' rx='1.5'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-pinterest {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Crect x='4' y='4' width='7' height='6' rx='1.5'/%3E%3Crect x='13' y='4' width='7' height='9' rx='1.5'/%3E%3Crect x='4' y='12' width='7' height='8' rx='1.5'/%3E%3Crect x='13' y='15' width='7' height='5' rx='1.5'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Crect x='4' y='4' width='7' height='6' rx='1.5'/%3E%3Crect x='13' y='4' width='7' height='9' rx='1.5'/%3E%3Crect x='4' y='12' width='7' height='8' rx='1.5'/%3E%3Crect x='13' y='15' width='7' height='5' rx='1.5'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-list {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M8 6h12M8 12h12M8 18h12'/%3E%3Ccircle cx='4.5' cy='6' r='0.8' fill='%23000' stroke='none'/%3E%3Ccircle cx='4.5' cy='12' r='0.8' fill='%23000' stroke='none'/%3E%3Ccircle cx='4.5' cy='18' r='0.8' fill='%23000' stroke='none'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M8 6h12M8 12h12M8 18h12'/%3E%3Ccircle cx='4.5' cy='6' r='0.8' fill='%23000' stroke='none'/%3E%3Ccircle cx='4.5' cy='12' r='0.8' fill='%23000' stroke='none'/%3E%3Ccircle cx='4.5' cy='18' r='0.8' fill='%23000' stroke='none'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-favorite-on {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Cpath d='M12 20s-7-4.5-9-9a5 5 0 0 1 9-3 5 5 0 0 1 9 3c-2 4.5-9 9-9 9z'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Cpath d='M12 20s-7-4.5-9-9a5 5 0 0 1 9-3 5 5 0 0 1 9 3c-2 4.5-9 9-9 9z'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-favorite-off {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round' stroke-dasharray='3 3'%3E%3Cpath d='M12 20s-7-4.5-9-9a5 5 0 0 1 9-3 5 5 0 0 1 9 3c-2 4.5-9 9-9 9z'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round' stroke-dasharray='3 3'%3E%3Cpath d='M12 20s-7-4.5-9-9a5 5 0 0 1 9-3 5 5 0 0 1 9 3c-2 4.5-9 9-9 9z'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-none {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='12' cy='12' r='8'/%3E%3Cpath d='M6.5 6.5l11 11'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='12' cy='12' r='8'/%3E%3Cpath d='M6.5 6.5l11 11'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-broken {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Crect x='4' y='5' width='16' height='14' rx='2'/%3E%3Cpath d='M4 12.5h3.5l1.5-3 2 5.5 2-4 1.5 1.5H20'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Crect x='4' y='5' width='16' height='14' rx='2'/%3E%3Cpath d='M4 12.5h3.5l1.5-3 2 5.5 2-4 1.5 1.5H20'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-clean {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 16l8-8 6 6-6 6H8z'/%3E%3Cpath d='M13 20h7'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 16l8-8 6 6-6 6H8z'/%3E%3Cpath d='M13 20h7'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-stop {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Crect x='7' y='7' width='10' height='10' rx='1.5'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Crect x='7' y='7' width='10' height='10' rx='1.5'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-random {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 7h4l8 10h4M4 17h4l2.5-3M13.5 10L16 7h4'/%3E%3Cpath d='M17.5 4.5L20 7l-2.5 2.5M17.5 14.5L20 17l-2.5 2.5'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 7h4l8 10h4M4 17h4l2.5-3M13.5 10L16 7h4'/%3E%3Cpath d='M17.5 4.5L20 7l-2.5 2.5M17.5 14.5L20 17l-2.5 2.5'/%3E%3C/svg%3E");
+}
+
+/* ============================================================
+   新主题 · 线性图标补全（第二批）：覆盖 SYSTEM_ICONS 其余全部
+   避免未覆盖图标退化为实心方块
+   ============================================================ */
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-folder {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Cpath d='M3 8a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Cpath d='M3 8a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-tag {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Cpath d='M4 11V5a1 1 0 0 1 1-1h6l9 9-7 7-9-9z'/%3E%3Ccircle cx='8.5' cy='8.5' r='1.2'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Cpath d='M4 11V5a1 1 0 0 1 1-1h6l9 9-7 7-9-9z'/%3E%3Ccircle cx='8.5' cy='8.5' r='1.2'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-api {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 8l-4 4 4 4M16 8l4 4-4 4M13.5 5l-3 14'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 8l-4 4 4 4M16 8l4 4-4 4M13.5 5l-3 14'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-template {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Crect x='4' y='5' width='16' height='14' rx='2'/%3E%3Cpath d='M4 10h16M10 10v9'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Crect x='4' y='5' width='16' height='14' rx='2'/%3E%3Cpath d='M4 10h16M10 10v9'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-import {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 4v10M8 10l4 4 4-4M5 19h14'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 4v10M8 10l4 4 4-4M5 19h14'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-export {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 14V4M8 8l4-4 4 4M5 19h14'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 14V4M8 8l4-4 4 4M5 19h14'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-reset {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M4 12a8 8 0 1 0 2.5-5.8'/%3E%3Cpath d='M4 3v5h5'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M4 12a8 8 0 1 0 2.5-5.8'/%3E%3Cpath d='M4 3v5h5'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-loading {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M12 4a8 8 0 1 1-8 8'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M12 4a8 8 0 1 1-8 8'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-menu {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M4 7h16M4 12h16M4 17h16'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M4 7h16M4 12h16M4 17h16'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-back {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M15 5l-7 7 7 7'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M15 5l-7 7 7 7'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-art {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Cpath d='M12 4a8 8 0 1 0 0 16c1.4 0 2-1 2-2s-.8-2-.8-3c0-1 .9-2 2.3-2H19a2 2 0 0 0 2-2c-.4-4.2-4.4-7-9-7z'/%3E%3Ccircle cx='8' cy='10' r='1' fill='%23000' stroke='none'/%3E%3Ccircle cx='12' cy='8' r='1' fill='%23000' stroke='none'/%3E%3Ccircle cx='16' cy='10' r='1' fill='%23000' stroke='none'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Cpath d='M12 4a8 8 0 1 0 0 16c1.4 0 2-1 2-2s-.8-2-.8-3c0-1 .9-2 2.3-2H19a2 2 0 0 0 2-2c-.4-4.2-4.4-7-9-7z'/%3E%3Ccircle cx='8' cy='10' r='1' fill='%23000' stroke='none'/%3E%3Ccircle cx='12' cy='8' r='1' fill='%23000' stroke='none'/%3E%3Ccircle cx='16' cy='10' r='1' fill='%23000' stroke='none'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-user {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='12' cy='8' r='4'/%3E%3Cpath d='M4.5 20a7.5 7.5 0 0 1 15 0'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='12' cy='8' r='4'/%3E%3Cpath d='M4.5 20a7.5 7.5 0 0 1 15 0'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-bot {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='5' y='8' width='14' height='11' rx='2'/%3E%3Cpath d='M12 8V5'/%3E%3Ccircle cx='12' cy='3.8' r='1.1'/%3E%3Ccircle cx='9' cy='13' r='0.9' fill='%23000' stroke='none'/%3E%3Ccircle cx='15' cy='13' r='0.9' fill='%23000' stroke='none'/%3E%3Cpath d='M9.5 16.5h5'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='5' y='8' width='14' height='11' rx='2'/%3E%3Cpath d='M12 8V5'/%3E%3Ccircle cx='12' cy='3.8' r='1.1'/%3E%3Ccircle cx='9' cy='13' r='0.9' fill='%23000' stroke='none'/%3E%3Ccircle cx='15' cy='13' r='0.9' fill='%23000' stroke='none'/%3E%3Cpath d='M9.5 16.5h5'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-file {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Cpath d='M6 4h8l4 4v12H6z'/%3E%3Cpath d='M14 4v4h4'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Cpath d='M6 4h8l4 4v12H6z'/%3E%3Cpath d='M14 4v4h4'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-web {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2'%3E%3Ccircle cx='12' cy='12' r='8'/%3E%3Cpath d='M4 12h16M12 4c2.8 2.6 2.8 13.4 0 16M12 4c-2.8 2.6-2.8 13.4 0 16'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2'%3E%3Ccircle cx='12' cy='12' r='8'/%3E%3Cpath d='M4 12h16M12 4c2.8 2.6 2.8 13.4 0 16M12 4c-2.8 2.6-2.8 13.4 0 16'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-processing {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M20 12a8 8 0 0 1-8 8'/%3E%3Cpath d='M4 12a8 8 0 0 1 8-8'/%3E%3Cpath d='M17 17l3 3M20 17l-3 3'/%3E%3Cpath d='M4 4l3 3M7 4L4 7'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M20 12a8 8 0 0 1-8 8'/%3E%3Cpath d='M4 12a8 8 0 0 1 8-8'/%3E%3Cpath d='M17 17l3 3M20 17l-3 3'/%3E%3Cpath d='M4 4l3 3M7 4L4 7'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-numbered {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M9 6h11M9 12h11M9 18h11'/%3E%3Crect x='3.5' y='4.5' width='3' height='3' rx='0.8' fill='%23000' stroke='none'/%3E%3Crect x='3.5' y='10.5' width='3' height='3' rx='0.8' fill='%23000' stroke='none'/%3E%3Crect x='3.5' y='16.5' width='3' height='3' rx='0.8' fill='%23000' stroke='none'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M9 6h11M9 12h11M9 18h11'/%3E%3Crect x='3.5' y='4.5' width='3' height='3' rx='0.8' fill='%23000' stroke='none'/%3E%3Crect x='3.5' y='10.5' width='3' height='3' rx='0.8' fill='%23000' stroke='none'/%3E%3Crect x='3.5' y='16.5' width='3' height='3' rx='0.8' fill='%23000' stroke='none'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-click {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Cpath d='M6 3l13 10-6 1 2.5 5.5-2.7 1.2-2.5-5.7L6 18z'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Cpath d='M6 3l13 10-6 1 2.5 5.5-2.7 1.2-2.5-5.7L6 18z'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-index,
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-indexing {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2'%3E%3Cpath d='M8 6V4.5A1.5 1.5 0 0 1 9.5 3h5A1.5 1.5 0 0 1 16 4.5V6'/%3E%3Crect x='4' y='6' width='16' height='13' rx='2'/%3E%3Cpath d='M8 11h8M8 15h5'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2'%3E%3Cpath d='M8 6V4.5A1.5 1.5 0 0 1 9.5 3h5A1.5 1.5 0 0 1 16 4.5V6'/%3E%3Crect x='4' y='6' width='16' height='13' rx='2'/%3E%3Cpath d='M8 11h8M8 15h5'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-index-done {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 6V4.5A1.5 1.5 0 0 1 9.5 3h5A1.5 1.5 0 0 1 16 4.5V6'/%3E%3Crect x='4' y='6' width='16' height='13' rx='2'/%3E%3Cpath d='M8.5 12.5l2.5 2.5 5-5'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 6V4.5A1.5 1.5 0 0 1 9.5 3h5A1.5 1.5 0 0 1 16 4.5V6'/%3E%3Crect x='4' y='6' width='16' height='13' rx='2'/%3E%3Cpath d='M8.5 12.5l2.5 2.5 5-5'/%3E%3C/svg%3E");
+}
+
+/* 索引类图标在按钮之外也使用线性版本（颜色随文字主题色） */
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon-index,
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon-indexing,
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon-index-done {
+    background-image: none !important;
+    background-color: currentColor;
+    -webkit-mask-position: center;
+    -webkit-mask-size: contain;
+    -webkit-mask-repeat: no-repeat;
+    mask-position: center;
+    mask-size: contain;
+    mask-repeat: no-repeat;
+}
+
+/* 索引中:卡片 + 进度点(区分于静态索引图标) */
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-indexing {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M8 6V4.5A1.5 1.5 0 0 1 9.5 3h5A1.5 1.5 0 0 1 16 4.5V6'/%3E%3Crect x='4' y='6' width='16' height='13' rx='2'/%3E%3Ccircle cx='8.5' cy='15' r='1' fill='%23000' stroke='none'/%3E%3Ccircle cx='12' cy='15' r='1' fill='%23000' stroke='none'/%3E%3Ccircle cx='15.5' cy='15' r='1' fill='%23000' stroke='none'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M8 6V4.5A1.5 1.5 0 0 1 9.5 3h5A1.5 1.5 0 0 1 16 4.5V6'/%3E%3Crect x='4' y='6' width='16' height='13' rx='2'/%3E%3Ccircle cx='8.5' cy='15' r='1' fill='%23000' stroke='none'/%3E%3Ccircle cx='12' cy='15' r='1' fill='%23000' stroke='none'/%3E%3Ccircle cx='15.5' cy='15' r='1' fill='%23000' stroke='none'/%3E%3C/svg%3E");
+}
+
+/* ------------------------------------------------------------
+   补齐缺失的 mask 图标（此前会退化成 currentColor 纯色方块）
+   与上文同风格：24×24 极简线性、stroke 2、圆角端点
+   ------------------------------------------------------------ */
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-refresh {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 12a8 8 0 0 1 13.7-5.6M20 12a8 8 0 0 1-13.7 5.6'/%3E%3Cpath d='M18 3v4h-4M6 21v-4h4'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 12a8 8 0 0 1 13.7-5.6M20 12a8 8 0 0 1-13.7 5.6'/%3E%3Cpath d='M18 3v4h-4M6 21v-4h4'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-play {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 5.5v13l11-6.5z'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 5.5v13l11-6.5z'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-pause {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round'%3E%3Cpath d='M9 5.5v13M15 5.5v13'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round'%3E%3Cpath d='M9 5.5v13M15 5.5v13'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-sort {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M7 20V5M4 8l3-3 3 3M17 4v15M14 16l3 3 3-3'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M7 20V5M4 8l3-3 3 3M17 4v15M14 16l3 3 3-3'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-sliders {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M4 7h16M4 17h16'/%3E%3Ccircle cx='9' cy='7' r='2.4'/%3E%3Ccircle cx='15' cy='17' r='2.4'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M4 7h16M4 17h16'/%3E%3Ccircle cx='9' cy='7' r='2.4'/%3E%3Ccircle cx='15' cy='17' r='2.4'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-fullscreen {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 9V5.5A1.5 1.5 0 0 1 5.5 4H9M15 4h3.5A1.5 1.5 0 0 1 20 5.5V9M20 15v3.5a1.5 1.5 0 0 1-1.5 1.5H15M9 20H5.5A1.5 1.5 0 0 1 4 18.5V15'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 9V5.5A1.5 1.5 0 0 1 5.5 4H9M15 4h3.5A1.5 1.5 0 0 1 20 5.5V9M20 15v3.5a1.5 1.5 0 0 1-1.5 1.5H15M9 20H5.5A1.5 1.5 0 0 1 4 18.5V15'/%3E%3C/svg%3E");
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .icon.icon-hammer {
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M13.5 4.5l6 6-2.6 2.6-6-6z'/%3E%3Cpath d='M12.2 8.4L4 16.6l3.4 3.4 8.2-8.2'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M13.5 4.5l6 6-2.6 2.6-6-6z'/%3E%3Cpath d='M12.2 8.4L4 16.6l3.4 3.4 8.2-8.2'/%3E%3C/svg%3E");
+}
+
+/* ------------------------------------------------------------
+   索引按钮重新设计：不再随正文颜色发黑/发灰
+   —— 静止用次要文字色，悬停/索引中/已完成统一取主题强调色，
+   使其在 5 个新主题里分别呈现金/墨绿/极光绿/埃及金/水彩粉
+   ------------------------------------------------------------ */
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .tree-index-btn {
+    color: var(--text-secondary);
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .tree-index-btn:hover {
+    color: var(--accent);
+}
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .tree-index-btn.indexing,
+:root:is([data-theme="gallery-dark"], [data-theme="gallery-light"], [data-theme="arctic-aurora"], [data-theme="egyptian-museum"], [data-theme="watercolor-doodle"]) .tree-index-btn.done {
+    color: var(--accent);
+}
+
+/* 网格末尾"已加载全部"指示器 */
+.gallery-end-indicator {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 18px 0 26px;
+    color: var(--text-muted);
+    font-size: 12px;
+}
+.gallery-end-indicator::before,
+.gallery-end-indicator::after {
+    content: '';
+    width: 60px;
+    height: 1px;
+    background: var(--border-color);
 }

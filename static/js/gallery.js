@@ -8,7 +8,7 @@ const Gallery = (() => {
     const t = (typeof I18n !== 'undefined' ? I18n.t : (s) => s);
 
     // DOM
-    let galleryScroll, galleryGrid, loadingIndicator, loadMoreIndicator;
+    let galleryScroll, galleryGrid, loadingIndicator, loadMoreIndicator, endIndicator;
     let bgOpStatusEl;
     let layoutBtns, thumbnailSlider, thumbnailSizeValue, sortSelect;
     let imageCountEl, btnShowPromptCount, btnInertiaToggle;
@@ -29,6 +29,13 @@ const Gallery = (() => {
     let selectedImages = new Set();
     let currentLayout = 'grid';
     let thumbnailSize = 220;
+
+    // ★ 手机版视觉缩放：布局计算时缩略图尺寸减半（纯前端显示，不改动保存的设置）
+    function getThumbSize() {
+        return document.body.classList.contains('mobile')
+            ? Math.max(60, Math.round(thumbnailSize / 2))
+            : thumbnailSize;
+    }
     let sortOrder = 'date-desc';
     let showPromptCount = false;    // 是否显示提示词版本数量
     let promptCountMap = {};        // imagePath → count
@@ -58,6 +65,12 @@ const Gallery = (() => {
     let currentFavoriteFilter = false; // 当前是否在收藏视图
     let isFilteringActive = false;
 
+    // ★ 手机端体验：记录最后成功加载的文件夹（持久化到服务器设置）。
+    //   页面重新打开时自动恢复一次；render() 发现"应显示文件夹却空了"时自愈重载。
+    let lastLoadedFolderPath = null;
+    let lastFolderRestoreAttempted = false; // 每次页面加载只自动恢复一次，避免干扰"全部图片"空态
+    let lastFolderRestoring = false;
+
     // ★ 内存优化：全局 images 数组软上限（LRU 式淘汰旧文件夹的服务端图片）。
     //   images 跨文件夹切换只增不减（用于快速缓存切换），大库浏览久了会膨胀。
     //   超过上限时保留"当前视图 + 最近访问"的文件夹，淘汰更早的 _fromServer 图片。
@@ -72,16 +85,45 @@ const Gallery = (() => {
     }
 
     // 超过上限时淘汰最旧文件夹的服务端图片（保留当前/最近访问的文件夹）
+    // ★ 节流：大文件夹（如 99k 张）深分页时每次 render 都超上限，重建保护 Set 是 O(n)，
+    //   用滞后水位(1.25×) + 时间间隔(3s)限制触发频率。
+    let _lastPruneAt = 0;
     function pruneImagesCache() {
+        const _now = Date.now();
         if (images.length <= IMAGES_CACHE_MAX) return;
+        if (images.length < IMAGES_CACHE_MAX * 1.25 && _now - _lastPruneAt < 3000) return;
+        _lastPruneAt = _now;
         const keepKeys = new Set(recentFolderKeys);
+        // ★ 深分页保护（终极修复）：当前视图 filteredImages 引用到的图片按 path 直接保护。
+        //   之前用 folderKey 前缀匹配，但 rootId/rootPath/folder 的组合在不同加载路径下
+        //   键格式不一致，保护会漏——日志证实：深分页浏览中当前文件夹图片仍被整批淘汰
+        //   （淘汰 864 张后 images=8500 < filtered=15500，"已到底"显示 8864）。
+        //   引用级保护不依赖任何键格式，绝对可靠。
+        const protectedPaths = new Set();
+        if (currentFolderFilter && filteredImages && filteredImages.length) {
+            for (let i = 0; i < filteredImages.length; i++) protectedPaths.add(filteredImages[i].path);
+        }
+        // ★ 保护判断必须用前缀匹配：浏览根目录 R 时,图片的 folderKey 是
+        //   "R/相对子文件夹"（imageFolderKey 会把 folder 列拼在 rootPath 后）,
+        //   与 keepKeys 里的 "R" 永远不相等 → 当前正在浏览的图片被当成
+        //   "旧文件夹"整批淘汰（表现为滚动到底只剩 8 千多张 + "已到底部"）。
+        //   规则：folderKey 等于某保护键,或是某保护键的子路径,即受保护；
+        //   反向（保护键是 folderKey 的子路径,如浏览子文件夹时保护其父级其余图片）不需要。
+        const isProtected = (folderKey) => {
+            if (keepKeys.has(folderKey)) return true;
+            for (const k of keepKeys) {
+                if (folderKey.startsWith(k + '/')) return true;
+            }
+            return false;
+        };
         const removable = [];
         for (let i = 0; i < images.length; i++) {
             const img = images[i];
             if (!img._fromServer) continue;
+            if (protectedPaths.has(img.path)) continue;
             // ★ GC 优化：用缓存好的 folderKey,避免每轮 repeat 字符串替换
             const folderKey = imageFolderKey(img);
-            if (!keepKeys.has(folderKey)) {
+            if (!isProtected(folderKey)) {
                 removable.push(img);
             }
         }
@@ -95,13 +137,28 @@ const Gallery = (() => {
         }
         images = images.filter(img => !removePaths.has(img.path));
         invalidatePathIndex();
-        console.log(`[Gallery] 内存优化：淘汰 ${removeCount} 张旧文件夹图片（上限 ${IMAGES_CACHE_MAX}），当前 ${images.length}`);
+        console.log(`[Gallery] 内存优化：淘汰 ${removeCount} 张旧文件夹图片（上限 ${IMAGES_CACHE_MAX}），当前 ${images.length}，当前视图保护 ${protectedPaths.size} 张`);
     }
     let folderAbortController = null; // 问题一：文件夹切换中断控制器
     let folderLoadTotal = 0;          // 当前文件夹服务器的图片总数
     let folderLoadOffset = 0;         // 已加载偏移量
-    const FOLDER_LOOKAHEAD = 250;    // 视窗后方保持预加载的图片张数
-    const FOLDER_FETCH_BATCH = 500;  // 后端单次分页上限，滚动中提前拉满一批
+    const FOLDER_LOOKAHEAD = 1000;   // 视窗后方保持预加载的图片张数（大文件夹如 99k 张时减少批次数）
+    const FOLDER_FETCH_BATCH = 1000; // 后端单次分页上限，滚动中提前拉满一批
+    // ★ 正在扫描的根目录集合（模块作用域）：导入期间 offset>=total 不再视为"已加载完"，
+    //   否则初期把首批拉满后（offset==total==当时的 total），扫描继续加图，
+    //   滚动分页与流式补图都被 offset>=total 挡死，表现为"导入初期偶发卡死，刷新才恢复"。
+    //   ★ 必须在模块作用域：原先声明在 scan:complete 的 if 块内，外部函数引用会抛
+    //   "_scanActiveFor is not defined"——且只在 offset>=total（到底部）时因短路求值
+    //   才触发，表现为"快到底必报错、加载中断、指示器卡死、无法继续滚动"。
+    const _activeScanRoots = new Set();
+    function _scanActiveFor(folderPath) {
+        if (!folderPath || _activeScanRoots.size === 0) return false;
+        const n = folderPath.replace(/\\/g, '/');
+        for (const r of _activeScanRoots) {
+            if (n === r || n.startsWith(r + '/')) return true;
+        }
+        return false;
+    }
     let isLoadingMoreFolder = false;  // 防止重复触发增量加载
     let _loadMoreStartedAt = 0;        // 增量加载开始时刻（超时自愈用）
     let _loadMoreFollowupTimer = null; // 增量加载后继续检查，避免停在批次边界
@@ -172,16 +229,16 @@ const Gallery = (() => {
     const OVERSCAN_LEGACY_ROWS = 50;     // 大缩略图（≥220px）固定缓冲行数
     const OVERSCAN_THUMB_THRESHOLD = 220; // 小图/大图缓冲策略的分界尺寸
     function overscanRows(rowH) {
-        if (thumbnailSize >= OVERSCAN_THUMB_THRESHOLD) return OVERSCAN_LEGACY_ROWS;
+        if (getThumbSize() >= OVERSCAN_THUMB_THRESHOLD) return OVERSCAN_LEGACY_ROWS;
         return Math.max(OVERSCAN_MIN_ROWS, Math.ceil(OVERSCAN_PX / Math.max(1, rowH)));
     }
 
     // ★ 图片预取窗口：前后各 50 行（与 DOM 缓冲对齐，用户定版）。
-    //   行高用 thumbnailSize+44 近似（网格卡片高 36px 信息栏 + 8px 间距；
+    //   行高用 getThumbSize()+44 近似（网格卡片高 36px 信息栏 + 8px 间距；
     //   瀑布流/列表行高略有出入，作为调度器的估算足够）。
     const PREFETCH_ROWS = 50;
     function prefetchPx() {
-        return PREFETCH_ROWS * (thumbnailSize + 44);
+        return PREFETCH_ROWS * (getThumbSize() + 44);
     }
 
     // ★ 滚动状态（模块级，供 IntersectionObserver 和 scroll 防抖共享）
@@ -248,7 +305,7 @@ const Gallery = (() => {
     let pinterestPrefixMaxIdx = [];  // y 序前缀的最大 imgIndex（查视窗内最后一张图 O(logN)）
     let pinterestMaxItemH = 0;       // 最高卡片高度（可见范围下界回退用）
 
-    // 列表模式缓存：每行固定高度（thumbnailSize），绝对定位
+    // 列表模式缓存：每行固定高度（getThumbSize()），绝对定位
     let listLayoutVersion = 0;       // 递增以触发重渲染
     let listFirstId = '';            // 布局中第一张图片的 id
     let listTotalHeight = 0;         // 容器总高度
@@ -277,6 +334,7 @@ const Gallery = (() => {
         galleryGrid = document.getElementById('galleryGrid');
         loadingIndicator = document.getElementById('loadingIndicator');
         loadMoreIndicator = document.getElementById('loadMoreIndicator');
+        endIndicator = document.getElementById('galleryEndIndicator');
         layoutBtns = document.querySelectorAll('.layout-option');
         const layoutDropdownBtn = document.getElementById('layoutDropdownBtn');
         const layoutDropdownIcon = document.getElementById('layoutDropdownIcon');
@@ -362,18 +420,8 @@ const Gallery = (() => {
                 let loadedScanFolder = null;   // 已经为这个文件夹的 scan 加载完成
                 let _scanCompleteLast = 0;      // scan:complete 重取当前文件夹的防抖时间戳
                 let _scanCompleteTimer = null;  // ★ 尾随防抖：最后一次 scan:complete 后 1s 仍会重取
-                // ★ 正在扫描的根目录集合：导入期间 offset>=total 不再视为"已加载完"，
-                //   否则初期把首批拉满后（offset==total==当时的 total），扫描继续加图，
-                //   滚动分页与流式补图都被 offset>=total 挡死，表现为"导入初期偶发卡死，刷新才恢复"。
-                const _activeScanRoots = new Set();
-                function _scanActiveFor(folderPath) {
-                    if (!folderPath || _activeScanRoots.size === 0) return false;
-                    const n = folderPath.replace(/\\/g, '/');
-                    for (const r of _activeScanRoots) {
-                        if (n === r || n.startsWith(r + '/')) return true;
-                    }
-                    return false;
-                }
+                // ★ _activeScanRoots/_scanActiveFor 已上移到模块作用域（FOLDER_FETCH_BATCH 附近），
+                //   供 checkLoadMoreOnScroll/loadMoreFolderImages/_updateEndIndicator 等外部函数使用。
                 window.runtime.EventsOn('scan:complete', (data) => {
                     console.log('[Gallery] 收到扫描完成事件:', data);
                     _bgOpScanning = false;
@@ -434,6 +482,11 @@ const Gallery = (() => {
                 // 开始加载时设 pending，完成后移入 loaded
                 Gallery._beginScanLoad = (fp) => { pendingScanFolder = fp; loadedScanFolder = null; };
                 Gallery._finishScanLoad = (fp) => { if (pendingScanFolder === fp) { pendingScanFolder = null; loadedScanFolder = fp; } };
+                // ★ 供 sidebar 轮询判断：当前文件夹已深入分页（超过第一批）时，
+                //   scan:complete 的重取会清空已加载内容、重置回第一页并全量重绘
+                //   （表现为滚动中计数骤降、页面闪动、之后只能慢慢补回）。
+                //   深分页时靠 _scanStreamLoad/分页的 total 校正即可，无需重取。
+                Gallery._isDeepPaged = () => folderLoadOffset > FOLDER_FETCH_BATCH;
 
                 // ★ 增量扫描：每完成一个文件夹立即收到推送（大库事件上万，DOM 更新做节流合并）
                 let _batchPending = false;
@@ -2299,7 +2352,7 @@ const Gallery = (() => {
         const viewBottom = galleryScroll.scrollTop + galleryScroll.clientHeight;
 
         if (currentLayout === 'masonry') {
-            const rowH = thumbnailSize + 8;
+            const rowH = getThumbSize() + 8;
             const lastVisibleRow = Math.floor(viewBottom / rowH);
             // ★ 二分（masonryLayout 按 row 单调递增；原实现 findLast/reverse 是 O(N)）
             let lo = 0, hi = masonryLayout.length;
@@ -2316,7 +2369,7 @@ const Gallery = (() => {
         }
 
         if (currentLayout === 'list') {
-            const rowStep = thumbnailSize + 8;
+            const rowStep = getThumbSize() + 8;
             const lastVisibleRow = Math.floor(viewBottom / rowStep);
             return Math.min(
                 Math.max(0, (lastVisibleRow + 1) * 2 - 1),
@@ -2325,7 +2378,7 @@ const Gallery = (() => {
         }
 
         const columns = getColumnCount();
-        const rowHeight = thumbnailSize + 36 + 8;
+        const rowHeight = getThumbSize() + 36 + 8;
         const lastVisibleRow = Math.floor(viewBottom / rowHeight);
         return Math.min((lastVisibleRow + 1) * columns - 1, filteredImages.length - 1);
     }
@@ -2342,7 +2395,7 @@ const Gallery = (() => {
         //   时才触发，加载期间底部是空白 → 不够丝滑。
         //   提前到 3 屏发起，滚到底时数据通常已就绪；配合 scheduleLoadMoreFollowup
         //   只在停止滚动后继续加载，不会一次连锁拉满整个文件夹造成上拉跳动。
-        const bottomBuffer = Math.max(Math.round(galleryScroll.clientHeight * 3), thumbnailSize * 6);
+        const bottomBuffer = Math.max(Math.round(galleryScroll.clientHeight * 3), getThumbSize() * 6);
         return imagesAheadOfViewport <= FOLDER_LOOKAHEAD || getLoadedBottomDistance() <= bottomBuffer;
     }
 
@@ -2420,7 +2473,7 @@ const Gallery = (() => {
         } else {
             // 接近底部却不触发时打出判定状态（1 秒一次），定位"拖到底不加载更多"
             const bottomDist = getLoadedBottomDistance();
-            if (bottomDist < Math.max(galleryScroll.clientHeight * 1.5, thumbnailSize * 3) &&
+            if (bottomDist < Math.max(galleryScroll.clientHeight * 1.5, getThumbSize() * 3) &&
                 Date.now() - _lastPageDiagAt > 1000) {
                 _lastPageDiagAt = Date.now();
                 trace('[分页] 底部未触发: ahead=' + imagesAheadOfViewport +
@@ -2442,6 +2495,10 @@ const Gallery = (() => {
             _loadMoreFollowupTimer = null;
             if (!_isScrolling) {
                 checkLoadMoreOnScroll();
+            } else {
+                // ★ 滚动尚未停止时不能把这次检查丢掉，否则底部提示一直挂着、
+                //   也不再自动补载（表现为"显示正在加载更多图片"却永远不动）。
+                scheduleLoadMoreFollowup();
             }
         }, 120);
     }
@@ -2450,7 +2507,7 @@ const Gallery = (() => {
         if (!currentFolderFilter || isLoadingMoreFolder) return;
         isLoadingMoreFolder = true;
         _loadMoreStartedAt = Date.now();
-        _showLoadMoreIndicator(true);
+        _showLoadMoreIndicator(true, _loadMoreProgressText());
         trace('[分页] loadMoreFolderImages 开始: offset=' + folderLoadOffset + '/' + folderLoadTotal);
 
         // ★ 修复：把 folderPath 提到 try 外声明，finally 中需要用它判断文件夹是否已切换
@@ -2476,6 +2533,7 @@ const Gallery = (() => {
                 // ★ 空批次≠没有更多：导入期间后端可能暂时返回空（扫描未推进到该位置），
                 //   此时冻结 folderLoadTotal=offset 会在扫描恢复后永久挡住分页。
                 //   仅在无相关扫描进行时才视为加载完。
+                console.warn(`[分页诊断] 空批次！ folder=${folderPath} offset=${folderLoadOffset} 冻结前total=${folderLoadTotal} 后端result.total=${result.total}`);
                 if (!_scanActiveFor(folderPath)) folderLoadTotal = folderLoadOffset;
                 _showLoadMoreIndicator(false);
                 return;
@@ -2484,9 +2542,17 @@ const Gallery = (() => {
             // ★ 记录追加前的 filteredImages 长度，以便精确取出新增部分
             const prevFilteredLength = filteredImages.length;
 
-            images.push(...result.images);
+            // ★ 按 id 去重后追加：与 _scanStreamLoad 并发时可能从同一 offset 重复取回，
+            //   不去重会在下一次 applyCurrentFilter 的 _dedupImages 中集中收缩
+            //   （表现为"已加载数量骤降"，如 16364 → 8864）。offset 仍按后端
+            //   返回条数推进，保证与后端分页位置一致。
+            const existIDs = new Set(images.map(i => i.id).filter(Boolean));
+            const fresh = result.images.filter(i => !i.id || !existIDs.has(i.id));
+            images.push(...fresh);
             folderLoadTotal = result.total;
             folderLoadOffset += result.images.length;
+            // ★ 诊断（常开）：每批的 offset/total/返回数/去重丢弃数,定位"加载数 < 文件夹总数"
+            console.log(`[分页诊断] batch: offset=${folderLoadOffset}/${folderLoadTotal} 返回=${result.images.length} 新增=${fresh.length} 重复丢弃=${result.images.length - fresh.length} images=${images.length} filtered=${filteredImages.length}`);
 
             const normFolder = (folderPath || '').replace(/\\/g, '/');
             folderCacheMeta[normFolder] = { total: result.total };
@@ -2525,6 +2591,13 @@ const Gallery = (() => {
                     _scanActiveFor(folderPath)) {
                     // 还有更多（或扫描仍在推进，total 还会涨）：保持底部提示显示，等用户继续滚动/自动加载下一批
                     scheduleLoadMoreFollowup();
+                    // ★ total<=0 的死锁修复：后端瞬时返回 Total 0（幽灵清理/重扫期间）时，
+                    //   checkLoadMoreOnScroll 会在 folderLoadTotal===0 处直接返回，
+                    //   followup 永远空转而指示器永不隐藏。此时先隐藏指示器，
+                    //   等扫描推进后 _scheduleScanStreaming 会重新拉取。
+                    if (folderLoadTotal <= 0) {
+                        _showLoadMoreIndicator(false);
+                    }
                 } else {
                     // 已全部加载完成：隐藏底部提示
                     _showLoadMoreIndicator(false);
@@ -2537,9 +2610,23 @@ const Gallery = (() => {
     }
 
     // 底部"加载更多"提示：显示在网格末尾，提示用户下方还在加载
-    function _showLoadMoreIndicator(show) {
+    function _showLoadMoreIndicator(show, progressText) {
         if (!loadMoreIndicator) return;
         loadMoreIndicator.style.display = show ? 'flex' : 'none';
+        // ★ 大文件夹进度：显示"已加载 X / Y"，让 99k 级文件夹的分页进度可感知
+        if (show) {
+            const span = loadMoreIndicator.querySelector('span');
+            if (span) {
+                span.textContent = progressText ||
+                    (window.I18n && window.I18n.t ? window.I18n.t('gallery.loading_more') : '正在加载更多图片...');
+            }
+        }
+    }
+    function _loadMoreProgressText() {
+        if (folderLoadTotal > 0) {
+            return `${window.I18n && window.I18n.t ? window.I18n.t('gallery.loading_more_progress') : '正在加载更多图片'} ${folderLoadOffset} / ${folderLoadTotal}...`;
+        }
+        return window.I18n && window.I18n.t ? window.I18n.t('gallery.loading_more') : '正在加载更多图片...';
     }
 
     // ★ 流式补图调度（模块级计时器）：导入/扫描期间，当前打开的文件夹按 scan:batch
@@ -2589,7 +2676,11 @@ const Gallery = (() => {
                 return;
             }
             images.push(...added);
-            folderLoadOffset += added.length;
+            // ★ offset 必须按后端实际返回条数推进（与上面"全为重复"分支一致）。
+            //   旧代码按 added.length 推进：部分重复的批次会让前端 offset 落后于
+            //   后端位置，下一批重叠重取 → 偏移漂移累积，最终 offset 到达 total
+            //   时仍有真实条目没加载过（表现为"到底了但已加载数 < 文件夹计数"）。
+            folderLoadOffset += result.images.length;
             invalidatePathIndex();
             applyCurrentFilter();
             updateImageCount();
@@ -2616,7 +2707,7 @@ const Gallery = (() => {
         if (tagLoadOffset >= tagLoadTotal) return;
         isLoadingMoreFolder = true;
         _loadMoreStartedAt = Date.now();
-        _showLoadMoreIndicator(true);
+        _showLoadMoreIndicator(true, _loadMoreProgressText());
         trace('[分页] loadMoreFolderImages 开始: offset=' + folderLoadOffset + '/' + folderLoadTotal);
         const tagId = currentTagFilter;
         try {
@@ -2660,7 +2751,7 @@ const Gallery = (() => {
         if (favLoadOffset >= favLoadTotal) return;
         isLoadingMoreFolder = true;
         _loadMoreStartedAt = Date.now();
-        _showLoadMoreIndicator(true);
+        _showLoadMoreIndicator(true, _loadMoreProgressText());
         trace('[分页] loadMoreFolderImages 开始: offset=' + folderLoadOffset + '/' + folderLoadTotal);
         const inFavView = currentFavoriteFilter;
         try {
@@ -2761,10 +2852,23 @@ const Gallery = (() => {
 
             if (!hasChanges) return; // 无变化，保留当前缓存
 
-            console.log(`[Gallery] 后台刷新: ${normalizedFolder} 有更新 (${freshTotal}张)，替换缓存`);
+            console.log(`[Gallery] 后台刷新: ${normalizedFolder} 有更新 (${freshTotal}张)`);
 
             // ★ 替换前再次检查是否已中断（替换 images 是破坏性操作）
             if (signal.aborted || folderAbortController !== currentController) return;
+
+            // ★ 深分页保护：用户已加载超过第一批时，绝不能把已加载子树整个擦掉
+            //   重置回 500 张（表现为滚动中计数骤降 + 全量重绘闪动，之后要慢慢补回）。
+            //   只校正分页元数据：total 用最新值；offset 若超过新 total（重扫描去重后
+            //   总数缩小，如 16364 → 8864）则夹到 total，让分页自然收尾。
+            if (folderLoadOffset > FOLDER_FETCH_BATCH) {
+                console.warn(`[分页诊断] 后台刷新(深分页): freshTotal=${freshTotal} 旧total=${folderLoadTotal} offset=${folderLoadOffset} images=${images.length}`);
+                folderCacheMeta[normalizedFolder] = { total: freshTotal };
+                folderLoadTotal = freshTotal;
+                if (folderLoadOffset > freshTotal) folderLoadOffset = freshTotal;
+                updateImageCount();
+                return;
+            }
 
             // 替换 images 中的旧数据
             images = images.filter(img => {
@@ -3147,6 +3251,12 @@ const Gallery = (() => {
                 if (displayImages.length === 0) {
                     trace('[filterByFolder] 空视图! displayImages=0 但 images=', images.length, '→ 图廊会显示"加载中/无图"。诊断: currentFolder=', normalizedFolder);
                 }
+                // ★ 持久化最后浏览的文件夹（手机端重开页面时自动恢复）
+                if (folderPath && typeof Storage !== 'undefined' && Storage.setSetting) {
+                    lastLoadedFolderPath = folderPath;
+                    lastFolderRestoreAttempted = false; // 重新武装空态自愈
+                    try { Storage.setSetting('lastFolder', folderPath); } catch (e) { /* 静默 */ }
+                }
             } finally {
                 showLoading(false);
                 // ★ 修复：使用闭包捕获的 currentController 判断是否是当前请求
@@ -3504,6 +3614,15 @@ const Gallery = (() => {
             seen.add(key);
         }
         if (!changed) return arr;
+        // ★ 诊断（常开）：去重发生收缩,打印数量与重复样例,定位"已加载数骤降"
+        const dupKeys = [];
+        const seenDiag = new Set();
+        for (let i = 0; i < arr.length; i++) {
+            const key = arr[i].id || arr[i].path;
+            if (seenDiag.has(key)) { if (dupKeys.length < 5) dupKeys.push(key + '@' + i); }
+            else seenDiag.add(key);
+        }
+        console.warn(`[分页诊断] _dedupImages 收缩: ${arr.length} → 预计${(() => { const s = new Set(); let n = 0; for (const it of arr) { const k = it.id || it.path; if (k && !s.has(k)) { s.add(k); n++; } } return n; })()} 重复样例:`, dupKeys);
         const out = [];
         const seenOut = new Set();
         for (let i = 0; i < arr.length; i++) {
@@ -3513,6 +3632,7 @@ const Gallery = (() => {
             seenOut.add(key);
             out.push(item);
         }
+        console.warn(`[分页诊断] _dedupImages 完成: ${arr.length} → ${out.length}`);
         return out;
     }
     function render() {
@@ -3545,6 +3665,20 @@ const Gallery = (() => {
         }
 
         if (displayImages.length === 0) {
+            // ★ 自愈/恢复：应显示某个视图却空了。
+            //   a) 启动后首次空态：恢复上次浏览的文件夹（手机重开页面直接回到原位置）
+            //   b) 会话中 currentFolderFilter 被竞态重置成 null（表现为"莫名没有图片"）：
+            //      自动重新加载最后文件夹一次，用户手动退出文件夹视图（点击根/全部）不受影响——
+            //      那会先走 filterByFolder(null) 更新 lastLoadedFolderPath 之前的渲染路径，
+            //      且恢复只触发一次。
+            const inRootView = !currentFolderFilter && !currentTagFilter && !currentFavoriteFilter && !isSearchMode;
+            if (inRootView && lastLoadedFolderPath && !lastFolderRestoreAttempted && !lastFolderRestoring) {
+                lastFolderRestoreAttempted = true;
+                lastFolderRestoring = true;
+                console.log('[Gallery] 空态自愈：重新加载最后浏览的文件夹', lastLoadedFolderPath);
+                filterByFolder(lastLoadedFolderPath, '', {}).finally(() => { lastFolderRestoring = false; });
+                return;
+            }
             if (currentFolderFilter) {
                 hideGalleryPlaceholder();
                 _harvestGridCards();
@@ -3613,7 +3747,7 @@ const Gallery = (() => {
 
         const totalItems = displayImages.length;
         const columns = getColumnCount();
-        const cardHeight = thumbnailSize + 36;
+        const cardHeight = getThumbSize() + 36;
         const gap = 8;
         const rowHeight = cardHeight + gap;
         const overRows = overscanRows(rowHeight);
@@ -3755,7 +3889,7 @@ const Gallery = (() => {
         const gap = 8;
         const padding = 24; // galleryScroll padding (12px × 2)
         const containerW = Math.max(200, (galleryScroll ? galleryScroll.clientWidth : 800) - padding);
-        const rowH = thumbnailSize;
+        const rowH = getThumbSize();
         masonryRowHeight = rowH;
         masonryContainerWidth = containerW;
         masonryFirstId = displayImages.length > 0 ? (displayImages[0].id || '') : '';
@@ -3806,7 +3940,7 @@ const Gallery = (() => {
         // ★ 注意：_clearGrid（拆 DOM）被移到下方的滚动帧守卫之后——
         //   守卫命中时必须原样保留 DOM，已加载的图片才不会闪黑块
 
-        const rowH = thumbnailSize;
+        const rowH = getThumbSize();
         const gap = 8;
         const rowStep = rowH + gap;
 
@@ -3914,9 +4048,9 @@ const Gallery = (() => {
         const gap = 8;
         const padding = 24; // galleryScroll padding (12px × 2)
         const containerW = Math.max(200, (galleryScroll ? galleryScroll.clientWidth : 800) - padding);
-        // ★ 用 thumbnailSize 控制列宽（与 masonry 用 thumbnailSize 控制行高一致）
-        //    列宽 = thumbnailSize，最少 2 列（确保竖版瀑布流效果）
-        const colW = Math.max(80, Math.min(thumbnailSize, containerW - gap));
+        // ★ 用 getThumbSize() 控制列宽（与 masonry 用 getThumbSize() 控制行高一致）
+        //    列宽 = getThumbSize()，最少 2 列（确保竖版瀑布流效果）
+        const colW = Math.max(80, Math.min(getThumbSize(), containerW - gap));
         const colCount = Math.max(2, Math.floor((containerW + gap) / (colW + gap)));
 
         pinterestColCount = colCount;
@@ -4103,7 +4237,7 @@ const Gallery = (() => {
         const padding = 24;
         const containerW = Math.max(300, (galleryScroll ? galleryScroll.clientWidth : 800) - padding);
         const colW = Math.floor((containerW - gap) / 2); // 两列，每列宽度
-        const rowH = Math.max(60, thumbnailSize); // 行高 = 缩略图大小
+        const rowH = Math.max(60, getThumbSize()); // 行高 = 缩略图大小
 
         listRowHeight = rowH;
         listContainerWidth = containerW;
@@ -4227,13 +4361,13 @@ const Gallery = (() => {
     }
 
     function updateGridColumns() {
-        galleryGrid.style.gridTemplateColumns = `repeat(auto-fill, minmax(${thumbnailSize}px, 1fr))`;
+        galleryGrid.style.gridTemplateColumns = `repeat(auto-fill, minmax(${getThumbSize()}px, 1fr))`;
     }
 
     function getColumnCount() {
         const containerWidth = galleryScroll.clientWidth - 24;
         const gap = 8;
-        return Math.max(1, Math.floor((containerWidth + gap) / (thumbnailSize + gap)));
+        return Math.max(1, Math.floor((containerWidth + gap) / (getThumbSize() + gap)));
     }
 
     // ==================== 图片卡片 ====================
@@ -4302,7 +4436,11 @@ const Gallery = (() => {
         if (!galleryScroll) return null;
         const rect = galleryScroll.getBoundingClientRect();
         if (_thumbScrollBurst) {
-            const ahead = (rect.height || window.innerHeight) * 1.5;
+            // ★ 前方窗口必须覆盖虚拟滚动的 DOM 缓冲（OVERSCAN_PX=2000px，小缩略图时
+            //   约 13 行）：窗口边缘新插入的行如果落在爆发窗口之外，要等滚动停稳
+            //   150ms 后才补载——表现为小缩略图快滚时"出现 2-3 行空白、瞬间又补上"。
+            //   取 max(1.5 屏, OVERSCAN_PX) 保证 DOM 里所有行都在派发窗口内。
+            const ahead = Math.max((rect.height || window.innerHeight) * 1.5, OVERSCAN_PX);
             if (_scrollDir >= 0) {
                 return { top: rect.top - rect.height * 0.5, bottom: rect.bottom + ahead, tight: true };
             }
@@ -4336,7 +4474,7 @@ const Gallery = (() => {
     function thumbMaxInflight() {
         if (!galleryScroll) return THUMB_MAX_INFLIGHT;
         const cols = getColumnCount();
-        const rows = Math.ceil(galleryScroll.clientHeight / (thumbnailSize + 44)) + 2;
+        const rows = Math.ceil(galleryScroll.clientHeight / (getThumbSize() + 44)) + 2;
         return Math.max(THUMB_MAX_INFLIGHT, cols * rows + 16);
     }
     const _inflightThumbs = new Set();
@@ -4571,7 +4709,7 @@ const Gallery = (() => {
                                      //   × 50 行 ≈ 700 张），复用池必须罩住窗口，
                                      //   否则每帧滚动都在淘汰已加载的卡片 → 图片闪黑框
     function _cardPoolMax() {
-        const base = thumbnailSize >= 360 ? 180 : thumbnailSize >= 280 ? 240 : 400;
+        const base = getThumbSize() >= 360 ? 180 : getThumbSize() >= 280 ? 240 : 400;
         return Math.max(base, _lastWindowCardCount + 80);
     }
 
@@ -4587,7 +4725,7 @@ const Gallery = (() => {
             geo = 'mas:' + masonryLayout.x + ',' + masonryLayout.y + ',' + masonryLayout.w + ',' + masonryLayout.h;
         } else {
             // 网格：几何只取决于缩略图尺寸
-            geo = 'grid:' + currentLayout + ':' + thumbnailSize;
+            geo = 'grid:' + currentLayout + ':' + getThumbSize();
         }
         return geo + '\u0000' + imgData.path;
     }
@@ -4887,7 +5025,7 @@ const Gallery = (() => {
         if (currentLayout === 'grid') {
             // ★ wrapper 固定宽高，不随图片原始尺寸变化
             wrapper.style.width = '100%';
-            wrapper.style.height = thumbnailSize + 'px';
+            wrapper.style.height = getThumbSize() + 'px';
             wrapper.style.overflow = 'hidden';
             wrapper.style.background = '#000';
             wrapper.style.flexShrink = '0';
@@ -4913,11 +5051,11 @@ const Gallery = (() => {
             card.style.width = masonryLayout.w + 'px';
             card.style.height = masonryLayout.h + 'px';
 
-            // 计算缩略图宽高（保留原始比例，高度固定为 thumbnailSize）
-            const imgW = imgData.width || (imgData.height ? Math.round(imgData.height * 4/3) : thumbnailSize);
-            const imgH = imgData.height || (imgData.width ? Math.round(imgData.width * 3/4) : thumbnailSize);
+            // 计算缩略图宽高（保留原始比例，高度固定为 getThumbSize()）
+            const imgW = imgData.width || (imgData.height ? Math.round(imgData.height * 4/3) : getThumbSize());
+            const imgH = imgData.height || (imgData.width ? Math.round(imgData.width * 3/4) : getThumbSize());
             const ratio = (imgW && imgH && imgH > 0) ? imgW / imgH : 4/3;
-            const thumbH = thumbnailSize;
+            const thumbH = getThumbSize();
             const thumbW = Math.round(thumbH * ratio);
 
             wrapper.style.width = thumbW + 'px';
@@ -5673,7 +5811,7 @@ const Gallery = (() => {
         if (currentLayout === 'grid') {
             const cols = getColumnCount();
             const row = Math.floor(idx / cols);
-            top = Math.max(0, row * ((thumbnailSize + 36) + 8) - 80);
+            top = Math.max(0, row * ((getThumbSize() + 36) + 8) - 80);
         } else if (masonryLayout && masonryLayout[idx] && masonryLayout[idx].y != null) {
             top = Math.max(0, masonryLayout[idx].y - 80);
         } else if (galleryScroll) {
@@ -6203,6 +6341,30 @@ const Gallery = (() => {
             const label = I18n.t('toolbar.image_count');
             imageCountEl.textContent = `${displayImages.length} ${label}`;
         }
+        _updateEndIndicator(displayImages);
+    }
+
+    // ★ "已到底"指示器：文件夹视图下 offset 追平 total 且无扫描进行时，
+    //   在网格末尾显示"已加载全部 N 张图片"。状态集中在 updateImageCount
+    //   （所有分页/过滤路径都会调用它）里判定，避免多处手动维护显隐。
+    function _updateEndIndicator(displayImages) {
+        if (!endIndicator) return;
+        const show = !!(currentFolderFilter &&
+            folderLoadTotal > 0 &&
+            folderLoadOffset >= folderLoadTotal &&
+            !_scanActiveFor(currentFolderFilter) &&
+            !isLoadingMoreFolder &&
+            (!displayImages || displayImages.length > 0));
+        if (!show) {
+            endIndicator.style.display = 'none';
+            return;
+        }
+        console.warn(`[分页诊断] 已到底指示器显示: offset=${folderLoadOffset} total=${folderLoadTotal} loaded=${displayImages ? displayImages.length : '?'} folder=${currentFolderFilter}`);
+        const t = (typeof I18n !== 'undefined' ? I18n.t : (s) => s);
+        const n = displayImages ? displayImages.length : folderLoadTotal;
+        const span = endIndicator.querySelector('span');
+        if (span) span.textContent = t('gallery.end_of_gallery').replace('{n}', n);
+        endIndicator.style.display = 'flex';
     }
 
     // ==================== 按需解析元数据 ====================
@@ -6242,9 +6404,10 @@ const Gallery = (() => {
                 console.log('[Gallery] resolveMetadataOnDemand: 使用 File 对象解析', imgData.name);
                 meta = await MetadataParser.parseFile(imgData.file);
             } else if (imgData._fromServer) {
-                // ★ Wails 环境：用 Go 端 ParseMetadata 本地读取（只读头部元数据，不下载全图）
-                console.log('[Gallery] resolveMetadataOnDemand: 通过 Go ParseMetadata 本地解析, path:', imgData.path);
+                // ★ 服务器图片来源：Wails 桌面端走 Go 本地解析，手机/浏览器端走 LAN 接口
                 if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails()) {
+                    // Wails 环境：用 Go 端 ParseMetadata 本地读取（只读头部元数据，不下载全图）
+                    console.log('[Gallery] resolveMetadataOnDemand: 通过 Go ParseMetadata 本地解析, path:', imgData.path);
                     try {
                         meta = await WailsBridge.parseMetadata(imgData.path);
                         if (meta && (meta.prompt || Object.keys(meta.params || {}).length > 0 || Object.keys(meta.raw || {}).length > 0)) {
@@ -6255,22 +6418,22 @@ const Gallery = (() => {
                     } catch (e) {
                         console.warn('[Gallery] Go ParseMetadata 失败:', e.message);
                     }
-                }
-            } else if (typeof WailsBridge !== 'undefined' && !WailsBridge.isWails()) {
-                // ★ 浏览器/局域网模式：通过 LAN 服务的 /api/metadata 接口解析（Go 端本地读文件头部）
-                console.log('[Gallery] resolveMetadataOnDemand: 通过 /api/metadata 解析, path:', imgData.path);
-                try {
-                    const resp = await fetch('/api/metadata?path=' + encodeURIComponent(imgData.path));
-                    if (resp.ok) {
-                        const m = await resp.json();
-                        if (m && m.success !== false && (m.prompt || Object.keys(m.params || {}).length > 0 || Object.keys(m.raw || {}).length > 0)) {
-                            meta = m;
-                        } else {
-                            meta = null;
+                } else {
+                    // ★ 浏览器/局域网模式：通过 LAN 服务的 /api/metadata 接口解析（Go 端本地读文件头部）
+                    console.log('[Gallery] resolveMetadataOnDemand: 通过 /api/metadata 解析, path:', imgData.path);
+                    try {
+                        const resp = await fetch('/api/metadata?path=' + encodeURIComponent(imgData.path));
+                        if (resp.ok) {
+                            const m = await resp.json();
+                            if (m && m.success !== false && (m.prompt || Object.keys(m.params || {}).length > 0 || Object.keys(m.raw || {}).length > 0)) {
+                                meta = m;
+                            } else {
+                                meta = null;
+                            }
                         }
+                    } catch (e) {
+                        console.warn('[Gallery] /api/metadata 解析失败:', e.message);
                     }
-                } catch (e) {
-                    console.warn('[Gallery] /api/metadata 解析失败:', e.message);
                 }
             } else {
                 console.warn('[Gallery] resolveMetadataOnDemand: 无法获取图片数据', 'url:', imgData.url, '_fromServer:', imgData._fromServer, 'file:', !!imgData.file);
@@ -6701,7 +6864,7 @@ const Gallery = (() => {
             const gap = 8;
             const padding = 24;
             const containerW = Math.max(300, (galleryScroll ? galleryScroll.clientWidth : 800) - padding);
-            const rowStep = thumbnailSize + gap;
+            const rowStep = getThumbSize() + gap;
             const totalRows = Math.ceil(allDisplayImages.length / 2);
             listTotalHeight = totalRows * rowStep;
             listLayoutVersion++;

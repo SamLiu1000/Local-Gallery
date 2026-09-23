@@ -667,5 +667,17 @@
   "settings.media_tools_path_ph": "Папка с ffmpeg (необязательно, пусто = автоопределение)",
   "settings.redetect": "Повторить поиск",
   "detail.audio_unsupported": "Этот аудиоформат не может быть воспроизведён в текущей среде",
-  "detail.media_info": "Сведения о медиа"
+  "detail.media_info": "Сведения о медиа",
+  "theme.mono_dark": "Монохром · Тёмная",
+  "theme.mono_light": "Монохром · Светлая",
+  "theme.gallery_dark": "Тёмный музей",
+  "theme.gallery_light": "Белая галерея",
+  "theme.arctic_aurora": "Северное сияние",
+  "theme.egyptian_museum": "Египетский музей",
+  "theme.watercolor_doodle": "Акварельные каракули",
+  "settings.concurrency_desc": "Количество параллельно создаваемых миниатюр. Чем больше значение, тем быстрее фоновая генерация, но выше нагрузка на ЦП и память. «Восстановить по умолчанию» установит число логических ядер ЦП (мин. 2). Изменения применяются сразу, без перезапуска.",
+  "gallery.end_of_gallery": "Загружены все изображения: {n}",
+  "gallery.loading_more_progress": "Loading more images",
+  "mobile.lock": "Блокировка",
+  "toolbar.more_tools": "Другие инструменты"
 }

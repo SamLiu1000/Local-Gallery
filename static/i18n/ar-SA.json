@@ -667,5 +667,17 @@
   "settings.media_tools_path_ph": "المجلد الذي يحتوي على ffmpeg (اختياري، اتركه فارغًا للكشف التلقائي)",
   "settings.redetect": "إعادة الكشف",
   "detail.audio_unsupported": "لا يمكن تشغيل تنسيق الصوت هذا في البيئة الحالية",
-  "detail.media_info": "معلومات الوسائط"
+  "detail.media_info": "معلومات الوسائط",
+  "theme.mono_dark": "أحادي · داكن",
+  "theme.mono_light": "أحادي · فاتح",
+  "theme.gallery_dark": "متحف ذهبي داكن",
+  "theme.gallery_light": "معرض أبيض",
+  "theme.arctic_aurora": "الشفق القطبي",
+  "theme.egyptian_museum": "المتحف المصري",
+  "theme.watercolor_doodle": "رسومات مائية",
+  "settings.concurrency_desc": "عدد الصور المصغرة التي يتم إنشاؤها بالتوازي. القيم الأكبر تجعل التوليد المسبق في الخلفية أسرع لكنها تستهلك معالجًا وذاكرة أكبر. \"استعادة الافتراضي\" يضبط العدد على الأنوية المنطقية للمعالج (الحد الأدنى 2). تُطبق التغييرات فورًا دون إعادة تشغيل.",
+  "gallery.end_of_gallery": "تم تحميل جميع الصور ({n})",
+  "gallery.loading_more_progress": "Loading more images",
+  "mobile.lock": "قفل",
+  "toolbar.more_tools": "أدوات أخرى"
 }

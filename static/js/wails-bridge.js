@@ -297,6 +297,7 @@ const WailsBridge = (() => {
     }
 
     async function saveUserData(data) {
+        if (_dataDirSwitching) return _blockedDuringSwitch();
         if (!isWailsEnv) {
             const response = await fetch('/api/user-data/save', {
                 method: 'POST',
@@ -309,6 +310,7 @@ const WailsBridge = (() => {
     }
 
     async function saveRoots(roots) {
+        if (_dataDirSwitching) return _blockedDuringSwitch();
         if (!isWailsEnv) {
             const response = await fetch('/api/user-data/save-roots', {
                 method: 'POST',
@@ -331,6 +333,7 @@ const WailsBridge = (() => {
     }
 
     async function saveRootsWithMeta(roots) {
+        if (_dataDirSwitching) return _blockedDuringSwitch();
         return getApp().SaveRootsWithMeta(roots);
     }
 
@@ -339,6 +342,7 @@ const WailsBridge = (() => {
     }
 
     async function setSidebarSetting(key, value) {
+        if (_dataDirSwitching) return _blockedDuringSwitch();
         return getApp().SetSidebarSetting(key, value);
     }
 
@@ -347,14 +351,17 @@ const WailsBridge = (() => {
     }
 
     async function addImageTag(imagePath, tagId) {
+        if (_dataDirSwitching) return _blockedDuringSwitch();
         return getApp().AddImageTag(imagePath, tagId);
     }
 
     async function removeImageTag(imagePath, tagId) {
+        if (_dataDirSwitching) return _blockedDuringSwitch();
         return getApp().RemoveImageTag(imagePath, tagId);
     }
 
     async function removeImageTagsByTagId(tagId) {
+        if (_dataDirSwitching) return _blockedDuringSwitch();
         return getApp().RemoveImageTagsByTagID(tagId);
     }
 
@@ -371,14 +378,17 @@ const WailsBridge = (() => {
     }
 
     async function importImageTags(tags) {
+        if (_dataDirSwitching) return _blockedDuringSwitch();
         return getApp().ImportImageTags(tags);
     }
 
     async function toggleFavorite(imagePath) {
+        if (_dataDirSwitching) return _blockedDuringSwitch();
         return getApp().ToggleFavorite(imagePath);
     }
 
     async function setFavorite(imagePath, value) {
+        if (_dataDirSwitching) return _blockedDuringSwitch();
         return getApp().SetFavorite(imagePath, value);
     }
 
@@ -976,6 +986,11 @@ const WailsBridge = (() => {
         return getApp().SetThumbConcurrency(n);
     }
 
+    async function getThumbConcurrencyInfo() {
+        if (!isWailsEnv) return { concurrency: 2, defaultConcurrency: 2 };
+        return getApp().GetThumbConcurrencyInfo();
+    }
+
     async function getThumbKernel() {
         if (!isWailsEnv) return 'lanczos3';
         return getApp().GetThumbKernel();
@@ -1030,9 +1045,28 @@ const WailsBridge = (() => {
         return getApp().ResumeBackground();
     }
 
+    // ★ 数据目录热切换守卫：restartWithNewPaths 调用期间，旧页面的防抖/定时器
+    //   仍可能触发状态写回（收纳夹、收藏、标签、设置）——此时后端已指向新目录，
+    //   这些写回会把旧目录的数据污染进新目录（表现为切换后收纳夹成员丢失/串目录）。
+    //   切换成功即 reload（标志随页面销毁自然消失）；失败时由调用方 resume 复位。
+    let _dataDirSwitching = false;
+    function isDataDirSwitching() { return _dataDirSwitching; }
+
     async function restartWithNewPaths() {
         if (!isWailsEnv) return { success: false, error: '非Wails环境' };
-        return getApp().RestartWithNewPaths();
+        _dataDirSwitching = true;
+        try {
+            return await getApp().RestartWithNewPaths();
+        } finally {
+            // 失败回滚时复位（成功路径会 window.location.reload()，不会走到这）
+            setTimeout(() => { _dataDirSwitching = false; }, 3000);
+        }
+    }
+
+    // 切换窗口内丢弃状态写回：返回成功形态的空结果，调用方 catch/忽略均可
+    function _blockedDuringSwitch() {
+        console.warn('[Bridge] 数据目录切换中，丢弃状态写回');
+        return Promise.resolve({ success: false, blocked: true });
     }
 
     async function saveFile(defaultName, content) {
@@ -1213,6 +1247,7 @@ const WailsBridge = (() => {
         getThumbGeneration,
         getThumbConcurrency,
         setThumbConcurrency,
+        getThumbConcurrencyInfo,
         getThumbKernel,
         setThumbKernel,
         getMediaToolsStatus,

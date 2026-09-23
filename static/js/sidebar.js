@@ -932,6 +932,21 @@ const Sidebar = (() => {
     // 启动时先渲染上次保存的树（好像一直在那里），后台再与后端 RPC 比对刷新。
     // 缓存只含结构/路径/计数，不含 previews（刷新后由服务端补全）。
     const FOLDER_TREE_CACHE_KEY = 'folder_tree_cache_v1';
+    // ★ 数据目录热切换后的一次性标记（sessionStorage 仅在同标签页 reload 间存活）：
+    //   切换前设置，reload 后首次读取即清除——本轮启动完全信任后端，禁用一切
+    //   localStorage 铺底缓存（旧目录的树/收纳夹会经同源共享的 localStorage 串进来，
+    //   且大库下 GetFolders 慢，旧树会"一直不刷新"地顶着）。
+    const _dataDirSwitched = (function () {
+        try {
+            if (sessionStorage.getItem('gallery_data_dir_switched')) {
+                sessionStorage.removeItem('gallery_data_dir_switched');
+                localStorage.removeItem(FOLDER_TREE_CACHE_KEY);
+                console.log('[Sidebar] 检测到数据目录刚切换：作废本地树缓存，等待后端权威数据');
+                return true;
+            }
+        } catch (e) { /* 隐私模式等 */ }
+        return false;
+    })();
     let _lastTreeCacheSave = 0;
 
     function serializeFolderNode(n) {
@@ -1060,6 +1075,8 @@ const Sidebar = (() => {
 
     function loadFolderTreeCache(allowUnvalidated) {
         try {
+            // ★ 刚切换数据目录：localStorage 缓存属于旧目录，本轮一律不用
+            if (_dataDirSwitched) return null;
             // ★ 导入根列表已就绪时先验签名：不匹配（切换用户目录/导入列表变化）→ 作废。
             // ★ 未就绪且 allowUnvalidated 时仍返回缓存：0 秒渲染优先——后端根列表 RPC
             //   很快但整条启动链（Gallery 初始化等）有先后依赖，等它就 0 秒就没了。
@@ -1145,10 +1162,14 @@ const Sidebar = (() => {
                     // ★ 收纳夹持久化数据也在此一并加载：否则首屏只有文件夹、
                     //   收纳夹要等 GetFolders RPC 返回后才出现（先后两截）
                     await loadFolderBins();
+                    // ★ 顺序致命：必须先把 cachedTree 赋给 folderRoots 再 sync——
+                    //   syncBinsWithRoots 用模块变量 folderRoots 计算合法根集合，
+                    //   若在其仍为空数组时调用，所有收纳夹成员都会被当作"消失的根"
+                    //   裁剪掉并立即持久化（每次启动都清空一次收纳夹成员！）
+                    folderRoots = cachedTree;
                     syncBinsWithRoots();
                     applyExpandedStates(cachedTree);
                 } catch (e) { /* 读持久化失败则按缓存原样渲染 */ }
-                folderRoots = cachedTree;
                 renderFolderTree();
             }
         }
@@ -2961,8 +2982,14 @@ const Sidebar = (() => {
             if (count >= 0) updateLocalCount(count);
             updateDOMCount(count);
             if (count > 0 && typeof Gallery !== 'undefined' && Gallery.filterByFolder) {
-                if (Gallery._beginScanLoad) Gallery._beginScanLoad(folderPath);
-                Gallery.filterByFolder(folderPath, folderName);
+                // ★ 深分页守卫：用户已在该文件夹加载超过第一批时跳过重取，
+                //   否则会清空已加载内容重置回第一页并全量重绘（计数骤降+闪动）。
+                if (Gallery._isDeepPaged && Gallery._isDeepPaged()) {
+                    console.log('[Sidebar] 扫描完成：Gallery 已深入分页，跳过重取');
+                } else {
+                    if (Gallery._beginScanLoad) Gallery._beginScanLoad(folderPath);
+                    Gallery.filterByFolder(folderPath, folderName);
+                }
             }
             console.log('[Sidebar] 扫描完成:', folderPath, count, '张图片');
         }
@@ -2983,8 +3010,12 @@ const Sidebar = (() => {
                             updateLocalCount(finalCount);
                             updateDOMCount(finalCount);
                             if (finalCount > 0 && typeof Gallery !== 'undefined' && Gallery.filterByFolder) {
-                                if (Gallery._beginScanLoad) Gallery._beginScanLoad(folderPath);
-                                await Gallery.filterByFolder(folderPath, folderName);
+                                if (Gallery._isDeepPaged && Gallery._isDeepPaged()) {
+                                    console.log('[Sidebar] 轮询超时兜底：Gallery 已深入分页，跳过重取');
+                                } else {
+                                    if (Gallery._beginScanLoad) Gallery._beginScanLoad(folderPath);
+                                    await Gallery.filterByFolder(folderPath, folderName);
+                                }
                             }
                             cleanupEvent();
                             return;
@@ -3006,8 +3037,12 @@ const Sidebar = (() => {
                             updateDOMCount(count);
                             await refreshFolderTree();
                             if (count > 0 && typeof Gallery !== 'undefined' && Gallery.filterByFolder) {
-                                if (Gallery._beginScanLoad) Gallery._beginScanLoad(folderPath);
-                                await Gallery.filterByFolder(folderPath, folderName);
+                                if (Gallery._isDeepPaged && Gallery._isDeepPaged()) {
+                                    console.log('[Sidebar] scan:complete：Gallery 已深入分页，跳过重取');
+                                } else {
+                                    if (Gallery._beginScanLoad) Gallery._beginScanLoad(folderPath);
+                                    await Gallery.filterByFolder(folderPath, folderName);
+                                }
                             }
                             console.log('[Sidebar] 扫描完成 (scan:complete):', folderPath, count, '张图片');
                             cleanupEvent();
@@ -6380,8 +6415,18 @@ const Sidebar = (() => {
     let folderBins = [];
     let navSequence = [];
     let folderBinsLoaded = false;
+    // ★ 收纳夹数据是否已成功从持久层读到过：未读到前禁止任何写回——
+    //   否则后端数据库未就绪/读取失败时，空的 folderBins 会被 sync 追加根后
+    //   落盘，把目录里真实的收纳夹覆盖成空（表现为切换后收纳夹消失）
+    let folderBinsHydrated = false;
 
     function saveFolderBins() {
+        // ★ 未水合前禁止写回：读取失败/后端未就绪时内存里是空 bins，
+        //   此时落盘会把目录里真实的收纳夹覆盖成空
+        if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails() && !folderBinsHydrated) {
+            console.warn('[Sidebar] 收纳夹尚未从后端加载成功，拒绝写回（防止空数据覆盖）');
+            return;
+        }
         const payload = JSON.stringify({ bins: folderBins, seq: navSequence });
         if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails()) {
             WailsBridge.setSidebarSetting('sidebar_folder_bins', payload).catch(() => {});
@@ -6395,13 +6440,29 @@ const Sidebar = (() => {
         folderBinsLoaded = true;
         try {
             let raw = null;
+            let loadOK = false; // 后端明确应答（含"确实为空"）
             if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails()) {
                 const r = await WailsBridge.getSidebarSetting('sidebar_folder_bins');
-                if (r && r.success && r.value) raw = r.value;
+                if (r && r.success) {
+                    loadOK = true;
+                    if (r.value) raw = r.value;
+                } else {
+                    // 允许下次树刷新时重试（后端可能尚未就绪）
+                    folderBinsLoaded = false;
+                    console.warn('[Sidebar] 收纳夹读取失败（后端未就绪？）:', r && r.error);
+                }
             }
-            if (!raw && typeof Storage !== 'undefined' && Storage.getSetting) {
+            // ★ localStorage 回退仅供浏览器（非 Wails）模式：Wails 下同源 localStorage
+            //   跨数据目录共享，回退会把旧目录的收纳夹串进新目录（随后被裁剪+写回，
+            //   造成双向污染）。Wails 下后端 user-data.db 是唯一真相源，没有就没有。
+            if (!loadOK && !(typeof WailsBridge !== 'undefined' && WailsBridge.isWails()) &&
+                typeof Storage !== 'undefined' && Storage.getSetting) {
                 raw = await Storage.getSetting('sidebar_folder_bins', null);
+                loadOK = true;
             }
+            // ★ 只有明确读到（或确认为空）才视为已水合；读取失败保持未水合，
+            //   saveFolderBins/syncBinsWithRoots 会拒绝写回，防止空数据覆盖真实收纳夹
+            folderBinsHydrated = loadOK;
             if (raw) {
                 const parsed = JSON.parse(raw);
                 if (parsed && Array.isArray(parsed.bins)) {
@@ -6410,18 +6471,36 @@ const Sidebar = (() => {
                 }
             }
         } catch (e) {
+            folderBinsHydrated = false;
+            folderBinsLoaded = false; // 下次刷新重试
             console.warn('[Sidebar] 收纳夹数据加载失败:', e);
         }
     }
 
     // 每次拿到新 folderRoots 后同步：剔除消失的根/收纳夹，新根追加到顶层末尾
     function syncBinsWithRoots() {
+        // ★ 未水合前禁止任何裁剪/追加+落盘（Wails 模式）
+        if (typeof WailsBridge !== 'undefined' && WailsBridge.isWails() && !folderBinsHydrated) {
+            console.warn('[Sidebar] syncBinsWithRoots 跳过：收纳夹数据未从后端加载成功');
+            return false;
+        }
+        // ★ 防御：folderRoots 为空说明树还没从后端加载（或调用顺序错误），
+        //   此时所有收纳夹成员都会被误判为"消失的根"——绝不能在此状态下裁剪+落盘
+        if (folderRoots.length === 0) {
+            console.warn('[Sidebar] syncBinsWithRoots 在空树下被调用，跳过（防止误清收纳夹成员）');
+            return false;
+        }
         const rootKeys = new Set(folderRoots.map(n => pathCacheKey(n.path)));
         let changed = false;
         for (const b of folderBins) {
             const before = b.paths.length;
             b.paths = b.paths.filter(p => rootKeys.has(pathCacheKey(p)));
-            if (b.paths.length !== before) changed = true;
+            if (b.paths.length !== before) {
+                changed = true;
+                // ★ 审计：成员被裁剪必须留下痕迹（键/路径格式不匹配可据此定位）
+                console.warn('[Sidebar] 收纳夹 "' + b.name + '" 裁剪成员 ' + (before - b.paths.length) +
+                    ' 个，树根数=' + folderRoots.length + '，被裁路径=', b.paths);
+            }
         }
         folderBins = folderBins.filter(b => {
             if (b.paths.length > 0) return true;

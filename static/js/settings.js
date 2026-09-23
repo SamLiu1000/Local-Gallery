@@ -35,6 +35,12 @@ const Settings = (() => {
             <div class="settings-dialog">
                 <h2><span class="icon icon-settings"></span> ${t("settings.title")}</h2>
 
+                <!-- 0. 主题 -->
+                <div class="settings-section">
+                    <h4>${t("settings.theme")}</h4>
+                    <div class="theme-presets" id="themePresets"></div>
+                </div>
+
                 <!-- 1. 配色方案 -->
                 <div class="settings-section">
                     <h4>${t("settings.color_scheme")}</h4>
@@ -130,6 +136,7 @@ const Settings = (() => {
                         <button id="settingsRestoreConcurrency" class="btn-small">${t("settings.concurrency_restore_default")}</button>
                         <span class="input-hint" id="settingsThumbConcurrencyHint" style="margin-left: 8px;"></span>
                     </div>
+                    <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 6px;" data-i18n="settings.concurrency_desc">${t("settings.concurrency_desc")}</div>
                 </div>
 
                 <!-- 6. 媒体组件 (ffmpeg) -->
@@ -201,6 +208,9 @@ const Settings = (() => {
 
         // ===== 配色方案事件 =====
         initColorPickers();
+
+        // ===== 主题选择事件 =====
+        initThemePresets();
 
         document.getElementById('settingsBrowseUserDataDir').addEventListener('click', browseUserDataDir);
         document.getElementById('settingsResetUserDataDir').addEventListener('click', resetUserDataDir);
@@ -471,6 +481,9 @@ const Settings = (() => {
             const result = await WailsBridge.restartWithNewPaths();
             if (result && result.success) {
                 console.log('[设置] 数据目录已热切换:', result.userDataDir);
+                // ★ 给 reload 后的新页面打一次性标记：作废旧目录的 localStorage
+                //   树缓存/收纳夹回退，强制从新目录后端加载（见 sidebar.js）
+                try { sessionStorage.setItem('gallery_data_dir_switched', result.userDataDir || '1'); } catch (e) {}
                 // ★ 整体重载前端：导航栏布局/收纳夹/主题色/深浅色等所有设置与
                 //   侧栏状态（含 user-data.db 里 sidebar_settings 的内存缓存标志）
                 //   一律从新目录重新初始化，避免逐个重置内存缓存造成遗漏
@@ -886,6 +899,43 @@ const Settings = (() => {
                 saveAccentColor(color);
             });
         }
+    }
+
+    function initThemePresets() {
+        const container = document.getElementById('themePresets');
+        if (!container || typeof App === 'undefined' || !App.getThemeInfo) return;
+
+        const t = (typeof I18n !== "undefined" ? I18n.t : (s) => s);
+        const info = App.getThemeInfo();
+        const current = info.current;
+
+        container.innerHTML = info.themes.map(theme => {
+            const active = theme.id === current ? ' active' : '';
+            return `<button class="theme-swatch${active}" data-theme-id="${theme.id}" title="${t(theme.nameKey)}">
+                <span class="theme-swatch-preview theme-preview-${theme.id}"></span>
+                <span class="theme-swatch-name">${t(theme.nameKey)}</span>
+            </button>`;
+        }).join('');
+
+        container.querySelectorAll('.theme-swatch').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const id = btn.dataset.themeId;
+                if (typeof App.applyThemeById === 'function') {
+                    App.applyThemeById(id);
+                } else {
+                    localStorage.setItem('theme', id);
+                    if (typeof Storage !== 'undefined' && Storage.setSetting) {
+                        Storage.setSetting('theme', id);
+                    }
+                    App.applyTheme(id);
+                }
+                // 主题切换后强调色恢复为主题设计配色,同步配色方案区显示
+                if (typeof initColorPickers === 'function') initColorPickers();
+                container.querySelectorAll('.theme-swatch').forEach(b => {
+                    b.classList.toggle('active', b.dataset.themeId === id);
+                });
+            });
+        });
     }
 
     function updateSwatchActive(swatches, color) {

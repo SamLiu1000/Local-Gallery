@@ -667,5 +667,17 @@
   "settings.media_tools_path_ph": "Carpeta que contiene ffmpeg (opcional, vacío = detección automática)",
   "settings.redetect": "Redetectar",
   "detail.audio_unsupported": "Este formato de audio no se puede reproducir en el entorno actual",
-  "detail.media_info": "Información multimedia"
+  "detail.media_info": "Información multimedia",
+  "theme.mono_dark": "Monocromo · Oscuro",
+  "theme.mono_light": "Monocromo · Claro",
+  "theme.gallery_dark": "Galería oro oscuro",
+  "theme.gallery_light": "Galería blanca",
+  "theme.arctic_aurora": "Aurora ártica",
+  "theme.egyptian_museum": "Museo egipcio",
+  "theme.watercolor_doodle": "Acuarela garabateada",
+  "settings.concurrency_desc": "Número de miniaturas generadas en paralelo. Valores más altos aceleran la pregeneración en segundo plano pero consumen más CPU y memoria. «Restaurar predeterminado» fija los núcleos lógicos de la CPU (mín. 2). Los cambios surten efecto al instante, sin reiniciar.",
+  "gallery.end_of_gallery": "Se han cargado las {n} imágenes",
+  "gallery.loading_more_progress": "Loading more images",
+  "mobile.lock": "Bloquear",
+  "toolbar.more_tools": "Más herramientas"
 }

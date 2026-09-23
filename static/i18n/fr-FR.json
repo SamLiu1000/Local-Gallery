@@ -667,5 +667,17 @@
   "settings.media_tools_path_ph": "Dossier contenant ffmpeg (facultatif, vide = détection auto)",
   "settings.redetect": "Redétecter",
   "detail.audio_unsupported": "Ce format audio ne peut pas être lu dans l'environnement actuel",
-  "detail.media_info": "Infos média"
+  "detail.media_info": "Infos média",
+  "theme.mono_dark": "Monochrome · Sombre",
+  "theme.mono_light": "Monochrome · Clair",
+  "theme.gallery_dark": "Galerie or sombre",
+  "theme.gallery_light": "Galerie blanche",
+  "theme.arctic_aurora": "Aurore arctique",
+  "theme.egyptian_museum": "Musée égyptien",
+  "theme.watercolor_doodle": "Aquarelle griffonnée",
+  "settings.concurrency_desc": "Nombre de vignettes générées en parallèle. Plus la valeur est élevée, plus la pré-génération en arrière-plan est rapide, mais elle consomme davantage de CPU et de mémoire. « Restaurer par défaut » définit le nombre de cœurs logiques du CPU (min. 2). Les changements sont immédiats, sans redémarrage.",
+  "gallery.end_of_gallery": "Toutes les {n} images ont été chargées",
+  "gallery.loading_more_progress": "Loading more images",
+  "mobile.lock": "Verrouiller",
+  "toolbar.more_tools": "Plus d'outils"
 }

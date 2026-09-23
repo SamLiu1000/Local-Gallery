@@ -667,5 +667,17 @@
   "settings.media_tools_path_ph": "ffmpeg 폴더(비우면 자동 탐색)",
   "settings.redetect": "다시 탐색",
   "detail.audio_unsupported": "현재 환경에서 이 오디오 형식을 재생할 수 없습니다",
-  "detail.media_info": "미디어 정보"
+  "detail.media_info": "미디어 정보",
+  "theme.mono_dark": "모노크롬 · 다크",
+  "theme.mono_light": "모노크롬 · 라이트",
+  "theme.gallery_dark": "미술관 다크 골드",
+  "theme.gallery_light": "갤러리 화이트",
+  "theme.arctic_aurora": "북극 오로라",
+  "theme.egyptian_museum": "이집트 박물관",
+  "theme.watercolor_doodle": "수채 낙서",
+  "settings.concurrency_desc": "썸네일을 동시에 생성하는 병렬 작업 수입니다. 값이 클수록 백그라운드 사전 생성이 빨라지지만 CPU와 메모리를 더 사용합니다. '기본값 복원'을 누르면 CPU 논리 코어 수(최소 2)로 설정됩니다. 변경 즉시 적용되며 재시작이 필요 없습니다.",
+  "gallery.end_of_gallery": "모든 {n}개의 이미지를 불러왔습니다",
+  "gallery.loading_more_progress": "Loading more images",
+  "mobile.lock": "잠금",
+  "toolbar.more_tools": "더 많은 도구"
 }
