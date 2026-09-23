@@ -174,7 +174,9 @@ func (idb *ImageDB) initSchema() error {
 		root_path TEXT NOT NULL DEFAULT '',
 		width INTEGER NOT NULL DEFAULT 0,
 		height INTEGER NOT NULL DEFAULT 0,
-		is_video INTEGER NOT NULL DEFAULT 0
+		is_video INTEGER NOT NULL DEFAULT 0,
+		duration_ms INTEGER NOT NULL DEFAULT 0,
+		media_info_json TEXT NOT NULL DEFAULT ''
 	);
 	CREATE INDEX IF NOT EXISTS idx_image_cache_root_path ON image_cache(root_path);
 	CREATE INDEX IF NOT EXISTS idx_image_cache_folder ON image_cache(folder);
@@ -224,6 +226,13 @@ func (idb *ImageDB) initSchema() error {
 	// 迁移：添加 created_at 列（列已存在时忽略错误）
 	if _, err := idb.db.Exec(`ALTER TABLE images ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0`); err != nil {
 		fmt.Printf("[数据库迁移] created_at 列添加失败（可能已存在）: %v\n", err)
+	}
+	// 迁移：媒体时长与媒体技术信息（视频/音频增强字段，旧行默认 0/空）
+	if _, err := idb.db.Exec(`ALTER TABLE image_cache ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0`); err != nil {
+		fmt.Printf("[数据库迁移] duration_ms 列添加失败（可能已存在）: %v\n", err)
+	}
+	if _, err := idb.db.Exec(`ALTER TABLE image_cache ADD COLUMN media_info_json TEXT NOT NULL DEFAULT ''`); err != nil {
+		fmt.Printf("[数据库迁移] media_info_json 列添加失败（可能已存在）: %v\n", err)
 	}
 	// 迁移：添加 content_hash 列（用于扫描去重）
 	if _, err := idb.db.Exec(`ALTER TABLE image_cache ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''`); err != nil {
@@ -1393,6 +1402,9 @@ type ImageCacheEntry struct {
 	Width        int
 	Height       int
 	IsVideo      bool
+	IsAudio      bool
+	DurationMS   int64
+	MediaInfoJSON string
 	ContentHash  string
 }
 
@@ -1411,8 +1423,8 @@ func (idb *ImageDB) SaveImageCacheBatch(entries []ImageCacheEntry) error {
 	// ★ upsert 只更新基础字段：prompt/params_json/width/height/content_hash/has_thumb
 	//   等由其它链路（元数据索引、尺寸懒加载、缩略图 worker）维护的列不能被扫描覆盖。
 	stmt, err := tx.Prepare(`INSERT INTO image_cache
-		(id, path, name, size, last_modified, created_at, folder, root_path, width, height, is_video, content_hash)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(id, path, name, size, last_modified, created_at, folder, root_path, width, height, is_video, content_hash, duration_ms, media_info_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			path=excluded.path, name=excluded.name, size=excluded.size,
 			last_modified=excluded.last_modified, created_at=excluded.created_at,
@@ -1420,6 +1432,8 @@ func (idb *ImageDB) SaveImageCacheBatch(entries []ImageCacheEntry) error {
 			width=CASE WHEN excluded.width>0 THEN excluded.width ELSE image_cache.width END,
 			height=CASE WHEN excluded.height>0 THEN excluded.height ELSE image_cache.height END,
 			is_video=excluded.is_video,
+			duration_ms=CASE WHEN excluded.duration_ms>0 THEN excluded.duration_ms ELSE image_cache.duration_ms END,
+			media_info_json=CASE WHEN excluded.media_info_json!='' THEN excluded.media_info_json ELSE image_cache.media_info_json END,
 			content_hash=CASE WHEN excluded.content_hash!='' THEN excluded.content_hash ELSE image_cache.content_hash END`)
 	if err != nil {
 		return err
@@ -1431,7 +1445,8 @@ func (idb *ImageDB) SaveImageCacheBatch(entries []ImageCacheEntry) error {
 			isVideo = 1
 		}
 		if _, err := stmt.Exec(e.ID, e.Path, e.Name, e.Size, e.LastModified,
-			e.CreatedAt, e.Folder, e.RootPath, e.Width, e.Height, isVideo, e.ContentHash); err != nil {
+			e.CreatedAt, e.Folder, e.RootPath, e.Width, e.Height, isVideo, e.ContentHash,
+			e.DurationMS, e.MediaInfoJSON); err != nil {
 			return err
 		}
 	}
@@ -1493,8 +1508,8 @@ func (idb *ImageDB) SaveImageCacheBatchCounted(root string, entries []ImageCache
 
 	// 2. upsert（与 SaveImageCacheBatch 相同：只更新基础字段，保护 prompt/params/has_thumb）
 	stmt, err := tx.Prepare(`INSERT INTO image_cache
-		(id, path, name, size, last_modified, created_at, folder, root_path, width, height, is_video, content_hash)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(id, path, name, size, last_modified, created_at, folder, root_path, width, height, is_video, content_hash, duration_ms, media_info_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			path=excluded.path, name=excluded.name, size=excluded.size,
 			last_modified=excluded.last_modified, created_at=excluded.created_at,
@@ -1502,6 +1517,8 @@ func (idb *ImageDB) SaveImageCacheBatchCounted(root string, entries []ImageCache
 			width=CASE WHEN excluded.width>0 THEN excluded.width ELSE image_cache.width END,
 			height=CASE WHEN excluded.height>0 THEN excluded.height ELSE image_cache.height END,
 			is_video=excluded.is_video,
+			duration_ms=CASE WHEN excluded.duration_ms>0 THEN excluded.duration_ms ELSE image_cache.duration_ms END,
+			media_info_json=CASE WHEN excluded.media_info_json!='' THEN excluded.media_info_json ELSE image_cache.media_info_json END,
 			content_hash=CASE WHEN excluded.content_hash!='' THEN excluded.content_hash ELSE image_cache.content_hash END`)
 	if err != nil {
 		return err
@@ -1513,7 +1530,8 @@ func (idb *ImageDB) SaveImageCacheBatchCounted(root string, entries []ImageCache
 			isVideo = 1
 		}
 		if _, err := stmt.Exec(e.ID, e.Path, e.Name, e.Size, e.LastModified,
-			e.CreatedAt, e.Folder, e.RootPath, e.Width, e.Height, isVideo, e.ContentHash); err != nil {
+			e.CreatedAt, e.Folder, e.RootPath, e.Width, e.Height, isVideo, e.ContentHash,
+			e.DurationMS, e.MediaInfoJSON); err != nil {
 			return err
 		}
 	}
@@ -1631,8 +1649,8 @@ func (idb *ImageDB) SaveImageCacheByRoot(rootPath string, entries []ImageCacheEn
 	// 2. 分批插入（INSERT OR REPLACE，批间释放锁让读查询可插队）
 	// ★ upsert 只更新基础字段（同 SaveImageCacheBatch），并保留已有非空哈希与尺寸
 	stmt := `INSERT INTO image_cache
-		(id, path, name, size, last_modified, created_at, folder, root_path, width, height, is_video, content_hash)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(id, path, name, size, last_modified, created_at, folder, root_path, width, height, is_video, content_hash, duration_ms, media_info_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			path=excluded.path, name=excluded.name, size=excluded.size,
 			last_modified=excluded.last_modified, created_at=excluded.created_at,
@@ -1640,6 +1658,8 @@ func (idb *ImageDB) SaveImageCacheByRoot(rootPath string, entries []ImageCacheEn
 			width=CASE WHEN excluded.width>0 THEN excluded.width ELSE image_cache.width END,
 			height=CASE WHEN excluded.height>0 THEN excluded.height ELSE image_cache.height END,
 			is_video=excluded.is_video,
+			duration_ms=CASE WHEN excluded.duration_ms>0 THEN excluded.duration_ms ELSE image_cache.duration_ms END,
+			media_info_json=CASE WHEN excluded.media_info_json!='' THEN excluded.media_info_json ELSE image_cache.media_info_json END,
 			content_hash=CASE WHEN excluded.content_hash!='' THEN excluded.content_hash ELSE image_cache.content_hash END`
 	for i := 0; i < len(entries); i += insBatch {
 		end := i + insBatch
@@ -1655,7 +1675,8 @@ func (idb *ImageDB) SaveImageCacheByRoot(rootPath string, entries []ImageCacheEn
 					isVideo = 1
 				}
 				if _, err2 := tx.Exec(stmt, e.ID, e.Path, e.Name, e.Size, e.LastModified,
-					e.CreatedAt, e.Folder, e.RootPath, e.Width, e.Height, isVideo, e.ContentHash); err2 != nil {
+					e.CreatedAt, e.Folder, e.RootPath, e.Width, e.Height, isVideo, e.ContentHash,
+					e.DurationMS, e.MediaInfoJSON); err2 != nil {
 					err = err2
 					break
 				}
@@ -2257,4 +2278,38 @@ func (idb *ImageDB) LoadDuplicatesByContentHash() (map[string][]string, error) {
 		}
 	}
 	return dups, nil
+}
+
+// GetMediaInfoRow 读取单条记录的媒体技术信息（duration_ms / media_info_json）。
+// 专用于详情页按需查询，避免给高频列表查询增加列。
+func (idb *ImageDB) GetMediaInfoRow(id string) (int64, string, bool) {
+	var dur int64
+	var info string
+	err := idb.db.QueryRow(`SELECT duration_ms, media_info_json FROM image_cache WHERE id=?`, id).
+		Scan(&dur, &info)
+	if err != nil {
+		return 0, "", false
+	}
+	return dur, info, true
+}
+
+// UpdateMediaInfoRow 写回媒体技术信息（ffprobe 按需增强时调用）。
+func (idb *ImageDB) UpdateMediaInfoRow(id string, durationMS int64, infoJSON string) error {
+	idb.mu.Lock()
+	defer idb.mu.Unlock()
+	_, err := idb.db.Exec(`UPDATE image_cache SET
+		duration_ms=CASE WHEN ? > 0 THEN ? ELSE duration_ms END,
+		media_info_json=CASE WHEN ? != '' THEN ? ELSE media_info_json END
+		WHERE id=?`,
+		durationMS, durationMS, infoJSON, infoJSON, id)
+	return err
+}
+
+// GetImagePathForID 按记录 id 取文件路径（媒体信息按需探测用）。
+func (idb *ImageDB) GetImagePathForID(id string) string {
+	var p string
+	if err := idb.db.QueryRow(`SELECT path FROM image_cache WHERE id=?`, id).Scan(&p); err != nil {
+		return ""
+	}
+	return p
 }

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"local-gallery/internal/database"
+	"local-gallery/internal/mediatools"
 
 	"github.com/davidbyttow/govips/v2/vips"
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
@@ -353,12 +354,21 @@ func (a *App) generateThumbnail(srcPath string, imageID string) error {
 	}
 	phase = time.Now()
 
-	// 视频文件：存储黑色占位 JPEG（无需帧提取）
+	// 视频/音频文件：视频优先 ffmpeg 抽帧生成真实缩略图（未安装降级黑占位）；
+	// 音频用占位卡片。永不报错中断（ffmpeg 纯增强契约）。
 	if isVideoFile(filepath.Base(srcPath)) {
-		placeholder := createVideoPlaceholderJPEG()
+		jpegBytes := generateVideoThumbnailBytes(srcPath)
 		return a.thumbDB.Batch(func(tx *bbolt.Tx) error {
 			b := tx.Bucket(thumbBucket)
-			return b.Put([]byte(imageID), placeholder)
+			return b.Put([]byte(imageID), jpegBytes)
+		})
+	}
+	if isAudioFile(filepath.Base(srcPath)) {
+		// ★ 音频绝不能进 vips：isImageByMagic 对 mp3 的 ID3 头会"无法确认→放行"，
+		//   而 libvips 解码 mp3 会触发 glib abort → 整个进程 0xc0000409 崩溃。
+		return a.thumbDB.Batch(func(tx *bbolt.Tx) error {
+			b := tx.Bucket(thumbBucket)
+			return b.Put([]byte(imageID), createAudioPlaceholderJPEG())
 		})
 	}
 
@@ -442,10 +452,16 @@ func (a *App) generateThumbnailDirect(srcPath string, imageID string) error {
 		return fmt.Errorf("文件为空: %s", srcPath)
 	}
 	if isVideoFile(filepath.Base(srcPath)) {
-		placeholder := createVideoPlaceholderJPEG()
+		jpegBytes := generateVideoThumbnailBytes(srcPath)
 		return a.thumbDB.Batch(func(tx *bbolt.Tx) error {
 			b := tx.Bucket(thumbBucket)
-			return b.Put([]byte(imageID), placeholder)
+			return b.Put([]byte(imageID), jpegBytes)
+		})
+	}
+	if isAudioFile(filepath.Base(srcPath)) {
+		return a.thumbDB.Batch(func(tx *bbolt.Tx) error {
+			b := tx.Bucket(thumbBucket)
+			return b.Put([]byte(imageID), createAudioPlaceholderJPEG())
 		})
 	}
 	if !isImageByMagic(srcPath) {
@@ -486,6 +502,19 @@ func generateThumbnailBytes(srcPath string, maxSize, quality int) ([]byte, error
 		return nil, fmt.Errorf("vips 导出 JPEG 失败: %w", err)
 	}
 	return jpegBytes, nil
+}
+
+// generateVideoThumbnailBytes 视频缩略图：ffmpeg 可用则抽 1 帧真实画面，
+// 否则（或抽帧失败）降级为黑色占位 JPEG —— 与"ffmpeg 纯增强"契约一致，永不报错中断。
+// 调用方（generateThumbnail / generateThumbnailDirect）已在 thumbSem / worker 池并发预算内。
+func generateVideoThumbnailBytes(srcPath string) []byte {
+	if tools := mediatools.Detect(); tools.FFmpegFound {
+		if frame, err := mediatools.ExtractVideoFrame(tools, srcPath, thumbMaxSize, 4); err == nil && len(frame) > 0 {
+			return frame
+		}
+		// 抽帧失败（损坏/怪异编码/超时）不重试风暴，直接占位
+	}
+	return createVideoPlaceholderJPEG()
 }
 
 // isImageByMagic 读文件头魔数判断是否为已知图片格式
@@ -536,9 +565,16 @@ func isImageByMagic(filePath string) bool {
 	if header[0] == '<' {
 		return true
 	} // SVG/XML
-	if n >= 8 && header[4] == 0x66 && header[5] == 0x74 && header[6] == 0x79 && header[7] == 0x70 {
-		return true
-	} // HEIC/AVIF
+	if n >= 12 && header[4] == 0x66 && header[5] == 0x74 && header[6] == 0x79 && header[7] == 0x70 {
+		// ISO-BMFF：按 major brand 区分——图片品牌(HEIC/AVIF)放行，mp4/m4a 等拦截
+		brand := string(header[8:12])
+		switch brand {
+		case "heic", "heix", "avif", "avis", "hevc", "hevx", "mif1", "msf1":
+			return true
+		default:
+			return false
+		}
+	} // HEIC/AVIF 放行；MP4/MOV/M4A 拦截（进 vips 会 abort）
 
 	// 已知非图片魔数 → 拦截（伪装扩展名的损坏文件）
 	// TGA: 文件尾有 TRUEVISION 或开头并非 JPEG
@@ -570,6 +606,20 @@ func isImageByMagic(filePath string) bool {
 	if header[0] == 0x1F && header[1] == 0x8B {
 		return false
 	}
+	// 音频/视频容器（防止误入 libvips 触发 abort）：
+	// MP3(ID3) / MP3裸帧 / OGG / FLAC / MP4/MOV/M4A(ftyp 已在上面被当 HEIC 放行，这里区分)
+	if header[0] == 0x49 && header[1] == 0x44 && header[2] == 0x33 {
+		return false
+	} // ID3
+	if header[0] == 0xFF && header[1] == 0xFB || header[0] == 0xFF && header[1] == 0xF3 || header[0] == 0xFF && header[1] == 0xF2 {
+		return false
+	} // MPEG audio frame
+	if header[0] == 0x4F && header[1] == 0x67 && header[2] == 0x67 && header[3] == 0x53 {
+		return false
+	} // OggS
+	if header[0] == 0x66 && header[1] == 0x4C && header[2] == 0x61 && header[3] == 0x43 {
+		return false
+	} // fLaC
 
 	// 无法确认 → 信任扩展名放行（相机 RAW/CR2/NEF/ORF 等无法通过魔数确认）
 	return true
@@ -1038,7 +1088,8 @@ func (a *App) runPreGen(folder string, entries []*ImageEntry) {
 					}
 				}
 
-				// 跳过已有缓存
+				// 跳过已有缓存。例外：视频此前在无 ffmpeg 时只生成了黑色占位图，
+				// ffmpeg 现已可用则识别占位图并重抽真帧（一次性升级）。
 				if a.thumbDB != nil {
 					hasCache := false
 					a.thumbDB.View(func(tx *bbolt.Tx) error {
@@ -1047,6 +1098,9 @@ func (a *App) runPreGen(folder string, entries []*ImageEntry) {
 						}
 						return nil
 					})
+					if hasCache && a.thumbIsUpgradableVideoPlaceholder(entry) {
+						hasCache = false
+					}
 					if hasCache {
 						preGenStatusMu.Lock()
 						preGenStatus.Skipped++
@@ -1833,7 +1887,7 @@ func (a *App) incrementThumbCount(imageID string) {
 				ID: e.ID, Path: e.Path, Name: e.Name, Size: e.Size,
 				LastModified: e.LastModified, CreatedAt: e.CreatedAt,
 				Folder: e.Folder, RootPath: e.RootPath,
-				Width: e.Width, Height: e.Height, IsVideo: e.IsVideo,
+				Width: e.Width, Height: e.Height, IsVideo: e.IsVideo, IsAudio: isAudioFile(e.Path),
 				URL: fmt.Sprintf("/image/%s", e.ID),
 			}
 		}
@@ -2508,6 +2562,42 @@ func formatThumbSize(bytes int64) string {
 		return fmt.Sprintf("%.1f KB", float64(bytes)/1024)
 	}
 	return fmt.Sprintf("%.1f MB", float64(bytes)/(1024*1024))
+}
+
+// thumbIsUpgradableVideoPlaceholder 判断某视频的缩略图是否为旧黑色占位图且
+// 当前 ffmpeg 可用（可升级为真帧）。占位图字节与固定输出精确比对，开销极小。
+func (a *App) thumbIsUpgradableVideoPlaceholder(entry *ImageEntry) bool {
+	if !isVideoFile(entry.Path) {
+		return false // 音频永远是占位卡片，无需升级
+	}
+	tools := mediatools.Detect()
+	if !tools.FFmpegFound {
+		return false // 无 ffmpeg 时重生成仍是占位，徒劳浪费 IO
+	}
+	placeholder := createVideoPlaceholderJPEG()
+	var current []byte
+	if a.thumbDB != nil {
+		a.thumbDB.View(func(tx *bbolt.Tx) error {
+			if b := tx.Bucket(thumbBucket); b != nil {
+				current = b.Get([]byte(entry.ID))
+			}
+			return nil
+		})
+	}
+	return current != nil && string(current) == string(placeholder)
+}
+
+// createAudioPlaceholderJPEG 生成音频占位缩略图（深蓝背景 JPEG，与视频黑占位区分）
+func createAudioPlaceholderJPEG() []byte {
+	img := image.NewRGBA(image.Rect(0, 0, 500, 500))
+	for y := 0; y < 500; y++ {
+		for x := 0; x < 500; x++ {
+			img.Set(x, y, color.RGBA{20, 26, 38, 255})
+		}
+	}
+	var buf bytes.Buffer
+	jpeg.Encode(&buf, img, &jpeg.Options{Quality: 60})
+	return buf.Bytes()
 }
 
 // createVideoPlaceholderJPEG 生成视频占位缩略图（深色背景 JPEG）

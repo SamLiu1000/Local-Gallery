@@ -82,6 +82,10 @@ export function GetLANConfig():Promise<Record<string, any>>;
 
 export function GetLANInfo():Promise<Record<string, any>>;
 
+export function GetMediaInfo(arg1:string):Promise<Record<string, any>>;
+
+export function GetMediaToolsStatus():Promise<Record<string, any>>;
+
 export function GetParamTags(arg1:boolean):Promise<main.ParamTagsResponse>;
 
 export function GetPreGenStatus():Promise<main.PreGenStatus>;
@@ -140,6 +144,8 @@ export function PreloadThumbCounts():Promise<void>;
 
 export function ProxyRequest(arg1:main.ProxyRequestArgs):Promise<Record<string, any>>;
 
+export function RedetectMediaTools():Promise<Record<string, any>>;
+
 export function Refresh():Promise<main.ScanResult>;
 
 export function RefreshAll():Promise<Record<string, any>>;
@@ -185,6 +191,8 @@ export function SetContext(arg1:context.Context):Promise<void>;
 export function SetFavorite(arg1:string,arg2:boolean):Promise<Record<string, any>>;
 
 export function SetLANConfig(arg1:boolean,arg2:number):Promise<Record<string, any>>;
+
+export function SetMediaToolsPath(arg1:string):Promise<Record<string, any>>;
 
 export function SetSidebarSetting(arg1:string,arg2:string):Promise<Record<string, any>>;
 

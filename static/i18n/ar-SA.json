@@ -659,5 +659,13 @@
   "status.bgop.scan": "جارٍ الفحص والاستيراد…",
   "status.bgop.pregen": "إنشاء المصغرات مسبقًا {done}/{total}",
   "inertia.power": "قوة الانزلاق (0-100)",
-  "inertia.power_hint": "دفع كل نقرة عجلة والسرعة القصوى؛ الأعلى ينزلق أبعد."
+  "inertia.power_hint": "دفع كل نقرة عجلة والسرعة القصوى؛ الأعلى ينزلق أبعد.",
+  "settings.media_tools": "مكونات الوسائط (ffmpeg)",
+  "settings.media_tools_hint": "مكون إضافي اختياري. بدونه، تكون الصور المصغرة للفيديو عبارة عن صورة سوداء بديلة؛ ولا تتأثر الميزات الأخرى",
+  "settings.media_tools_ready": "الميزات المحسّنة مُفعّلة",
+  "settings.media_tools_missing": "لم يتم العثور على ffmpeg (الميزات المحسّنة معطلة)",
+  "settings.media_tools_path_ph": "المجلد الذي يحتوي على ffmpeg (اختياري، اتركه فارغًا للكشف التلقائي)",
+  "settings.redetect": "إعادة الكشف",
+  "detail.audio_unsupported": "لا يمكن تشغيل تنسيق الصوت هذا في البيئة الحالية",
+  "detail.media_info": "معلومات الوسائط"
 }

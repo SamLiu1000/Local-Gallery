@@ -662,5 +662,13 @@
   "inertia.power": "Glide power (0-100)",
   "inertia.power_hint": "Impulse per wheel notch and top speed; higher glides farther.",
   "inertia.analog": "Analog scrolling (continuous rate)",
-  "inertia.analog_hint": "Scroll speed follows wheel speed continuously: flick fast to glide, roll slow to crawl — no per-notch steps. A single notch after a pause scrolls exactly one step."
+  "inertia.analog_hint": "Scroll speed follows wheel speed continuously: flick fast to glide, roll slow to crawl — no per-notch steps. A single notch after a pause scrolls exactly one step.",
+  "settings.media_tools": "Media Components (ffmpeg)",
+  "settings.media_tools_hint": "Optional enhancement. Without it, video thumbnails use a black placeholder; other features are unaffected",
+  "settings.media_tools_ready": "Enhanced capabilities enabled",
+  "settings.media_tools_missing": "ffmpeg not detected (enhancements disabled)",
+  "settings.media_tools_path_ph": "Directory containing ffmpeg (optional, auto-detected if empty)",
+  "settings.redetect": "Re-detect",
+  "detail.audio_unsupported": "This audio format cannot be played in the current environment",
+  "detail.media_info": "Media Info"
 }

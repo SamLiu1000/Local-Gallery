@@ -659,5 +659,13 @@
   "status.bgop.scan": "Analyse et importation…",
   "status.bgop.pregen": "Pré-génération des miniatures {done}/{total}",
   "inertia.power": "Puissance de glisse (0-100)",
-  "inertia.power_hint": "Impulsion par cran de molette et vitesse max ; plus haut = glisse plus loin."
+  "inertia.power_hint": "Impulsion par cran de molette et vitesse max ; plus haut = glisse plus loin.",
+  "settings.media_tools": "Composants multimédias (ffmpeg)",
+  "settings.media_tools_hint": "Amélioration optionnelle. Sans lui, les vignettes vidéo utilisent un espace réservé noir ; les autres fonctions ne sont pas affectées",
+  "settings.media_tools_ready": "Fonctions améliorées activées",
+  "settings.media_tools_missing": "ffmpeg non détecté (améliorations désactivées)",
+  "settings.media_tools_path_ph": "Dossier contenant ffmpeg (facultatif, vide = détection auto)",
+  "settings.redetect": "Redétecter",
+  "detail.audio_unsupported": "Ce format audio ne peut pas être lu dans l'environnement actuel",
+  "detail.media_info": "Infos média"
 }

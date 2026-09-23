@@ -31,6 +31,8 @@ func getMIMEType(ext string) string {
 		".gif": "image/gif", ".svg": "image/svg+xml", ".ico": "image/x-icon",
 		".webp": "image/webp", ".bmp": "image/bmp", ".avif": "image/avif",
 		".mp4": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska",
+		".mp3": "audio/mpeg", ".wav": "audio/wav", ".flac": "audio/flac",
+		".ogg": "audio/ogg", ".m4a": "audio/mp4", ".opus": "audio/ogg",
 	}
 	if mime, ok := mimeTypes[strings.ToLower(ext)]; ok {
 		return mime
@@ -67,8 +69,24 @@ func isVideoFile(name string) bool {
 	return videoExts[ext]
 }
 
+// isAudioFile 音频文件（AI 音乐生成产物以 mp3 为主，兼容常见无损/流格式）
+func isAudioFile(name string) bool {
+	ext := ""
+	for i := len(name) - 1; i >= 0; i-- {
+		if name[i] == '.' {
+			ext = strings.ToLower(name[i:])
+			break
+		}
+	}
+	audioExts := map[string]bool{
+		".mp3": true, ".wav": true, ".flac": true,
+		".ogg": true, ".m4a": true, ".opus": true,
+	}
+	return audioExts[ext]
+}
+
 func isMediaFile(name string) bool {
-	return isImageFile(name) || isVideoFile(name)
+	return isImageFile(name) || isVideoFile(name) || isAudioFile(name)
 }
 
 func generateStableID(filePath string, fileSize int64, fileModified int64) string {
@@ -550,6 +568,12 @@ func extractComfyMetadata(jsonData map[string]interface{}) map[string]interface{
 				}
 			}
 
+		case "MiniMaxMusic3TextEncode":
+			// AI 音乐（MiniMax Music 3 等）：caption 即结构化正向提示词
+			if text, _ := inputs["caption"].(string); text != "" && positiveText == "" {
+				positiveText = text
+			}
+
 		case "KSampler", "KSamplerAdvanced":
 			if v, ok := inputs["steps"]; ok {
 				rawParams["Steps"] = formatIntParam(v)
@@ -568,6 +592,21 @@ func extractComfyMetadata(jsonData map[string]interface{}) map[string]interface{
 			}
 			if v, ok := inputs["distilled_cfg"]; ok {
 				rawParams["Distilled CFG Scale"] = fmt.Sprintf("%v", v)
+			}
+
+		case "EmptyMiniMaxMusic3LatentAudio", "EmptyLatentAudio":
+			if v, ok := inputs["seconds"]; ok {
+				rawParams["Duration"] = fmt.Sprintf("%v", v)
+			}
+
+		case "SeedNode":
+			if v, ok := inputs["seed"]; ok {
+				rawParams["Seed"] = formatIntParam(v)
+			}
+
+		case "UNETLoader":
+			if v, ok := inputs["unet_name"]; ok {
+				rawParams["Model"] = filepathBase(fmt.Sprintf("%v", v))
 			}
 
 		case "EmptyLatentImage":

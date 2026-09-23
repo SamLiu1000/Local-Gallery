@@ -255,6 +255,7 @@ export namespace main {
 	    width: number;
 	    height: number;
 	    isVideo: boolean;
+	    isAudio: boolean;
 	
 	    static createFrom(source: any = {}) {
 	        return new SafeImage(source);
@@ -275,6 +276,7 @@ export namespace main {
 	        this.width = source["width"];
 	        this.height = source["height"];
 	        this.isVideo = source["isVideo"];
+	        this.isAudio = source["isAudio"];
 	    }
 	}
 	export class FolderDiffResult {

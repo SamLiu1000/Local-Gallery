@@ -662,5 +662,13 @@
   "inertia.power": "滑行力度 (0-100)",
   "inertia.power_hint": "每格滚轮的冲量与最高速度；越高滑得越远。点击惯性按钮右侧的齿轮可随时微调。",
   "inertia.analog": "无级滚动（连续速率模式）",
-  "inertia.analog_hint": "根据滚轮转速连续调节滚动速度：快甩快滑、慢滚慢移，不再逐格跳变；停顿后的单格滚动为精确步进。"
+  "inertia.analog_hint": "根据滚轮转速连续调节滚动速度：快甩快滑、慢滚慢移，不再逐格跳变；停顿后的单格滚动为精确步进。",
+  "settings.media_tools": "媒体组件 (ffmpeg)",
+  "settings.media_tools_hint": "可选增强组件。未安装时视频缩略图为黑色占位图，其余功能不受影响",
+  "settings.media_tools_ready": "已启用增强能力",
+  "settings.media_tools_missing": "未检测到 ffmpeg（增强功能未启用）",
+  "settings.media_tools_path_ph": "ffmpeg 所在目录（可选，留空自动探测）",
+  "settings.redetect": "重新检测",
+  "detail.audio_unsupported": "当前环境不支持播放该音频格式",
+  "detail.media_info": "媒体信息"
 }

@@ -160,6 +160,7 @@ func NewApp(userDataDir, defaultUserDataDir string) *App {
 	logStartupf("NewApp: 步骤 loadUserData 完成（%s）", time.Since(stepT0).Round(time.Millisecond))
 	stepT0 = time.Now()
 	app.loadThumbSettings()     // 恢复缩略图并发数与缩放算法设置
+	app.loadMediaToolsSettings() // 恢复用户配置的 ffmpeg 路径并后台预检测
 	logStartupf("NewApp: 步骤 loadThumbSettings 完成（%s）", time.Since(stepT0).Round(time.Millisecond))
 	stepT0 = time.Now()
 	app.loadThumbCountsFromDisk() // ★ 冷启动恢复上次的 thumbCounts，跳过 8.6GB 缩略图库重算
@@ -982,7 +983,7 @@ func (a *App) DebugScanRoot(rootPath string) *DebugScanResult {
 			return nil
 		}
 		res.DiskTotalFiles++
-		if isImageFile(fi.Name()) || isVideoFile(fi.Name()) {
+		if isMediaFile(fi.Name()) {
 			res.DiskImageFiles++
 			diskImageSet[p] = true
 		}
@@ -1065,7 +1066,7 @@ func (a *App) DebugAppState() map[string]interface{} {
 			if err != nil {
 				return filepath.SkipDir
 			}
-			if !fi.IsDir() && (isImageFile(fi.Name()) || isVideoFile(fi.Name())) {
+			if !fi.IsDir() && (isMediaFile(fi.Name())) {
 				diskCount++
 			}
 			return nil
@@ -1109,7 +1110,7 @@ func (a *App) DebugAppState() map[string]interface{} {
 					if err != nil {
 						return filepath.SkipDir
 					}
-					if !fi.IsDir() && (isImageFile(fi.Name()) || isVideoFile(fi.Name())) {
+					if !fi.IsDir() && (isMediaFile(fi.Name())) {
 						diskSubCount++
 					}
 					return nil
@@ -1294,7 +1295,7 @@ func (a *App) FullRescanFolder(rootPath string) (result *ScanResult) {
 		syncBudget := dimSyncBudgetPerPage
 		for i, e := range entries {
 			w, h := e.Width, e.Height
-			needBackfill := !e.IsVideo && (w == 0 || h == 0)
+			needBackfill := !e.IsVideo && !isAudioFile(e.Path) && (w == 0 || h == 0)
 			if needBackfill && syncBudget > 0 {
 				// ★ 尺寸按需优先：与缩略图一样"当前页面优先"——头部快路径 <1ms/张，
 				//   首屏直接返回真实宽高，瀑布流第一屏就是正确的（不再显示占位比例）。
@@ -1321,6 +1322,7 @@ func (a *App) FullRescanFolder(rootPath string) (result *ScanResult) {
 					Width:        w,
 					Height:       h,
 					IsVideo:      e.IsVideo,
+					IsAudio:      isAudioFile(e.Path),
 				}
 				if needBackfill {
 					dimBackfill = append(dimBackfill, toImageEntry(e))
@@ -1392,7 +1394,7 @@ func (a *App) FullRescanFolder(rootPath string) (result *ScanResult) {
 		for i, e := range entries {
 			entry := toImageEntry(e)
 			w, h := entry.Width, entry.Height
-			needBackfill := !entry.IsVideo && (w == 0 || h == 0)
+			needBackfill := !entry.IsVideo && !isAudioFile(entry.Path) && (w == 0 || h == 0)
 			if needBackfill && syncBudget > 0 {
 				// ★ 尺寸按需优先（同 folder 分支）：首屏页内快路径同步补齐
 				if sw, sh := fastImageDimensions(entry.Path); sw > 0 && sh > 0 {
@@ -1419,6 +1421,7 @@ func (a *App) FullRescanFolder(rootPath string) (result *ScanResult) {
 				Width:        w,
 				Height:       h,
 				IsVideo:      entry.IsVideo,
+				IsAudio:      isAudioFile(entry.Path),
 			}
 		}
 		a.writeDimsAsync(dimUpdates)
@@ -1467,7 +1470,7 @@ func (a *App) GetImagesByPaths(paths []string, offset int, limit int, sortOrder 
 	syncBudget := dimSyncBudgetPerPage
 	for i, entry := range paged {
 		w, h := entry.Width, entry.Height
-		needBackfill := !entry.IsVideo && (w == 0 || h == 0)
+		needBackfill := !entry.IsVideo && !isAudioFile(entry.Path) && (w == 0 || h == 0)
 		if needBackfill && syncBudget > 0 {
 			// ★ 尺寸按需优先（同 GetImages）：页内快路径同步补齐
 			if sw, sh := fastImageDimensions(entry.Path); sw > 0 && sh > 0 {
@@ -1494,6 +1497,7 @@ func (a *App) GetImagesByPaths(paths []string, offset int, limit int, sortOrder 
 			Width:        w,
 			Height:       h,
 			IsVideo:      entry.IsVideo,
+			IsAudio:      isAudioFile(entry.Path),
 		}
 	}
 	a.writeDimsAsync(dimUpdates)
@@ -1814,7 +1818,7 @@ func (a *App) GetImageFile(imageID string) *FileData {
 				ID: e.ID, Path: e.Path, Name: e.Name, Size: e.Size,
 				LastModified: e.LastModified, CreatedAt: e.CreatedAt,
 				Folder: e.Folder, RootPath: e.RootPath,
-				Width: e.Width, Height: e.Height, IsVideo: e.IsVideo,
+				Width: e.Width, Height: e.Height, IsVideo: e.IsVideo, IsAudio: isAudioFile(e.Path),
 				URL: fmt.Sprintf("/image/%s", e.ID),
 			}
 		}

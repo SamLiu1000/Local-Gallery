@@ -659,5 +659,13 @@
   "status.bgop.scan": "スキャンと読み込み中…",
   "status.bgop.pregen": "サムネイルを事前生成中 {done}/{total}",
   "inertia.power": "滑走力 (0-100)",
-  "inertia.power_hint": "ホイール1目盛りの推進力と最高速度。高いほど長く滑ります。"
+  "inertia.power_hint": "ホイール1目盛りの推進力と最高速度。高いほど長く滑ります。",
+  "settings.media_tools": "メディアコンポーネント (ffmpeg)",
+  "settings.media_tools_hint": "任意の拡張コンポーネント。未インストールでも動画サムネイルが黒いプレースホルダーになるだけで他の機能には影響しません",
+  "settings.media_tools_ready": "拡張機能が有効",
+  "settings.media_tools_missing": "ffmpeg が検出されません（拡張機能は無効）",
+  "settings.media_tools_path_ph": "ffmpeg のあるフォルダー（空欄で自動検出）",
+  "settings.redetect": "再検出",
+  "detail.audio_unsupported": "この環境ではこの音声形式を再生できません",
+  "detail.media_info": "メディア情報"
 }

@@ -5,6 +5,20 @@
 
 // EXIF 字段映射：后端 extractCameraEXIF 写入 raw 时使用固定中文 key，
 // 前端按此表查找数据，再通过 _t(label) 显示当前语言的标签
+// 自动播放：点击即用户手势，直接 play；被策略拦截时退化为静音自动播放。
+// 顶层共享：DetailPanel（信息栏预览）与 ImageViewer（锁定模式大图查看器）都用。
+function autoplayMedia(el) {
+    if (!el) return;
+    const p = el.play();
+    if (p && p.catch) {
+        p.catch(() => {
+            el.muted = true;
+            const p2 = el.play();
+            if (p2 && p2.catch) p2.catch(() => {});
+        });
+    }
+}
+
 const PHOTO_EXIF_FIELDS = [
     { key: '拍摄时间', label: 'detail.photo_capture_time' },
     { key: '相机厂商', label: 'detail.photo_camera_make' },
@@ -354,7 +368,7 @@ const DetailPanel = (() => {
         detailImage.addEventListener('dragstart', (e) => {
             if (!currentImage) return;
             const ext = currentImage.name.split('.').pop().toLowerCase();
-            const mimeMap = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', svg: 'image/svg+xml', mp4: 'video/mp4', webm: 'video/webm', mkv: 'video/x-matroska' };
+            const mimeMap = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', svg: 'image/svg+xml', mp4: 'video/mp4', webm: 'video/webm', mkv: 'video/x-matroska', mp3: 'audio/mpeg', wav: 'audio/wav', flac: 'audio/flac', ogg: 'audio/ogg', m4a: 'audio/mp4', opus: 'audio/ogg' };
             const mime = mimeMap[ext] || 'image/png';
             e.dataTransfer.setData('DownloadURL', mime + ':' + currentImage.name + ':' + currentImage.url);
             e.dataTransfer.setData('text/uri-list', currentImage.url);
@@ -527,11 +541,32 @@ const DetailPanel = (() => {
         detailPlaceholder.style.display = 'none';
         detailInfo.style.display = 'block';
 
-        // 大图预览：视频使用 <video>，图片使用 <img>
-        const existingVideo = detailPreview.querySelector('video');
-        if (existingVideo) existingVideo.remove();
+        // 大图预览：视频使用 <video>，图片使用 <img>，音频使用 <audio>
+        // ★ 单一媒体源：查看器打开期间，信息栏不建媒体预览、不播放
+        //  （播放权归查看器）；面板开始播放时也必须已停掉查看器媒体。
+        stopPreviewMedia();
+        const viewerActive = (typeof ImageViewer !== 'undefined' && ImageViewer.isOpen && ImageViewer.isOpen());
 
-        if (imgData.isVideo) {
+        if (viewerActive && (imgData.isVideo || imgData.isAudio)) {
+            // 查看器正在展示该媒体：面板只填信息，不重复播放
+        } else if (imgData.isAudio) {
+            // 音频：不展示大图（缩略图是深蓝占位卡片），用 <audio> 控件预览
+            detailImage.style.display = 'none';
+            const audioEl = document.createElement('audio');
+            audioEl.src = imgData.url;
+            audioEl.controls = true;
+            audioEl.style.width = '100%';
+            audioEl.style.marginTop = '8px';
+            audioEl.preload = 'metadata';
+            audioEl.onerror = function() {
+                console.warn('[Detail] 音频无法播放:', imgData.name);
+                App.showToast(_t('detail.audio_unsupported'), 'warning');
+                audioEl.remove();
+                detailImage.style.display = '';
+            };
+            detailPreview.appendChild(audioEl);
+            autoplayMedia(audioEl);
+        } else if (imgData.isVideo) {
             detailImage.style.display = 'none';
             const videoEl = document.createElement('video');
             videoEl.src = imgData.url;
@@ -548,6 +583,7 @@ const DetailPanel = (() => {
                 detailImage.style.display = '';
             };
             detailPreview.appendChild(videoEl);
+            autoplayMedia(videoEl);
         } else {
             detailImage.style.display = '';
             detailImage.src = imgData.url;
@@ -605,12 +641,23 @@ const DetailPanel = (() => {
         }
     }
 
+    // 停掉并移除信息栏预览中的视频/音频（查看器开始播放时调用，保证单一媒体源）
+    function stopPreviewMedia() {
+        if (!detailPreview) return;
+        const media = detailPreview.querySelectorAll('video, audio');
+        media.forEach(el => { try { el.pause(); } catch (e) {} el.remove(); });
+    }
+
     function hideImage() {
         currentImage = null;
         currentSearchKeywords = [];
         detailPlaceholder.style.display = 'block';
         detailInfo.style.display = 'none';
         detailImage.src = '';
+        {
+            const audioEl = document.querySelector('#detailPreview audio');
+            if (audioEl) { audioEl.pause(); audioEl.remove(); }
+        }
         isRawMetadataVisible = false;
         if (rawMetadataPanel) rawMetadataPanel.classList.add('hidden');
         if (btnToggleRawMetadata) btnToggleRawMetadata.textContent = _t("detail.metadata");
@@ -652,7 +699,47 @@ const DetailPanel = (() => {
             <div class="info-item"><span class="info-key">${_t('detail.file_size')}</span><br><span class="info-val">${sizeDisplay}</span></div>
             <div class="info-item"><span class="info-key">${_t('detail.created_time')}</span><br><span class="info-val">${createdAt}</span></div>
             <div class="info-item"><span class="info-key">${_t('detail.modified_date')}</span><br><span class="info-val">${modifiedAt}</span></div>
+            <div class="info-item" id="mediaInfoItem" style="display: none;"><span class="info-key">${_t('detail.media_info')}</span><br><span class="info-val" id="mediaInfoVal"></span></div>
         `;
+
+        // 视频/音频：按需加载时长与编码信息（duration 来自扫描期纯 Go 解析或 ffprobe 增强）
+        if (imgData.isVideo || imgData.isAudio) {
+            loadMediaInfo(imgData);
+        }
+    }
+
+    async function loadMediaInfo(imgData) {
+        const item = document.getElementById('mediaInfoItem');
+        const val = document.getElementById('mediaInfoVal');
+        if (!item || !val) return;
+        try {
+            const result = await WailsBridge.getMediaInfo(imgData.id);
+            if (!result || !result.found) return;
+            const parts = [];
+            if (result.durationMs > 0) {
+                const sec = Math.round(result.durationMs / 100) / 10;
+                if (sec >= 60) {
+                    const m = Math.floor(sec / 60);
+                    parts.push(`${m}:${String(Math.round(sec % 60)).padStart(2, '0')}`);
+                } else {
+                    parts.push(`${sec}s`);
+                }
+            }
+            if (result.infoJson) {
+                try {
+                    const info = JSON.parse(result.infoJson);
+                    const codecs = [info.videoCodec, info.audioCodec].filter(Boolean).join(' / ');
+                    if (codecs) parts.push(codecs);
+                    if (info.width && info.height) parts.push(`${info.width}×${info.height}`);
+                    if (info.sampleRate) parts.push(`${(info.sampleRate / 1000).toFixed(1)}kHz`);
+                    if (info.bitRate) parts.push(`${Math.round(info.bitRate / 1000)}kbps`);
+                } catch (e) { /* 忽略解析失败 */ }
+            }
+            if (parts.length > 0) {
+                val.textContent = parts.join(' · ');
+                item.style.display = '';
+            }
+        } catch (e) { /* 静默：媒体信息是纯增强 */ }
     }
 
     // ==================== 提示词版本管理 ====================
@@ -1762,6 +1849,8 @@ const DetailPanel = (() => {
         setLocked,
         getLocked,
         getCurrentImage: () => currentImage,
+        // ★ 跨面互停：停掉信息栏预览中正在播放的媒体
+        stopPreviewMedia,
         refreshDetailApiConfigSelect,
         // ★ 语言切换：刷新当前图片的详情（参数/元数据）+ 静态翻译由全局 scanDOM 处理
         refreshI18n: () => {
@@ -1793,6 +1882,7 @@ const ImageViewer = (() => {
     let overlay, wrapper, img, closeBtn, prevBtn, nextBtn;
     let filenameEl, positionEl, zoomLevelEl;
     let videoEl = null;
+    let audioViewerEl = null;
     let scale = 1;
     let rotation = 0;
     let isDragging = false;
@@ -2430,8 +2520,12 @@ async function toggleFullscreen() {
         updatePosition();
         updateNavButtons();
 
+        // ★ 互斥三分支：video / audio / image。
+        // 此前音频分支执行后图片分支仍会继续，把 mp3 塞进 <img> 触发
+        // 0×0 缩放计算，是点击音乐导致程序崩溃的根因。
         if (imgData.isVideo) {
-            // 隐藏图片，显示视频
+            hideViewerMedia();
+            // 隐藏图片，显示视频并自动播放
             img.style.visibility = 'hidden';
             img.style.display = 'none';
             if (!videoEl) {
@@ -2454,15 +2548,37 @@ async function toggleFullscreen() {
             }
             videoEl.style.display = '';
             videoEl.src = imgData.url || '';
+            autoplayMedia(videoEl);
             scale = 1;
             applyTransform();
             img.style.cursor = 'default';
-        } else {
-            // 显示图片，隐藏视频
-            if (videoEl) {
-                videoEl.pause();
-                videoEl.style.display = 'none';
+        } else if (imgData.isAudio) {
+            hideViewerMedia();
+            // 音频：隐藏图片，居中放 <audio> 控件并自动播放
+            img.style.visibility = 'hidden';
+            img.style.display = 'none';
+            if (!audioViewerEl) {
+                audioViewerEl = document.createElement('audio');
+                audioViewerEl.controls = true;
+                audioViewerEl.style.position = 'absolute';
+                audioViewerEl.style.width = 'min(480px, 80%)';
+                audioViewerEl.style.top = '50%';
+                audioViewerEl.style.left = '50%';
+                audioViewerEl.style.transform = 'translate(-50%, -50%)';
+                audioViewerEl.preload = 'auto';
+                audioViewerEl.onerror = function() {
+                    console.warn('[Viewer] 音频无法播放');
+                    audioViewerEl.style.display = 'none';
+                };
+                wrapper.appendChild(audioViewerEl);
             }
+            audioViewerEl.style.display = '';
+            audioViewerEl.src = imgData.url || '';
+            autoplayMedia(audioViewerEl);
+            img.style.cursor = 'default';
+        } else {
+            // 显示图片，隐藏视频/音频
+            hideViewerMedia();
             img.style.display = '';
             img.style.visibility = 'hidden';
 
@@ -2477,6 +2593,19 @@ async function toggleFullscreen() {
         }
     }
 
+    // 停掉并隐藏查看器中的视频/音频（分支切换时调用）
+    function hideViewerMedia() {
+        if (videoEl) {
+            videoEl.pause();
+            videoEl.style.display = 'none';
+        }
+        if (audioViewerEl) {
+            audioViewerEl.pause();
+            audioViewerEl.style.display = 'none';
+        }
+    }
+
+
     function releaseCurrentImage() {
         if (img.src && img.src.startsWith('blob:')) {
             URL.revokeObjectURL(img.src);
@@ -2484,6 +2613,10 @@ async function toggleFullscreen() {
         if (videoEl) {
             videoEl.pause();
             videoEl.src = '';
+        }
+        if (audioViewerEl) {
+            audioViewerEl.pause();
+            audioViewerEl.src = '';
         }
     }
 
@@ -2546,6 +2679,10 @@ async function toggleFullscreen() {
         naturalHeight = 0;
 
         overlay.style.display = 'flex';
+        // ★ 单一媒体源：查看器取得播放权，先停掉信息栏预览
+        if (typeof DetailPanel !== 'undefined' && DetailPanel.stopPreviewMedia) {
+            DetailPanel.stopPreviewMedia();
+        }
         loadImage(imgData);
 
         // ★ 移动端：查看器打开时同步填充右侧信息面板（不自动展开抽屉，等用户点"信息"）
@@ -2581,9 +2718,9 @@ async function toggleFullscreen() {
         overlay.style.display = 'none';
         // 释放所有 blob URL 和降采样资源
         releaseCurrentImage();
+        hideViewerMedia();
         img.src = '';
         img.style.display = '';
-        if (videoEl) videoEl.style.display = 'none';
         imageList = [];
         currentIndex = -1;
         currentImgData = null;
@@ -2791,6 +2928,9 @@ async function toggleFullscreen() {
         open,
         close,
         rotate,
-        resetTransform
+        resetTransform,
+        // ★ 跨面互停：查看器是否开着 / 停掉查看器内正在播放的媒体
+        isOpen: () => overlay && overlay.style.display !== 'none',
+        stopMedia: hideViewerMedia
     };
 })();

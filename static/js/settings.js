@@ -132,7 +132,23 @@ const Settings = (() => {
                     </div>
                 </div>
 
-                <!-- 6. 手机/平板访问 (WiFi) -->
+                <!-- 6. 媒体组件 (ffmpeg) -->
+                <div class="settings-section">
+                    <h4>${t("settings.media_tools") || "媒体组件 (ffmpeg)"}</h4>
+                    <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 8px;">${t("settings.media_tools_hint") || "可选增强组件。未安装时视频缩略图为黑色占位图，其余功能不受影响"}</div>
+                    <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px;">
+                        <span id="mediaToolsStatusDot" style="width: 10px; height: 10px; border-radius: 50%; background: var(--text-muted); flex: none;"></span>
+                        <span id="mediaToolsStatusText" style="font-size: 12px; color: var(--text-secondary);">${t("gallery.loading")}</span>
+                    </div>
+                    <div id="mediaToolsVersion" style="font-size: 11px; color: var(--text-muted); margin-bottom: 8px; word-break: break-all;"></div>
+                    <div style="display: flex; gap: 8px; align-items: center;">
+                        <input type="text" id="settingsMediaToolsPath" class="settings-dir-input" style="flex: 1;" placeholder="${t("settings.media_tools_path_ph") || "ffmpeg 所在目录（可选，留空自动探测）"}" />
+                        <button id="settingsSaveMediaPath" class="btn-small">${t("settings.apply")}</button>
+                        <button id="settingsRedetectMedia" class="btn-small"><span class="icon icon-refresh"></span> ${t("settings.redetect") || "重新检测"}</button>
+                    </div>
+                </div>
+
+                <!-- 7. 手机/平板访问 (WiFi) -->
                 <div class="settings-section">
                     <h4>${t("settings.wifi_access") || "WiFi 访问"}</h4>
                     <p style="font-size: 11px; color: var(--text-muted); margin: 0 0 8px 0;">${t("settings.wifi_access_hint") || "开启后，同一 WiFi 下的手机、平板可通过浏览器访问"}</p>
@@ -195,6 +211,9 @@ const Settings = (() => {
         document.getElementById('settingsClearFolderThumbs').addEventListener('click', clearSelectedFolderThumbs);
         document.getElementById('settingsStartLAN').addEventListener('click', startLANServer);
         document.getElementById('settingsStopLAN').addEventListener('click', stopLANServer);
+        document.getElementById('settingsSaveMediaPath').addEventListener('click', saveMediaToolsPath);
+        document.getElementById('settingsRedetectMedia').addEventListener('click', redetectMediaTools);
+        loadMediaToolsStatus();
         // ★ 项目主页链接：点击复制完整 URL
         const githubBtn = document.getElementById('settingsCopyGithub');
         if (githubBtn) {
@@ -534,6 +553,59 @@ const Settings = (() => {
         } catch (e) {
             App.showToast(t('settings.save_failed') + ': ' + e.message, 'error');
         }
+    }
+
+    // ==================== 媒体组件（ffmpeg/ffprobe） ====================
+
+    function renderMediaToolsStatus(status) {
+        const dot = document.getElementById('mediaToolsStatusDot');
+        const text = document.getElementById('mediaToolsStatusText');
+        const version = document.getElementById('mediaToolsVersion');
+        const pathInput = document.getElementById('settingsMediaToolsPath');
+        if (!dot || !text) return;
+        if (status && status.ffmpegFound) {
+            dot.style.background = 'var(--success, #4caf50)';
+            text.textContent = t('settings.media_tools_ready') || '已启用增强能力';
+            version.textContent = status.version || '';
+        } else {
+            dot.style.background = 'var(--text-muted)';
+            text.textContent = t('settings.media_tools_missing') || '未检测到 ffmpeg（增强功能未启用）';
+            version.textContent = '';
+        }
+        if (pathInput && status && status.userPath) pathInput.value = status.userPath;
+    }
+
+    async function loadMediaToolsStatus() {
+        try {
+            const status = await WailsBridge.getMediaToolsStatus();
+            renderMediaToolsStatus(status);
+        } catch (e) {
+            renderMediaToolsStatus(null);
+        }
+    }
+
+    async function saveMediaToolsPath() {
+        const input = document.getElementById('settingsMediaToolsPath');
+        try {
+            const result = await WailsBridge.setMediaToolsPath(input ? input.value.trim() : '');
+            if (result && result.success) {
+                if (result.ffmpegFound) {
+                    App.showToast(t('settings.media_tools_ready') || '已启用增强能力', 'success');
+                } else {
+                    App.showToast(t('settings.media_tools_missing') || '未检测到 ffmpeg', 'warning');
+                }
+            }
+        } catch (e) {
+            App.showToast(t('settings.save_failed') + ': ' + e.message, 'error');
+        }
+        loadMediaToolsStatus();
+    }
+
+    async function redetectMediaTools() {
+        try {
+            await WailsBridge.redetectMediaTools();
+        } catch (e) { /* 静默，状态刷新可见 */ }
+        loadMediaToolsStatus();
     }
 
     // ==================== 按文件夹清除缩略图 ====================

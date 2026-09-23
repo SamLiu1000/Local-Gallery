@@ -986,6 +986,28 @@ const WailsBridge = (() => {
         return getApp().SetThumbKernel(kernel);
     }
 
+    // ==================== 媒体组件（ffmpeg/ffprobe） ====================
+
+    async function getMediaToolsStatus() {
+        if (!isWailsEnv) return { ffmpegFound: false, ffprobeFound: false, enhanced: false, source: 'not_found' };
+        return getApp().GetMediaToolsStatus();
+    }
+
+    async function setMediaToolsPath(p) {
+        if (!isWailsEnv) return { success: false, error: '非Wails环境' };
+        return getApp().SetMediaToolsPath(p);
+    }
+
+    async function redetectMediaTools() {
+        if (!isWailsEnv) return { success: false, error: '非Wails环境' };
+        return getApp().RedetectMediaTools();
+    }
+
+    async function getMediaInfo(id) {
+        if (!isWailsEnv) return { found: false };
+        return getApp().GetMediaInfo(id);
+    }
+
     // ==================== 用户数据目录设置 ====================
 
     async function getUserDataDir() {
@@ -1193,6 +1215,10 @@ const WailsBridge = (() => {
         setThumbConcurrency,
         getThumbKernel,
         setThumbKernel,
+        getMediaToolsStatus,
+        setMediaToolsPath,
+        redetectMediaTools,
+        getMediaInfo,
         getUserDataDir,
         setUserDataDir,
         pauseBackground,

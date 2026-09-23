@@ -659,5 +659,13 @@
   "status.bgop.scan": "Сканирование и импорт…",
   "status.bgop.pregen": "Предварительное создание миниатюр {done}/{total}",
   "inertia.power": "Сила скольжения (0-100)",
-  "inertia.power_hint": "Импульс на щелчок колеса и макс. скорость; выше — дольше скольжение."
+  "inertia.power_hint": "Импульс на щелчок колеса и макс. скорость; выше — дольше скольжение.",
+  "settings.media_tools": "Медиакомпоненты (ffmpeg)",
+  "settings.media_tools_hint": "Необязательное расширение. Без него эскизы видео будут чёрными заглушками; остальные функции не затронуты",
+  "settings.media_tools_ready": "Расширенные функции включены",
+  "settings.media_tools_missing": "ffmpeg не обнаружен (расширения отключены)",
+  "settings.media_tools_path_ph": "Папка с ffmpeg (необязательно, пусто = автоопределение)",
+  "settings.redetect": "Повторить поиск",
+  "detail.audio_unsupported": "Этот аудиоформат не может быть воспроизведён в текущей среде",
+  "detail.media_info": "Сведения о медиа"
 }

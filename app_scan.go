@@ -242,7 +242,7 @@ func (a *App) scanWalkDirBatched(dirPath, rootPath, currentRel string, onBatch f
 			a.scanWalkDirBatched(filepath.Join(dirPath, entry.Name()), rootPath, subRel, onBatch)
 			continue
 		}
-		if !isImageFile(entry.Name()) && !isVideoFile(entry.Name()) {
+		if !isMediaFile(entry.Name()) {
 			continue
 		}
 		fullPath := filepath.Join(dirPath, entry.Name())
@@ -270,6 +270,8 @@ func (a *App) scanWalkDirBatched(dirPath, rootPath, currentRel string, onBatch f
 			Folder:       relFolder,
 			RootPath:     rootPath,
 			IsVideo:      isVideoFile(entry.Name()),
+			IsAudio:      isAudioFile(entry.Name()),
+			DurationMS:   scanDurationMS(fullPath, isVideoFile(entry.Name())),
 		})
 	}
 
@@ -1178,7 +1180,7 @@ func (a *App) refreshFolderInternal(folderPath string) *FolderDiffResult {
 				walkFn(filepath.Join(dir, item.Name()), subRel)
 				continue
 			}
-			if !isImageFile(item.Name()) && !isVideoFile(item.Name()) {
+			if !isMediaFile(item.Name()) {
 				continue
 			}
 			fullPath := filepath.Join(dir, item.Name())
@@ -1264,6 +1266,8 @@ func (a *App) refreshFolderInternal(folderPath string) *FolderDiffResult {
 					LastModified: entry.LastModified, CreatedAt: entry.CreatedAt,
 					Folder: entry.Folder, RootPath: entry.RootPath,
 					IsVideo: entry.IsVideo,
+					IsAudio: isAudioFile(entry.Path),
+					DurationMS: scanDurationMS(entry.Path, entry.IsVideo),
 				})
 			}
 			const insertBatchSize = 2000
@@ -1310,6 +1314,7 @@ func (a *App) refreshFolderInternal(folderPath string) *FolderDiffResult {
 			Width:        entry.Width,
 			Height:       entry.Height,
 			IsVideo:      entry.IsVideo,
+			IsAudio:      isAudioFile(entry.Path),
 		}
 	}
 
@@ -1385,4 +1390,13 @@ func (a *App) autoHealMissingFolder(normalizedFolder string) {
 			})
 		}
 	}()
+}
+
+// scanDurationMS 扫描时顺带取视频时长（仅 mp4/mov 纯 Go 解析，毫秒级开销）。
+// 解析失败或非 mp4 返回 0，由 ffprobe 按需增强补充。
+func scanDurationMS(path string, isVideo bool) int64 {
+	if !isVideo {
+		return 0
+	}
+	return int64(extractMP4DurationSec(path) * 1000)
 }

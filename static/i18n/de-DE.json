@@ -659,5 +659,13 @@
   "status.bgop.scan": "Scannen und Importieren…",
   "status.bgop.pregen": "Miniaturbilder werden vorgeneriert {done}/{total}",
   "inertia.power": "Gleitkraft (0-100)",
-  "inertia.power_hint": "Impuls pro Mausrad-Raste und Höchstgeschwindigkeit; höher gleitet weiter."
+  "inertia.power_hint": "Impuls pro Mausrad-Raste und Höchstgeschwindigkeit; höher gleitet weiter.",
+  "settings.media_tools": "Medienkomponenten (ffmpeg)",
+  "settings.media_tools_hint": "Optionale Erweiterung. Ohne diese erhalten Video-Miniaturbilder schwarze Platzhalter; andere Funktionen sind nicht betroffen",
+  "settings.media_tools_ready": "Erweiterte Funktionen aktiviert",
+  "settings.media_tools_missing": "ffmpeg nicht erkannt (Erweiterungen deaktiviert)",
+  "settings.media_tools_path_ph": "Ordner mit ffmpeg (optional, leer = automatisch suchen)",
+  "settings.redetect": "Neu suchen",
+  "detail.audio_unsupported": "Dieses Audioformat kann in der aktuellen Umgebung nicht wiedergegeben werden",
+  "detail.media_info": "Medieninformationen"
 }

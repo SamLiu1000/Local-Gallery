@@ -659,5 +659,13 @@
   "status.bgop.scan": "Escaneando e importando…",
   "status.bgop.pregen": "Pregenerando miniaturas {done}/{total}",
   "inertia.power": "Potencia de deslizamiento (0-100)",
-  "inertia.power_hint": "Impulso por muesca de rueda y velocidad máxima; más alto desliza más lejos."
+  "inertia.power_hint": "Impulso por muesca de rueda y velocidad máxima; más alto desliza más lejos.",
+  "settings.media_tools": "Componentes multimedia (ffmpeg)",
+  "settings.media_tools_hint": "Mejora opcional. Sin él, las miniaturas de vídeo usan un marcador negro; el resto no se ve afectado",
+  "settings.media_tools_ready": "Funciones mejoradas activadas",
+  "settings.media_tools_missing": "ffmpeg no detectado (mejoras desactivadas)",
+  "settings.media_tools_path_ph": "Carpeta que contiene ffmpeg (opcional, vacío = detección automática)",
+  "settings.redetect": "Redetectar",
+  "detail.audio_unsupported": "Este formato de audio no se puede reproducir en el entorno actual",
+  "detail.media_info": "Información multimedia"
 }

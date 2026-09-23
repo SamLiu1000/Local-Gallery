@@ -659,5 +659,13 @@
   "status.bgop.scan": "스캔 및 가져오는 중…",
   "status.bgop.pregen": "썸네일 사전 생성 중 {done}/{total}",
   "inertia.power": "미끄럼 강도 (0-100)",
-  "inertia.power_hint": "휠 한 칸당 추진력과 최고 속도. 높을수록 멀리 미끄러집니다."
+  "inertia.power_hint": "휠 한 칸당 추진력과 최고 속도. 높을수록 멀리 미끄러집니다.",
+  "settings.media_tools": "미디어 구성 요소 (ffmpeg)",
+  "settings.media_tools_hint": "선택적 확장 구성 요소. 미설치 시 동영상 썸네일이 검은색 자리표로 표시되며 다른 기능은 영향을 받지 않습니다",
+  "settings.media_tools_ready": "확장 기능 사용 중",
+  "settings.media_tools_missing": "ffmpeg를 찾을 수 없습니다(확장 기능 비활성화)",
+  "settings.media_tools_path_ph": "ffmpeg 폴더(비우면 자동 탐색)",
+  "settings.redetect": "다시 탐색",
+  "detail.audio_unsupported": "현재 환경에서 이 오디오 형식을 재생할 수 없습니다",
+  "detail.media_info": "미디어 정보"
 }

@@ -1422,7 +1422,8 @@ const Gallery = (() => {
                     file: null,
                     _loaded: true,
                     _fromServer: true,
-                    isVideo: img.isVideo || false
+                    isVideo: img.isVideo || false,
+                    isAudio: img.isAudio || false
                 };
             }
 
@@ -1487,7 +1488,8 @@ const Gallery = (() => {
                     file: null,
                     _loaded: true,
                     _fromServer: true,
-                    isVideo: img.isVideo || false
+                    isVideo: img.isVideo || false,
+                    isAudio: img.isAudio || false
                 };
             }
 
@@ -5015,6 +5017,14 @@ const Gallery = (() => {
             wrapper.appendChild(videoIcon);
         }
 
+        // 音频文件叠加音符图标
+        if (imgData.isAudio) {
+            const audioIcon = document.createElement('div');
+            audioIcon.className = 'card-video-icon';
+            audioIcon.innerHTML = '<svg viewBox="0 0 24 24" width="48" height="48"><path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z" fill="white" opacity="0.9"/></svg>';
+            wrapper.appendChild(audioIcon);
+        }
+
         card.appendChild(wrapper);
 
         // ★ card-info 骨架立即创建，占住最终高度，避免后续文字填充时卡片跳动
@@ -6211,7 +6221,7 @@ const Gallery = (() => {
         }
 
         const ext = (imgData.name || '').split('.').pop().toLowerCase();
-        if (!['png', 'jpg', 'jpeg', 'webp', 'mp4', 'webm', 'mkv'].includes(ext)) {
+        if (!['png', 'jpg', 'jpeg', 'webp', 'mp4', 'webm', 'mkv', 'mp3'].includes(ext)) {
             console.log('[Gallery] resolveMetadataOnDemand: 不支持的文件格式', ext, imgData.name);
             return null;
         }
@@ -6850,7 +6860,8 @@ const Gallery = (() => {
                     file: null,
                     _loaded: true,
                     _fromServer: true,
-                    isVideo: img.isVideo || false
+                    isVideo: img.isVideo || false,
+                    isAudio: img.isAudio || false
                 });
             }
 

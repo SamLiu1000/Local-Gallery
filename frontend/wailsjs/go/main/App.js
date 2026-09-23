@@ -158,6 +158,14 @@ export function GetLANInfo() {
   return window['go']['main']['App']['GetLANInfo']();
 }
 
+export function GetMediaInfo(arg1) {
+  return window['go']['main']['App']['GetMediaInfo'](arg1);
+}
+
+export function GetMediaToolsStatus() {
+  return window['go']['main']['App']['GetMediaToolsStatus']();
+}
+
 export function GetParamTags(arg1) {
   return window['go']['main']['App']['GetParamTags'](arg1);
 }
@@ -274,6 +282,10 @@ export function ProxyRequest(arg1) {
   return window['go']['main']['App']['ProxyRequest'](arg1);
 }
 
+export function RedetectMediaTools() {
+  return window['go']['main']['App']['RedetectMediaTools']();
+}
+
 export function Refresh() {
   return window['go']['main']['App']['Refresh']();
 }
@@ -364,6 +376,10 @@ export function SetFavorite(arg1, arg2) {
 
 export function SetLANConfig(arg1, arg2) {
   return window['go']['main']['App']['SetLANConfig'](arg1, arg2);
+}
+
+export function SetMediaToolsPath(arg1) {
+  return window['go']['main']['App']['SetMediaToolsPath'](arg1);
 }
 
 export function SetSidebarSetting(arg1, arg2) {

@@ -36,6 +36,7 @@ type SafeImage struct {
 	Width        int    `json:"width"`
 	Height       int    `json:"height"`
 	IsVideo      bool   `json:"isVideo"`
+	IsAudio      bool   `json:"isAudio"`
 }
 
 type ImageListResult struct {
@@ -122,6 +123,7 @@ type ImageEntry struct {
 	Width        int    `json:"width"`
 	Height       int    `json:"height"`
 	IsVideo      bool   `json:"isVideo"`
+	IsAudio      bool   `json:"isAudio"`
 	ContentHash  string `json:"-"`
 }
 

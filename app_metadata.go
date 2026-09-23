@@ -199,6 +199,9 @@ func (a *App) ParseMetadataFast(filePath string) map[string]interface{} {
 		return a.parseWebPToLegacy(filePath)
 	case ".mp4", ".webm", ".mkv":
 		return a.parseVideoToLegacy(filePath)
+	case ".mp3":
+		defer guardMediaPanic("ParseMetadataFast(mp3)")
+		return a.parseAudioToLegacy(filePath)
 	default:
 		return nil
 	}

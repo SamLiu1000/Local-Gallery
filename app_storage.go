@@ -125,7 +125,7 @@ func toImageEntry(e database.ImageCacheEntry) *ImageEntry {
 		ID: e.ID, Path: e.Path, Name: e.Name, Size: e.Size,
 		LastModified: e.LastModified, CreatedAt: e.CreatedAt,
 		Folder: e.Folder, RootPath: e.RootPath,
-		Width: e.Width, Height: e.Height, IsVideo: e.IsVideo,
+		Width: e.Width, Height: e.Height, IsVideo: e.IsVideo, IsAudio: isAudioFile(e.Path),
 		URL: fmt.Sprintf("/image/%s", e.ID),
 	}
 }
